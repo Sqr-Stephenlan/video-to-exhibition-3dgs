@@ -1,0 +1,114 @@
+# macOS / editor noise
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+*.swp
+*.swo
+*~
+
+# Local environment
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+.python-version
+
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Node / frontend caches
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.turbo/
+.vite/
+.next/
+
+# Large source media and generated datasets
+data/raw_videos/**
+data/segments/**
+data/frames/**
+data/masks/**
+data/depth/**
+data/manifests/**
+!data/raw_videos/.gitkeep
+!data/segments/.gitkeep
+!data/frames/.gitkeep
+!data/masks/.gitkeep
+!data/depth/.gitkeep
+!data/manifests/.gitkeep
+
+# Reconstruction outputs
+outputs/reconstructions/**
+outputs/splats/**
+outputs/compressed/**
+outputs/renders/**
+outputs/web_demo/**
+!outputs/reconstructions/.gitkeep
+!outputs/splats/.gitkeep
+!outputs/compressed/.gitkeep
+!outputs/renders/.gitkeep
+!outputs/web_demo/.gitkeep
+
+# Model weights, checkpoints, and large 3D assets
+checkpoints/
+weights/
+pretrained/
+models/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.npz
+*.exr
+*.ply
+*.splat
+*.ksplat
+*.spz
+*.sog
+*.compressed.ply
+*.glb
+*.gltf
+*.obj
+*.fbx
+*.usd
+*.usdz
+*.stl
+
+# Video / image exports and logs generated during experiments
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.heic
+*.heif
+*.tiff
+*.tif
+*.log
+logs/
+runs/
+wandb/
+tensorboard/
+
+# Third-party repositories are managed as external dependencies.
+# Track only documentation or manifests placed directly under third_party/.
+third_party/*
+!third_party/README.md
+
