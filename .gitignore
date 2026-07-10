@@ -112,3 +112,15 @@ tensorboard/
 third_party/*
 !third_party/README.md
 
+# Local notes and moved documents (kept outside version control)
+.obsidian/
+docs/2308.04079v1.pdf
+docs/2508.14041v1.pdf
+docs/code_review_2026-07-10.md
+docs/exhibition_3dgs_architecture_review.md
+docs/exhibition_3dgs_pipeline_framework.md
+docs/exhibition_3dgs_technical_plan.docx
+docs/exhibition_3dgs_technical_plan.md
+docs/rectification_guidance_2026-07-10.md
+docs/研究方案_07_08.pdf
+docs/第一次架构讨论2026.7.8.md
