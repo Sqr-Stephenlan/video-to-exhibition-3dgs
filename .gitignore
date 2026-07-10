@@ -112,3 +112,14 @@ tensorboard/
 third_party/*
 !third_party/README.md
 
+# Demo / experimental data (large binary files)
+box/
+data/demo_object/
+data/demo_object_masked/
+outputs/demo_object/
+outputs/demo_object_masked/
+outputs/demo_object_v2/
+
+# Papers and PDFs
+*.pdf
+
