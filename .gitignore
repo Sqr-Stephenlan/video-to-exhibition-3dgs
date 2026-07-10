@@ -46,6 +46,7 @@ data/frames/**
 data/masks/**
 data/depth/**
 data/manifests/**
+data/rejected_frames/**
 !data/raw_videos/.gitkeep
 !data/segments/.gitkeep
 !data/frames/.gitkeep
@@ -122,4 +123,8 @@ outputs/demo_object_v2/
 
 # Papers and PDFs
 *.pdf
+
+# Markdown files (except README)
+*.md
+!README.md
 

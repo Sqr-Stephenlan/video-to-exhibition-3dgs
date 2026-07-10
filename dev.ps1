@@ -72,5 +72,6 @@ switch ($Command) {
     "python"   { Ensure-Venv; & $Py @RemainingArgs }
     "pip"      { Ensure-Venv; & $Py -m pip @RemainingArgs }
     "pytest"   { Ensure-Venv; & $Py -m pytest @RemainingArgs }
-    default    { Write-Error "Unknown: $Command. Usage: .\dev.ps1 {doctor|bootstrap|python|pip|pytest} ..."; exit 2 }
+    "ruff"     { Ensure-Venv; & $Py -m ruff @RemainingArgs }
+    default    { Write-Error "Unknown: $Command. Usage: .\dev.ps1 {doctor|bootstrap|python|pip|pytest|ruff} ..."; exit 2 }
 }

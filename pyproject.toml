@@ -1,0 +1,22 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "C4"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/_mast3r_adapter.py" = ["N806", "N803"]
+"scripts/_ply_transform.py" = ["N806", "N803"]
+"scripts/align_segments.py" = ["N806"]
+"tests/test_mast3r_adapter.py" = ["N806", "N803"]
+"tests/test_ply_transform.py" = ["N806"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
