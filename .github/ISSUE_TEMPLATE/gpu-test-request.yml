@@ -1,0 +1,101 @@
+name: GPU test request
+description: Request a reproducible CUDA/GPU test for one immutable commit.
+title: "[GPU Test]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Submit one request for one immutable commit SHA. The CUDA collaborator or Agent must not substitute branch HEAD, data, configuration, or environment without written approval.
+
+  - type: dropdown
+    id: test_level
+    attributes:
+      label: Test level
+      options:
+        - L2 — GPU call chain, dependency, CUDA environment, or export interface
+        - L3 — Training, camera/depth/alignment, or 3DGS reconstruction quality
+    validations:
+      required: true
+
+  - type: input
+    id: commit_sha
+    attributes:
+      label: Requested 40-character commit SHA
+      placeholder: "0123456789abcdef0123456789abcdef01234567"
+    validations:
+      required: true
+
+  - type: input
+    id: branch
+    attributes:
+      label: Branch (for locating the commit only)
+      placeholder: "research/longsplat-route"
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Test purpose, scope, and exclusions
+      placeholder: |
+        What must this run prove? What is explicitly outside this request?
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Platform, working directory, and exact command
+      description: Provide a copyable command for Windows PowerShell, WSL, Linux, or another named platform.
+      placeholder: |
+        Platform: Windows PowerShell
+        Working directory: C:\work\video-to-exhibition-3dgs
+        Command: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: input_and_config
+    attributes:
+      label: Input data, configuration, and fingerprints
+      placeholder: |
+        Data location/version/checksum:
+        Configuration path/SHA-256:
+        Model and third-party versions:
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_result
+    attributes:
+      label: Expected result and resource limits
+      placeholder: |
+        Required outputs and checks:
+        Expected exit code:
+        Maximum runtime / VRAM / disk:
+        Allowed network downloads:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducibility
+    attributes:
+      label: Run ID, seed, and retry policy
+      placeholder: |
+        Run ID:
+        Random seed / deterministic settings:
+        Allowed retries and reason:
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Requester acknowledgements
+      options:
+        - label: I will treat results as valid only for this commit, data, configuration, environment, and Run ID.
+          required: true
+        - label: I will require a new or explicitly scoped retest if an execution-affecting commit, dependency, data, configuration, or base branch changes.
+          required: true
+        - label: For L3, a named human will complete the visual acceptance section of the GPU Test Report.
+          required: true
