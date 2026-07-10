@@ -111,6 +111,7 @@ tensorboard/
 # Track only documentation or manifests placed directly under third_party/.
 third_party/*
 !third_party/README.md
+!third_party/*.txt
 
 # Local notes and moved documents (kept outside version control)
 .obsidian/
