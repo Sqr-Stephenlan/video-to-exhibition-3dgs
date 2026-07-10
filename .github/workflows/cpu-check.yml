@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for path in AGENTS.md dev.sh docs scripts data outputs; do
+          for path in AGENTS.md dev.sh docs scripts data outputs tests/unit tests/integration tests/gpu; do
             test -e "$path"
           done
           bash -n dev.sh
@@ -79,9 +79,12 @@ jobs:
           done
 
           tests_found=false
-          if [ -d tests ] && find tests -type f -name 'test_*.py' -print -quit | grep -q .; then
-            tests_found=true
-          fi
+          for test_dir in tests/unit tests/integration; do
+            if find "$test_dir" -type f -name 'test_*.py' -print -quit | grep -q .; then
+              tests_found=true
+              break
+            fi
+          done
 
           echo "metadata_found=$metadata_found" >> "$GITHUB_OUTPUT"
           echo "tests_found=$tests_found" >> "$GITHUB_OUTPUT"
@@ -116,9 +119,9 @@ jobs:
         run: |
           set -euo pipefail
           ./dev.sh python -c "import pytest"
-          ./dev.sh pytest tests
+          ./dev.sh pytest tests/unit tests/integration
 
       - name: Report intentionally empty Python test surface
         if: steps.project.outputs.tests_found != 'true'
         shell: bash
-        run: echo "No test_*.py files are currently present; CPU test execution is intentionally skipped."
+        run: echo "No CPU test_*.py files are currently present in tests/unit or tests/integration; execution is intentionally skipped."

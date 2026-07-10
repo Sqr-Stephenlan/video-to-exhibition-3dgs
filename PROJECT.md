@@ -391,8 +391,6 @@ Agent 可以运行自动检查、整理指标和生成视觉证据，但不得�
 
 ## 14. 参考文档
 
-- `exhibition_3dgs_pipeline_framework.md`：原始完整技术路线与工具选型。
-- `exhibition_3dgs_architecture_review.md`：对原路线的风险审核和双线 MVP 修订建议。
 - `docs/branch_task_plan.md`：分支、阶段、输出与最小完成状态。
 - `docs/collaborator_agent_development_guide.md`：角色权限、PR、测试等级、GPU 节点与验收规范。
 - `docs/testing/README.md`：测试资料入口。
