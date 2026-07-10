@@ -39,6 +39,12 @@ pnpm-debug.log*
 .vite/
 .next/
 
+# Codex project prompts are tracked; local Codex scratch output is not.
+.codex/tmp/
+.codex/cache/
+.codex/runs/
+.codex/sessions/
+
 # Large source media and generated datasets
 data/raw_videos/**
 data/segments/**
