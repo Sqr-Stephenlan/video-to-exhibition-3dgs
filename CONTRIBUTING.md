@@ -46,6 +46,20 @@ contributor, including AI coding agents.
 - Remove debug code, temporary files, and commented-out code before handoff.
 - Use clear, concise commit messages that describe the change.
 
+## Pull request review feedback
+
+- Prefer an ordinary review comment over a GitHub suggested change or
+  `Commit suggestion`. A comment preserves the problem, rationale, and
+  acceptance criteria so the author or agent can inspect related files and run
+  the appropriate checks before implementing the fix.
+- Use a suggested change only for a trivial, local, and unambiguous edit that
+  can be applied exactly as written, such as a typo or formatting correction.
+  Do not use it for behavior, workflow, dependency, policy, or multi-file
+  changes.
+- Do not commit a suggestion directly to a shared PR branch without the PR
+  author's or project owner's confirmation. Substantive feedback should be
+  implemented as a normal, reviewed commit with its validation evidence.
+
 ## Communication and decisions
 
 - If an ambiguity requires a material scope, product, or architecture decision,
