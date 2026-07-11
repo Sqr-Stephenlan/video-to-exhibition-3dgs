@@ -142,7 +142,7 @@ PR 作者必须在 PR 描述中声明测试等级；项目负责人负责确认�
 
 对 `L2`/`L3` PR，若启用严格 required checks，最终有效测试应针对已经包含当前 `main` 的功能分支 HEAD，或由受控 merge queue/预合并检查生成的等效合并结果。`main` 变化后，不得把旧基线上的报告当作最终合并证据。[GitHub 对严格 status checks 的说明](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 
-当前仓库已建立 `tests/unit/`、`tests/integration/` 和 `tests/gpu/` 目录骨架，但尚未加入实际测试 fixture，也没有跨平台 `doctor` 或统一 `run_smoke_test` 入口。在这些执行能力落地前，每个测试包必须列出真实存在于目标 SHA 的命令；不允许把规划中的命令写成已完成的检查。
+当前仓库尚未纳入统一的 `tests/`、跨平台 `doctor` 或 `run_smoke_test` 入口。在这些能力落地前，每个测试包必须列出真实存在于目标 SHA 的命令；不允许把规划中的命令写成已完成的检查。
 
 ## 7. 测试有效性、失效与重试规则
 
@@ -344,7 +344,7 @@ PR 转为 `Ready for review` 前，项目负责人应确认：
 
 ## 14. 实施路线与当前能力声明
 
-本规范定义目标行为，不把尚未实现的工具写成既有能力。当前仓库已落地 `dev.sh`、GitHub CPU checks 和测试目录骨架，但目录内尚无实际 fixture；跨平台 `doctor`、统一 smoke test 和 self-hosted runner 工作流也尚未实现。以下分别列出已落地能力与后续实施项：
+本规范定义目标行为，不把尚未实现的工具写成既有能力。当前仓库的统一入口仅有 `dev.sh`，且尚未纳入跨平台 `doctor`、统一 smoke test、测试目录或 self-hosted runner 工作流。以下为建议的实施顺序：
 
 已落地的协作入口：
 
