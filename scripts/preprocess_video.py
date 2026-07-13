@@ -311,9 +311,9 @@ def detect_scene_windows(video_path: Path, min_segment_sec: float) -> list[tuple
     scene_manager.detect_scenes(video)
     scenes = scene_manager.get_scene_list()
     windows = [
-        (round_sec(start.get_seconds()), round_sec(end.get_seconds()))
+        (round_sec(start.seconds), round_sec(end.seconds))
         for start, end in scenes
-        if end.get_seconds() > start.get_seconds()
+        if end.seconds > start.seconds
     ]
 
     if len(windows) <= 1:

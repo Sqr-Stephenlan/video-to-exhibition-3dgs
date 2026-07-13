@@ -4,7 +4,8 @@ Last updated: 2026-07-13
 
 ## Current Phase
 
-Stage 2 - Minimal preprocess MVP implemented and locally unit-tested.
+Stage 2 - Minimal preprocess MVP implemented and aligned with the main-branch
+test and API conventions.
 
 The feature now has a single CLI entrypoint, focused tests, and user-facing
 documentation. FFmpeg and ffprobe are now installed on PATH, and the FFmpeg
@@ -27,7 +28,7 @@ smoke test passes.
   - optional PySceneDetect scene segmentation with time-window fallback.
   - OpenCV frame sampling, blur/exposure scoring, average-hash duplicate
     filtering, selected/rejected frame handling, and manifest generation.
-- Added `tests/test_preprocess_video.py` covering:
+- Added `tests/unit/test_preprocess_video.py` covering:
   - time-window segmentation and tiny-tail merge behavior.
   - offset window math.
   - blur, exposure, and duplicate hash scoring.
@@ -39,6 +40,11 @@ smoke test passes.
   Python file I/O, and write failures raise a preprocessing error instead of
   producing manifest paths for missing images.
 - Added a regression test covering image writes under Unicode paths.
+- Moved preprocess tests to `tests/unit/` so the main-branch CPU workflow
+  discovers and executes them; retained the required
+  `tests/integration/` and `tests/gpu/` directory placeholders.
+- Migrated PySceneDetect scene-window conversion from deprecated
+  `FrameTimecode.get_seconds()` calls to the `seconds` property.
 - Installed FFmpeg 8.1.2 through winget as a user-scoped package. Both
   `ffmpeg` and `ffprobe` resolve from the installed `bin` directory, with the
   required `libx264` H.264 encoder and MP4 muxer available.
@@ -47,8 +53,13 @@ smoke test passes.
 
 - Ran through the project Python entrypoint with Git Bash:
   `./dev.sh pytest`
-- Result: `12 passed`.
-- The FFmpeg smoke test now executes successfully instead of being skipped.
+- Result with the installed FFmpeg bin directory on PATH: `12 passed`.
+- Ran the main-branch CI test scope:
+  `./dev.sh pytest tests/unit tests/integration`; result: `12 passed`.
+- Ran `bash -n dev.sh` and `./dev.sh python -m compileall -q scripts tests/unit`.
+- Ran a synthetic FFmpeg smoke flow through the CLI. It produced 2 segments,
+  4 sampled frames, 2 selected frames, and a complete manifest; temporary
+  outputs were removed after validation.
 - Re-ran the diagnostic preprocess flow on `data/raw_videos/bad_video_1.mp4`
   with filtering disabled and rejected-frame saving enabled. The result had 1
   segment, 101 sampled frames, 87 selected JPGs, and 14 rejected JPGs; all
@@ -98,8 +109,8 @@ run the longsplat preset on a real sample video:
   sampling found some motion-blurred frames that still scored just above the
   current blur threshold of 40.
 - PySceneDetect emits deprecation warnings for `FrameTimecode.get_seconds()` in
-  the current scene-window conversion code. This is non-blocking but should be
-  migrated to the `seconds` property before a future PySceneDetect upgrade.
+  the current scene-window conversion code. Resolved by using the `seconds`
+  property; a representative real-video scene run is still recommended.
 
 ## Current Non-Goals
 
