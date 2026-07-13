@@ -1,0 +1,32 @@
+# Default depth-prior config: Video Depth Anything Relative Base (vitb).
+# Paths are repository-relative. Do not put absolute personal paths here.
+
+schema_version: "1.0"
+module: depth-prior
+
+backend:
+  name: video-depth-anything
+  # Pin recorded in configs/depth/backend_pin.md
+  repo_dir: third_party/Video-Depth-Anything
+  commit: "4f5ae23172ba60fd7bc11ef671cca678842c7072"
+  encoder: vitb
+  depth_type: relative  # relative | metric
+  input_size: 518
+  max_res: 1280
+  fp16: true
+  # Leave empty to use repo_dir/checkpoints default for encoder+depth_type.
+  checkpoint: ""
+
+io:
+  frames_manifest: data/manifests/frames_manifest.json
+  depth_dir: data/depth
+  mask_dir: data/masks
+  depth_manifest: data/manifests/depth_manifest.json
+  run_record: outputs/reconstructions/depth_prior/run_record.json
+
+runtime:
+  # When frames_manifest points at image sequences, a temp video is built for VDA.
+  # target_fps is used only for that assembly step.
+  target_fps: 5
+  device: cuda
+  skip_existing: false

@@ -112,3 +112,6 @@ tensorboard/
 third_party/*
 !third_party/README.md
 
+
+# Local caches (keep packages off system drive temp/cache)
+.cache/
