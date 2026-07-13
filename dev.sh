@@ -5,7 +5,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 VENV_DIR="${VENV_DIR:-.venv}"
-PY="$VENV_DIR/bin/python"
+
+resolve_venv_python() {
+  for candidate in \
+    "$VENV_DIR/bin/python" \
+    "$VENV_DIR/Scripts/python.exe" \
+    "$VENV_DIR/Scripts/python"; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  echo "$VENV_DIR/bin/python"
+}
+
+PY="$(resolve_venv_python)"
 
 find_system_python() {
   if command -v python3 >/dev/null 2>&1; then
@@ -61,6 +75,7 @@ bootstrap() {
 
   SYSTEM_PY="$(find_system_python)"
   "$SYSTEM_PY" -m venv "$VENV_DIR"
+  PY="$(resolve_venv_python)"
   "$PY" -m pip install --upgrade pip
 
   if [ -f "requirements.txt" ]; then
