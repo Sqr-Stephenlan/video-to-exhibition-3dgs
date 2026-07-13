@@ -138,6 +138,19 @@ def test_average_hash_distance() -> None:
     assert pv.hash_distance(image_hash, pv.average_hash(inverse)) > 0
 
 
+def test_write_image_supports_unicode_paths(tmp_path: Path) -> None:
+    destination = tmp_path / "中文帧" / "选中.jpg"
+    destination.parent.mkdir()
+    image = np.full((16, 16, 3), 127, dtype=np.uint8)
+
+    pv.write_image(destination, image)
+
+    assert destination.exists()
+    decoded = cv2.imdecode(np.frombuffer(destination.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert decoded is not None
+    assert decoded.shape == image.shape
+
+
 def test_manifest_writes_stable_relative_paths(tmp_path: Path) -> None:
     source = ROOT / "data" / "raw_videos" / "sample.mp4"
     normalized = ROOT / "data" / "segments" / "sample" / "normalized.mp4"

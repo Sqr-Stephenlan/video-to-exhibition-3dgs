@@ -7,8 +7,8 @@ Last updated: 2026-07-13
 Stage 2 - Minimal preprocess MVP implemented and locally unit-tested.
 
 The feature now has a single CLI entrypoint, focused tests, and user-facing
-documentation. Full end-to-end video smoke testing still requires FFmpeg and
-ffprobe to be installed on PATH.
+documentation. FFmpeg and ffprobe are now installed on PATH, and the FFmpeg
+smoke test passes.
 
 ## Completed
 
@@ -35,36 +35,71 @@ ffprobe to be installed on PATH.
   - FFmpeg smoke flow, skipped when `ffmpeg` or `ffprobe` is unavailable.
 - Added `docs/preprocess_video.md` with usage, requirements, outputs, manifest
   shape, and verification instructions.
+- Fixed Windows Unicode frame output: OpenCV image encoding is now written via
+  Python file I/O, and write failures raise a preprocessing error instead of
+  producing manifest paths for missing images.
+- Added a regression test covering image writes under Unicode paths.
+- Installed FFmpeg 8.1.2 through winget as a user-scoped package. Both
+  `ffmpeg` and `ffprobe` resolve from the installed `bin` directory, with the
+  required `libx264` H.264 encoder and MP4 muxer available.
 
 ## Verification
 
 - Ran through the project Python entrypoint with Git Bash:
   `./dev.sh pytest`
-- Result: `10 passed, 1 skipped`.
-- The skipped test is the FFmpeg smoke test because this machine currently does
-  not have `ffmpeg` and `ffprobe` on PATH.
+- Result: `12 passed`.
+- The FFmpeg smoke test now executes successfully instead of being skipped.
+- Re-ran the diagnostic preprocess flow on `data/raw_videos/bad_video_1.mp4`
+  with filtering disabled and rejected-frame saving enabled. The result had 1
+  segment, 101 sampled frames, 87 selected JPGs, and 14 rejected JPGs; all
+  selected and rejected manifest paths exist.
 - Ran CLI help successfully:
   `./dev.sh python scripts/preprocess_video.py --help`
 - Ran the missing-FFmpeg failure path successfully; it exits with a clear setup
   message before writing outputs.
+- Ran a real-video baseline pressure pass on
+  `data/raw_videos/pressure_test.mp4` with `scene,time` segmentation and
+  rejected-frame saving enabled. The 79.4 second HEVC source completed in 25.8
+  seconds and produced 5 segments, 497 sampled frames, 281 selected frames, and
+  216 rejected frames.
+- Validated every pressure-pass artifact: all 6 generated MP4 files decode with
+  FFmpeg, all 497 JPEG files decode with OpenCV, and all 503 paths referenced by
+  the manifest exist.
+- The pressure pass used about 150.3 MiB of generated output from an 11.1 MiB
+  source when rejected JPEGs were retained.
 
 ## Next Step
 
-Install FFmpeg so both `ffmpeg` and `ffprobe` are on PATH, then run baseline and
-longsplat smoke tests on a real or tiny synthetic video:
+Review the `pressure_test` frame-selection quality and scene boundaries, then
+run the longsplat preset on a real sample video:
 
 ```bash
-./dev.sh python scripts/preprocess_video.py data/raw_videos/<video>.mp4 --video-id <id> --preset baseline --force
 ./dev.sh python scripts/preprocess_video.py data/raw_videos/<video>.mp4 --video-id <id> --preset longsplat --force
 ```
 
 ## Open Decisions
 
 - No new virtual environment is needed; `.venv` already exists.
+- FFmpeg is installed user-scoped through winget; a newly opened shell will
+  inherit the updated user PATH.
+- Existing VSCode/Git Bash processes opened before the installation retain the
+  old PATH. A fresh VSCode process resolves both `ffmpeg` and `ffprobe` to the
+  installed FFmpeg 8.1.2 `bin` directory.
 - No dependency installation was run in this session because the required Python
   packages were already present in `.venv`.
-- Scene segmentation is included in the MVP, but real scene-cut behavior still
-  needs validation after FFmpeg is available.
+- Scene segmentation is included in the MVP; real scene-cut behavior still
+  needs validation on a representative exhibition video.
+- A real-video diagnostic exposed and resolved a Windows Unicode-path issue in
+  frame writing. The original run recorded 87 selected frames but wrote zero
+  JPGs; the fixed run is consistent.
+- The baseline pressure pass technically succeeds, but real-video quality needs
+  manual acceptance. Scene detection isolated a 3 second fast-camera-motion
+  window as `segment_0004`, where only 3 of 15 frames were selected, and visual
+  sampling found some motion-blurred frames that still scored just above the
+  current blur threshold of 40.
+- PySceneDetect emits deprecation warnings for `FrameTimecode.get_seconds()` in
+  the current scene-window conversion code. This is non-blocking but should be
+  migrated to the `seconds` property before a future PySceneDetect upgrade.
 
 ## Current Non-Goals
 

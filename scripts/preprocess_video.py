@@ -430,6 +430,17 @@ def frame_filename(sample_index: int, timestamp_sec: float) -> str:
     return f"frame_{sample_index:06d}_t{timestamp_sec:010.3f}.jpg"
 
 
+def write_image(path: Path, frame: np.ndarray) -> None:
+    """Write an image through Python file I/O so Unicode Windows paths work."""
+    encoded_ok, encoded = cv2.imencode(".jpg", frame)
+    if not encoded_ok:
+        raise PreprocessError(f"OpenCV could not encode frame for {path}.")
+    try:
+        path.write_bytes(encoded.tobytes())
+    except OSError as exc:
+        raise PreprocessError(f"Could not write frame image {path}: {exc}") from exc
+
+
 def sample_segment_frames(
     segment: SegmentWindow,
     selected_root: Path,
@@ -495,10 +506,10 @@ def sample_segment_frames(
         if selected:
             output_path = selected_dir / filename
             selected_hashes.append(current_hash)
-            cv2.imwrite(str(output_path), frame)
+            write_image(output_path, frame)
         elif save_rejected:
             output_path = rejected_dir / filename
-            cv2.imwrite(str(output_path), frame)
+            write_image(output_path, frame)
         else:
             output_path = None
 
