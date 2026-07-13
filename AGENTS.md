@@ -1,3 +1,11 @@
+## AI Agent Instructions
+
+This repository follows the collaboration rules defined in `CONTRIBUTING.md`.
+
+Before making any changes, read and follow `CONTRIBUTING.md`.
+
+These rules apply to all AI coding agents.
+
 <!-- codex-python-env:start -->
 ## Python environment
 

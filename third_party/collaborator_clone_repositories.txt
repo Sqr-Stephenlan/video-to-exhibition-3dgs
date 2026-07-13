@@ -1,0 +1,88 @@
+协作者 third_party 仓库浅克隆清单
+生成日期：2026-07-10
+
+用途
+----
+主项目不跟踪第三方源码仓库。协作者如果需要查看代码、调试流程或运行展厅
+3DGS 管线，应在本地自行把外部仓库浅克隆到 third_party/ 目录。
+
+本清单基于当前本机已浅克隆的仓库，以及
+docs/exhibition_3dgs_pipeline_framework.md 中的框架路线整理。
+
+主路线说明
+----------
+本项目重建主线采用 LongSplat 替代 COLMAP。COLMAP 不是主流程必需仓库；
+只有做传统 SfM baseline 或对照实验时才需要额外克隆。
+
+在项目根目录执行：
+
+mkdir -p third_party
+
+主流程 / 工程流程需要克隆的顶层仓库
+------------------------------------
+# 视频解码、转码与抽帧
+git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git third_party/FFmpeg
+
+# 帧读取、图像质量检查和常规 CV 工具
+git clone --depth 1 https://github.com/opencv/opencv.git third_party/opencv
+
+# 长视频场景分段
+git clone --depth 1 https://github.com/Breakthrough/PySceneDetect.git third_party/PySceneDetect
+
+# 弱纹理展厅场景的视频深度先验
+git clone --depth 1 https://github.com/DepthAnything/Video-Depth-Anything.git third_party/Video-Depth-Anything
+
+# 无位姿几何 / 匹配先验。MASt3R 仓库内已包含 dust3r/。
+git clone --depth 1 https://github.com/naver/mast3r.git third_party/mast3r
+
+# 长视频无位姿 3DGS 主重建参考实现
+git clone --depth 1 https://github.com/NVlabs/LongSplat.git third_party/LongSplat
+
+# 3DGS 优化训练后端
+git clone --depth 1 https://github.com/nerfstudio-project/gsplat.git third_party/gsplat
+
+# splat 交互检查、清理和编辑
+git clone --depth 1 https://github.com/playcanvas/supersplat.git third_party/supersplat
+
+# splat 转换、压缩和过滤
+git clone --depth 1 https://github.com/playcanvas/splat-transform.git third_party/splat-transform
+
+# Web 展厅 / 数字孪生展示运行时
+git clone --depth 1 https://github.com/playcanvas/engine.git third_party/engine
+
+LongSplat submodules
+--------------------
+只查看代码时，顶层 LongSplat 仓库通常已经够用。若要运行或构建 LongSplat，
+克隆后还需要初始化它自己的 submodule：
+
+git -C third_party/LongSplat submodule update --init --recursive --depth 1
+
+LongSplat 声明的 submodule 包括：
+- submodules/diff-gaussian-rasterization
+- submodules/simple-knn
+- submodules/fused-ssim
+- submodules/mast3r
+
+可选参考仓库
+------------
+# 官方 3D Gaussian Splatting 实现，可作为算法 / 后端参考；
+# 框架主选训练后端仍为 gsplat。
+git clone --depth 1 https://github.com/graphdeco-inria/gaussian-splatting.git third_party/gaussian-splatting
+
+# 传统 SfM baseline 专用。LongSplat 主路线不需要。
+git clone --depth 1 https://github.com/colmap/colmap.git third_party/colmap
+
+本机快照版本（2026-07-10 核对）
+-------------------------------
+FFmpeg: c29d710 (2026-07-08)
+opencv: d48bf69 (2026-07-07)
+PySceneDetect: c1fcb79 (2026-07-05)
+Video-Depth-Anything: 4f5ae23 (2025-10-07)
+mast3r: f5209af (2025-06-30)
+LongSplat: 1975077 (2026-01-19)
+gsplat: 8b6319f (2026-07-02)
+supersplat: 9316be5 (2026-07-04)
+splat-transform: b42b60c (2026-06-30)
+engine: 2bad15e (2026-07-08)
+gaussian-splatting（可选参考）: 54c035f (2024-10-30)
+colmap（可选 baseline）: b39c162 (2026-07-07)
