@@ -1,0 +1,12 @@
+{
+  "source_path": "<run_dir>/input/images",
+  "model_path": "<run_dir>/longsplat_model",
+  "images": "images",
+  "resolution": -1,
+  "sh_degree": 3,
+  "iterations": 100,
+  "seed": 42,
+  "extra_train_args": {},
+  "convert_iteration": 100,
+  "convert_prune_ratio": 0.6
+}

@@ -46,7 +46,7 @@ data/frames/**
 data/masks/**
 data/depth/**
 data/manifests/**
-data/rejected_frames/**
+
 !data/raw_videos/.gitkeep
 !data/segments/.gitkeep
 !data/frames/.gitkeep
@@ -112,19 +112,4 @@ tensorboard/
 # Track only documentation or manifests placed directly under third_party/.
 third_party/*
 !third_party/README.md
-
-# Demo / experimental data (large binary files)
-box/
-data/demo_object/
-data/demo_object_masked/
-outputs/demo_object/
-outputs/demo_object_masked/
-outputs/demo_object_v2/
-
-# Papers and PDFs
-*.pdf
-
-# Markdown files (except README)
-*.md
-!README.md
 
