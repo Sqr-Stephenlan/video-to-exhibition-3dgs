@@ -58,6 +58,35 @@ smoke test passes.
   - `source` + `png` avoids second-generation segment-video sampling and JPEG
     compression for final reconstruction frames while keeping H.264 MP4
     normalized/segment outputs for downstream tool compatibility.
+- Added config-driven parameter tuning:
+  - `--config <path>` loads preprocessing settings from a dependency-free JSON
+    file.
+  - Settings resolve in the order built-in preset defaults, JSON config, then
+    explicit CLI options.
+  - Unknown fields, invalid types, and invalid choices fail with clear errors
+    instead of silently falling back to defaults.
+  - `--save-rejected` now also supports `--no-save-rejected` so CLI overrides
+    work in both directions.
+  - Added `configs/preprocess/baseline_real_video.json` as the editable
+    real-video tuning profile and documented the repeatable tuning workflow.
+- Ran a real-video parameter sweep against `data/raw_videos/pressure_test.mp4`
+  using the checked-in baseline config plus targeted CLI overrides for:
+  - blur threshold: `40`, `50`, `55`, `60`
+  - duplicate hash threshold: `4` and `3`
+  - target FPS: `5` and `4`
+  - segment overlap: `10` and `6`
+  - minimum segment length: `2` and `3`
+  - exposure ratios: `0.6` and `0.5`
+- Confirmed an important tuning semantic from the implementation: lower
+  `duplicate_hash_threshold` values are less strict, because duplicate rejection
+  happens when `duplicate_score <= duplicate_hash_threshold`.
+- Identified the first tuning pass recommendation for this sample:
+  - keep `duplicate_hash_threshold` at `4`
+  - increase `blur_threshold` to around `55`
+  - optionally reduce `target_fps` from `5` to `4` when disk and frame-count
+    pressure matter more than maximizing coverage
+  - leave exposure thresholds unchanged for now because no frames on
+    `pressure_test.mp4` tripped either exposure filter at `0.6` or `0.5`
 
 ## Verification
 
@@ -80,6 +109,16 @@ smoke test passes.
   `./dev.sh pytest tests/unit/test_preprocess_video.py`; result: `14 passed`.
 - Ran the full test suite through the project Python entrypoint:
   `./dev.sh pytest`; result: `14 passed`.
+- Re-ran the full test suite after adding JSON tuning support through the
+  project Python entrypoint: `./dev.sh pytest`; result: `20 passed`.
+- Ran CLI help and compile checks after the config change:
+  `./dev.sh python scripts/preprocess_video.py --help` and
+  `./dev.sh python -m compileall -q scripts tests/unit`.
+- Verified the checked-in tuning profile resolves to `baseline`, source-frame
+  PNG output, and rejected-frame saving, while an explicit
+  `--blur-threshold 55` overrides the JSON value.
+- Verified a missing `--config` path exits with a clear one-line error before
+  output directories are written.
 - Ran compile check:
   `./dev.sh python -m compileall -q scripts tests/unit`.
 - Ran the missing-FFmpeg failure path successfully; it exits with a clear setup
@@ -94,11 +133,67 @@ smoke test passes.
   the manifest exist.
 - The pressure pass used about 150.3 MiB of generated output from an 11.1 MiB
   source when rejected JPEGs were retained.
+- Ran a focused real-video tuning sweep with source-frame PNG output and saved
+  rejected frames. Key `pressure_test.mp4` results:
+  - baseline config (`blur=40`, `dup=4`, `fps=5`, `overlap=10`):
+    497 sampled, 285 selected, 212 rejected
+  - `blur=55`, `dup=4`, `fps=5`, `overlap=10`:
+    497 sampled, 264 selected, 233 rejected
+  - `blur=55`, `dup=4`, `fps=5`, `overlap=6`:
+    457 sampled, 254 selected, 203 rejected
+  - `blur=55`, `dup=4`, `fps=4`, `overlap=10`:
+    428 sampled, 250 selected, 178 rejected
+  - `blur=55`, `dup=3`, `fps=5`, `overlap=10`:
+    497 sampled, 304 selected, 193 rejected
+  - `blur=55`, `dup=3`, `fps=5`, `overlap=6`:
+    457 sampled, 291 selected, 166 rejected
+- The sweep showed:
+  - raising blur threshold from `40` to `55` increased blur rejections from
+    `82` to `104` on the same sample
+  - lowering duplicate threshold from `4` to `3` reduced duplicate rejections
+    from `129` to `89`, which confirms it is a looser setting rather than a
+    stricter one
+  - `min_segment_sec=3` had no effect on this sample versus `2`
+  - `overexposed_ratio=0.5` and `underexposed_ratio=0.5` still rejected zero
+    frames on this sample
+- The pressure sweep temporarily exhausted free disk space while retaining
+  rejected PNGs for every run. Experimental outputs were partially cleaned to
+  recover workspace capacity after capturing the metrics above.
+- Re-ran a narrower keep-output comparison for manual review on
+  `pressure_test.mp4` and retained these result sets:
+  - `pressure_keep_baseline_blur40_dup4_fps5`
+  - `pressure_keep_blur55_dup4_fps5`
+  - `pressure_keep_blur60_dup4_fps5`
+  - `pressure_keep_blur55_dup4_fps4`
+- Computed selected-frame blur statistics from the retained manifests. For this
+  sample, the highest average selected blur score came from
+  `pressure_keep_blur60_dup4_fps5`, followed closely by
+  `pressure_keep_blur55_dup4_fps5`.
+- Generated a visual review video from the selected frames of
+  `pressure_keep_blur60_dup4_fps5` at:
+  `data/frames/pressure_keep_blur60_dup4_fps5/selected/selected_review.mp4`
 
 ## Next Step
 
-Review the `pressure_test` frame-selection quality and scene boundaries, then
-run the longsplat preset on a real sample video:
+Review the retained comparison outputs, especially
+`pressure_keep_blur60_dup4_fps5`, and decide whether the small increase in
+clarity over `blur=55` is worth the additional selected-frame drop before
+updating `configs/preprocess/baseline_real_video.json` and comparing against
+the `longsplat` preset:
+
+- candidate baseline update for the next pass:
+  - `blur_threshold: 55.0`
+  - keep `duplicate_hash_threshold: 4`
+  - optionally set `target_fps: 4.0` if storage and review load need to come
+    down
+  - keep exposure thresholds at `0.6`
+- confirmation command:
+
+```bash
+./dev.sh python scripts/preprocess_video.py data/raw_videos/<video>.mp4 --video-id <id> --config configs/preprocess/baseline_real_video.json --force
+```
+
+- follow-up comparison:
 
 ```bash
 ./dev.sh python scripts/preprocess_video.py data/raw_videos/<video>.mp4 --video-id <id> --preset longsplat --force
@@ -124,6 +219,14 @@ run the longsplat preset on a real sample video:
   window as `segment_0004`, where only 3 of 15 frames were selected, and visual
   sampling found some motion-blurred frames that still scored just above the
   current blur threshold of 40.
+- The first tuning sweep supports increasing `blur_threshold` into the mid-50s
+  for this footage, but it also confirms that tightening blur alone reduces
+  retained coverage. The next configuration update should avoid simultaneously
+  loosening duplicate rejection unless that tradeoff is explicitly desired.
+- Reducing overlap or target FPS lowers generated output size and review volume,
+  but it also reduces total candidate frames. That tradeoff should be accepted
+  only if the remaining selected frames are still sufficient for downstream
+  reconstruction.
 - PySceneDetect emits deprecation warnings for `FrameTimecode.get_seconds()` in
   the current scene-window conversion code. Resolved by using the `seconds`
   property; a representative real-video scene run is still recommended.

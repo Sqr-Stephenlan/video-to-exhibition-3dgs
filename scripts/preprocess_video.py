@@ -37,6 +37,55 @@ PRESETS = {
     },
 }
 
+DEFAULT_PRESET = "baseline"
+DEFAULT_SETTINGS = {
+    "segment_method": "scene,time",
+    "min_segment_sec": 2.0,
+    "blur_threshold": 40.0,
+    "overexposed_ratio": 0.6,
+    "underexposed_ratio": 0.6,
+    "duplicate_hash_threshold": 4,
+    "save_rejected": False,
+    "frame_format": "jpg",
+    "frame_source": "segment",
+}
+CONFIG_SETTING_KEYS = frozenset(
+    {
+        "preset",
+        "target_fps",
+        "max_long_edge",
+        "segment_method",
+        "segment_length_sec",
+        "segment_overlap_sec",
+        "min_segment_sec",
+        "blur_threshold",
+        "overexposed_ratio",
+        "underexposed_ratio",
+        "duplicate_hash_threshold",
+        "save_rejected",
+        "frame_format",
+        "frame_source",
+    }
+)
+FLOAT_CONFIG_SETTINGS = frozenset(
+    {
+        "target_fps",
+        "segment_length_sec",
+        "segment_overlap_sec",
+        "min_segment_sec",
+        "blur_threshold",
+        "overexposed_ratio",
+        "underexposed_ratio",
+    }
+)
+INT_CONFIG_SETTINGS = frozenset({"max_long_edge", "duplicate_hash_threshold"})
+CHOICE_CONFIG_SETTINGS = {
+    "preset": frozenset(PRESETS),
+    "segment_method": frozenset({"scene", "time", "scene,time"}),
+    "frame_format": frozenset({"jpg", "png"}),
+    "frame_source": frozenset({"segment", "source"}),
+}
+
 
 class PreprocessError(RuntimeError):
     """User-facing preprocessing error."""
@@ -703,28 +752,70 @@ def prepare_output_dirs(output_root: Path, video_id: str, force: bool) -> tuple[
     return segments_dir, selected_dir, rejected_dir, manifests_dir, frames_dir
 
 
+def load_settings_config(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise PreprocessError(f"Config file does not exist: {path}") from exc
+    except OSError as exc:
+        raise PreprocessError(f"Could not read config file {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise PreprocessError(
+            f"Invalid JSON in config file {path} at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise PreprocessError(f"Config file must contain a JSON object: {path}")
+
+    unknown_keys = sorted(set(payload) - CONFIG_SETTING_KEYS)
+    if unknown_keys:
+        raise PreprocessError(f"Unknown config setting(s): {', '.join(unknown_keys)}")
+
+    settings = dict(payload)
+    for name in FLOAT_CONFIG_SETTINGS:
+        if name not in settings:
+            continue
+        value = settings[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise PreprocessError(f"Config setting '{name}' must be a number.")
+        settings[name] = float(value)
+
+    for name in INT_CONFIG_SETTINGS:
+        if name not in settings:
+            continue
+        value = settings[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PreprocessError(f"Config setting '{name}' must be an integer.")
+
+    if "save_rejected" in settings and not isinstance(settings["save_rejected"], bool):
+        raise PreprocessError("Config setting 'save_rejected' must be a boolean.")
+
+    for name, choices in CHOICE_CONFIG_SETTINGS.items():
+        if name not in settings:
+            continue
+        value = settings[name]
+        if not isinstance(value, str) or value not in choices:
+            allowed = ", ".join(sorted(choices))
+            raise PreprocessError(f"Config setting '{name}' must be one of: {allowed}.")
+
+    return settings
+
+
 def resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
-    preset = PRESETS[args.preset]
-    settings = {
-        "preset": args.preset,
-        "target_fps": args.target_fps if args.target_fps is not None else preset["target_fps"],
-        "max_long_edge": args.max_long_edge if args.max_long_edge is not None else preset["max_long_edge"],
-        "segment_method": args.segment_method,
-        "segment_length_sec": (
-            args.segment_length_sec if args.segment_length_sec is not None else preset["segment_length_sec"]
-        ),
-        "segment_overlap_sec": (
-            args.segment_overlap_sec if args.segment_overlap_sec is not None else preset["segment_overlap_sec"]
-        ),
-        "min_segment_sec": args.min_segment_sec,
-        "blur_threshold": args.blur_threshold,
-        "overexposed_ratio": args.overexposed_ratio,
-        "underexposed_ratio": args.underexposed_ratio,
-        "duplicate_hash_threshold": args.duplicate_hash_threshold,
-        "save_rejected": args.save_rejected,
-        "frame_format": args.frame_format,
-        "frame_source": args.frame_source,
-    }
+    config_path = getattr(args, "config", None)
+    config = load_settings_config(config_path) if config_path is not None else {}
+    preset_name = getattr(args, "preset", None) or config.get("preset", DEFAULT_PRESET)
+
+    settings = dict(DEFAULT_SETTINGS)
+    settings.update(PRESETS[preset_name])
+    settings.update({name: value for name, value in config.items() if name != "preset"})
+    settings["preset"] = preset_name
+
+    for name in CONFIG_SETTING_KEYS - {"preset"}:
+        cli_value = getattr(args, name, None)
+        if cli_value is not None:
+            settings[name] = cli_value
+
     validate_window_settings(
         settings["segment_length_sec"],
         settings["segment_overlap_sec"],
@@ -829,33 +920,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("source_video", type=Path, help="Path to the raw source video.")
     parser.add_argument("--output-root", type=Path, default=Path("data"), help="Root output directory.")
     parser.add_argument("--video-id", required=True, help="Stable video identifier used in output paths.")
-    parser.add_argument("--preset", choices=sorted(PRESETS), default="baseline", help="Default preprocess preset.")
+    parser.add_argument("--config", type=Path, help="JSON file containing preprocess tuning settings.")
+    parser.add_argument("--preset", choices=sorted(PRESETS), default=None, help="Preprocess preset.")
     parser.add_argument("--target-fps", type=float, default=None, help="Frame sampling rate per segment.")
     parser.add_argument("--max-long-edge", type=int, default=None, help="Maximum normalized video long edge.")
     parser.add_argument(
         "--segment-method",
         choices=["scene", "time", "scene,time"],
-        default="scene,time",
+        default=None,
         help="Segmentation strategy.",
     )
     parser.add_argument("--segment-length-sec", type=float, default=None, help="Maximum segment length.")
     parser.add_argument("--segment-overlap-sec", type=float, default=None, help="Overlap for split time windows.")
-    parser.add_argument("--min-segment-sec", type=float, default=2.0, help="Merge or avoid tiny segments below this.")
-    parser.add_argument("--blur-threshold", type=float, default=40.0, help="Reject frames below this Laplacian variance.")
-    parser.add_argument("--overexposed-ratio", type=float, default=0.6, help="Reject frames above this white-pixel ratio.")
-    parser.add_argument("--underexposed-ratio", type=float, default=0.6, help="Reject frames above this black-pixel ratio.")
-    parser.add_argument("--duplicate-hash-threshold", type=int, default=4, help="Reject near-duplicate average hashes.")
-    parser.add_argument("--save-rejected", action="store_true", help="Write rejected frame images as well as manifest rows.")
+    parser.add_argument("--min-segment-sec", type=float, default=None, help="Merge or avoid tiny segments below this.")
+    parser.add_argument("--blur-threshold", type=float, default=None, help="Reject frames below this Laplacian variance.")
+    parser.add_argument("--overexposed-ratio", type=float, default=None, help="Reject frames above this white-pixel ratio.")
+    parser.add_argument("--underexposed-ratio", type=float, default=None, help="Reject frames above this black-pixel ratio.")
+    parser.add_argument("--duplicate-hash-threshold", type=int, default=None, help="Reject near-duplicate average hashes.")
+    parser.add_argument(
+        "--save-rejected",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Write rejected frame images as well as manifest rows.",
+    )
     parser.add_argument(
         "--frame-format",
         choices=["jpg", "png"],
-        default="jpg",
+        default=None,
         help="Image format for selected and rejected frames.",
     )
     parser.add_argument(
         "--frame-source",
         choices=["segment", "source"],
-        default="segment",
+        default=None,
         help="Read sampled frames from generated segments or directly from the source video.",
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing output directories for this video id.")

@@ -1,0 +1,16 @@
+{
+  "preset": "baseline",
+  "target_fps": 5.0,
+  "max_long_edge": 1600,
+  "segment_method": "scene,time",
+  "segment_length_sec": 30.0,
+  "segment_overlap_sec": 10.0,
+  "min_segment_sec": 2.0,
+  "blur_threshold": 55.0,
+  "overexposed_ratio": 0.6,
+  "underexposed_ratio": 0.6,
+  "duplicate_hash_threshold": 4,
+  "frame_format": "png",
+  "frame_source": "source",
+  "save_rejected": true
+}

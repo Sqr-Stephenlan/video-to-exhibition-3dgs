@@ -42,6 +42,38 @@ Useful options:
   --force
 ```
 
+For repeated real-video tuning, edit
+`configs/preprocess/baseline_real_video.json` and pass it with `--config`:
+
+```bash
+./dev.sh python scripts/preprocess_video.py data/raw_videos/sample.mp4 \
+  --video-id sample_tuning \
+  --config configs/preprocess/baseline_real_video.json \
+  --force
+```
+
+Configuration precedence is built-in preset defaults, then values from the
+JSON file, then explicitly supplied CLI options. This makes temporary overrides
+possible without editing the shared tuning file:
+
+```bash
+./dev.sh python scripts/preprocess_video.py data/raw_videos/sample.mp4 \
+  --video-id sample_blur_55 \
+  --config configs/preprocess/baseline_real_video.json \
+  --blur-threshold 55 \
+  --no-save-rejected \
+  --force
+```
+
+The JSON file accepts only preprocessing settings: `preset`, `target_fps`,
+`max_long_edge`, segmentation settings, quality thresholds, `frame_format`,
+`frame_source`, and `save_rejected`. Input paths, `video_id`, output paths, and
+`force` remain explicit CLI options. Unknown fields, invalid value types, and
+invalid choices fail with a clear error so tuning typos are not ignored.
+The checked-in profile uses source-frame PNGs and keeps rejected images for
+visual comparison; set `save_rejected` to `false` after tuning to reduce disk
+usage.
+
 For higher-fidelity reconstruction frames, keep the compatible MP4 segment
 outputs but sample PNG frames directly from the source video:
 

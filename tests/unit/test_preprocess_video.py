@@ -16,6 +16,106 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import preprocess_video as pv  # noqa: E402
 
 
+def parse_settings(*arguments: str) -> dict[str, object]:
+    args = pv.build_arg_parser().parse_args(["source.mp4", "--video-id", "sample", *arguments])
+    return pv.resolve_settings(args)
+
+
+def test_resolve_settings_keeps_existing_defaults_without_config() -> None:
+    settings = parse_settings()
+
+    assert settings == {
+        "preset": "baseline",
+        "target_fps": 5.0,
+        "max_long_edge": 1600,
+        "segment_method": "scene,time",
+        "segment_length_sec": 30.0,
+        "segment_overlap_sec": 10.0,
+        "min_segment_sec": 2.0,
+        "blur_threshold": 40.0,
+        "overexposed_ratio": 0.6,
+        "underexposed_ratio": 0.6,
+        "duplicate_hash_threshold": 4,
+        "save_rejected": False,
+        "frame_format": "jpg",
+        "frame_source": "segment",
+    }
+
+
+def test_resolve_settings_loads_json_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "tuning.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "preset": "longsplat",
+                "target_fps": 8,
+                "blur_threshold": 55.0,
+                "save_rejected": True,
+                "frame_format": "png",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = parse_settings("--config", str(config_path))
+
+    assert settings["preset"] == "longsplat"
+    assert settings["target_fps"] == 8.0
+    assert settings["max_long_edge"] == 512
+    assert settings["blur_threshold"] == 55.0
+    assert settings["save_rejected"] is True
+    assert settings["frame_format"] == "png"
+
+
+def test_explicit_cli_settings_override_json_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "tuning.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "preset": "longsplat",
+                "target_fps": 8.0,
+                "blur_threshold": 55.0,
+                "save_rejected": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = parse_settings(
+        "--config",
+        str(config_path),
+        "--preset",
+        "baseline",
+        "--target-fps",
+        "3",
+        "--no-save-rejected",
+    )
+
+    assert settings["preset"] == "baseline"
+    assert settings["target_fps"] == 3.0
+    assert settings["max_long_edge"] == 1600
+    assert settings["blur_threshold"] == 55.0
+    assert settings["save_rejected"] is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"blur_treshold": 50.0}, "Unknown config setting"),
+        ({"target_fps": "fast"}, "target_fps.*must be a number"),
+        ({"frame_format": "webp"}, "frame_format.*must be one of"),
+    ],
+)
+def test_load_settings_config_rejects_invalid_values(
+    tmp_path: Path, payload: dict[str, object], message: str
+) -> None:
+    config_path = tmp_path / "invalid.json"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(pv.PreprocessError, match=message):
+        pv.load_settings_config(config_path)
+
+
 def test_build_time_windows_with_overlap() -> None:
     windows = pv.build_time_windows(
         duration_sec=95.0,
@@ -268,6 +368,21 @@ def test_preprocess_smoke_with_synthetic_video(tmp_path: Path) -> None:
 def test_preprocess_smoke_with_source_png_frames(tmp_path: Path) -> None:
     source = tmp_path / "synthetic.mp4"
     output_root = tmp_path / "data"
+    config_path = tmp_path / "source_png.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "segment_method": "time",
+                "segment_length_sec": 1.0,
+                "segment_overlap_sec": 0.25,
+                "target_fps": 2.0,
+                "blur_threshold": 0.0,
+                "frame_source": "source",
+                "frame_format": "png",
+            }
+        ),
+        encoding="utf-8",
+    )
     subprocess.run(
         [
             "ffmpeg",
@@ -292,20 +407,8 @@ def test_preprocess_smoke_with_source_png_frames(tmp_path: Path) -> None:
             "synthetic_png",
             "--output-root",
             str(output_root),
-            "--segment-method",
-            "time",
-            "--segment-length-sec",
-            "1.0",
-            "--segment-overlap-sec",
-            "0.25",
-            "--target-fps",
-            "2",
-            "--blur-threshold",
-            "0",
-            "--frame-source",
-            "source",
-            "--frame-format",
-            "png",
+            "--config",
+            str(config_path),
             "--force",
         ]
     )
