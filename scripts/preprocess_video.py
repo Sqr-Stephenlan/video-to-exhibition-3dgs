@@ -206,6 +206,9 @@ def normalize_video(source: Path, destination: Path, metadata: VideoMetadata, ma
     width, height = scaled_dimensions(metadata.width, metadata.height, max_long_edge)
     command = [
         "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-y",
         "-i",
         str(source),
