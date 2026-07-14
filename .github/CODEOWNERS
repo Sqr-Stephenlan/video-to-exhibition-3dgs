@@ -1,0 +1,16 @@
+# Default repository owner. Update this file when additional maintainers are
+# granted GitHub write access or own a defined module.
+* @Sqr-Stephenlan
+
+# Repository policy, execution entry points, and test controls require owner review.
+/.github/CODEOWNERS @Sqr-Stephenlan
+/.github/workflows/ @Sqr-Stephenlan
+/.github/ISSUE_TEMPLATE/ @Sqr-Stephenlan
+/.github/pull_request_template.md @Sqr-Stephenlan
+/dev.sh @Sqr-Stephenlan
+/scripts/ @Sqr-Stephenlan
+/configs/ @Sqr-Stephenlan
+/tests/ @Sqr-Stephenlan
+/docs/security/ @Sqr-Stephenlan
+/docs/testing/ @Sqr-Stephenlan
+/third_party/README.md @Sqr-Stephenlan
