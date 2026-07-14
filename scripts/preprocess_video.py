@@ -162,7 +162,11 @@ def probe_video(source: Path) -> VideoMetadata:
 
     stream = video_streams[0]
     format_info = payload.get("format", {})
-    duration = float(stream.get("duration") or format_info.get("duration") or 0.0)
+    duration_raw = stream.get("duration") or format_info.get("duration") or 0.0
+    try:
+        duration = float(duration_raw)
+    except (TypeError, ValueError):
+        duration = 0.0
     fps = parse_fraction(stream.get("avg_frame_rate")) or parse_fraction(stream.get("r_frame_rate"))
     width = int(stream.get("width") or 0)
     height = int(stream.get("height") or 0)
