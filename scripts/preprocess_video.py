@@ -426,19 +426,35 @@ def hash_distance(left: np.ndarray, right: np.ndarray) -> int:
     return int(np.count_nonzero(left != right))
 
 
-def frame_filename(sample_index: int, timestamp_sec: float) -> str:
-    return f"frame_{sample_index:06d}_t{timestamp_sec:010.3f}.jpg"
+def frame_filename(sample_index: int, timestamp_sec: float, frame_format: str = "jpg") -> str:
+    extension = "png" if frame_format == "png" else "jpg"
+    return f"frame_{sample_index:06d}_t{timestamp_sec:010.3f}.{extension}"
 
 
-def write_image(path: Path, frame: np.ndarray) -> None:
+def write_image(path: Path, frame: np.ndarray, frame_format: str = "jpg") -> None:
     """Write an image through Python file I/O so Unicode Windows paths work."""
-    encoded_ok, encoded = cv2.imencode(".jpg", frame)
+    if frame_format == "png":
+        extension = ".png"
+        params = [cv2.IMWRITE_PNG_COMPRESSION, 3]
+    else:
+        extension = ".jpg"
+        params = [cv2.IMWRITE_JPEG_QUALITY, 95]
+    encoded_ok, encoded = cv2.imencode(extension, frame, params)
     if not encoded_ok:
         raise PreprocessError(f"OpenCV could not encode frame for {path}.")
     try:
         path.write_bytes(encoded.tobytes())
     except OSError as exc:
         raise PreprocessError(f"Could not write frame image {path}: {exc}") from exc
+
+
+def resize_frame(frame: np.ndarray, dimensions: tuple[int, int] | None) -> np.ndarray:
+    if dimensions is None:
+        return frame
+    width, height = dimensions
+    if frame.shape[1] == width and frame.shape[0] == height:
+        return frame
+    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
 
 
 def sample_segment_frames(
@@ -452,18 +468,36 @@ def sample_segment_frames(
     duplicate_hash_threshold: int,
     save_rejected: bool,
     repo_root: Path,
+    frame_format: str = "jpg",
+    frame_source: str = "segment",
+    source_video: Path | None = None,
+    resize_to: tuple[int, int] | None = None,
 ) -> list[FrameRecord]:
     if segment.path is None:
         raise ValueError("segment.path is required for frame sampling")
     if target_fps <= 0:
         raise ValueError("target_fps must be greater than zero")
+    if frame_format not in {"jpg", "png"}:
+        raise ValueError("frame_format must be jpg or png")
+    if frame_source not in {"segment", "source"}:
+        raise ValueError("frame_source must be segment or source")
+    if frame_source == "source" and source_video is None:
+        raise ValueError("source_video is required when frame_source is source")
 
-    cap = cv2.VideoCapture(str(segment.path))
+    sampling_path = source_video if frame_source == "source" else segment.path
+    cap = cv2.VideoCapture(str(sampling_path))
     if not cap.isOpened():
-        raise PreprocessError(f"OpenCV could not open segment {segment.path}.")
+        raise PreprocessError(f"OpenCV could not open video for frame sampling: {sampling_path}.")
 
     segment_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     sample_every = 1 if segment_fps <= 0 else max(1, int(round(segment_fps / target_fps)))
+    start_frame_index = 0
+    end_frame_index: int | None = None
+    if frame_source == "source" and segment_fps > 0:
+        start_frame_index = max(0, int(round(segment.start_sec * segment_fps)))
+        end_frame_index = max(start_frame_index, int(round(segment.end_sec * segment_fps)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_index)
+
     selected_hashes: list[np.ndarray] = []
     records: list[FrameRecord] = []
     selected_dir = selected_root / segment.id
@@ -473,15 +507,21 @@ def sample_segment_frames(
         rejected_dir.mkdir(parents=True, exist_ok=True)
 
     frame_number = 0
+    source_frame_index = start_frame_index
     sample_index = 0
     while True:
+        if end_frame_index is not None and source_frame_index >= end_frame_index:
+            break
         ok, frame = cap.read()
         if not ok:
             break
         frame_number += 1
+        absolute_frame_index = source_frame_index + 1
+        source_frame_index += 1
         if (frame_number - 1) % sample_every != 0:
             continue
 
+        frame = resize_frame(frame, resize_to if frame_source == "source" else None)
         sample_index += 1
         local_timestamp = 0.0 if segment_fps <= 0 else (frame_number - 1) / segment_fps
         timestamp = round_sec(segment.start_sec + local_timestamp)
@@ -501,15 +541,15 @@ def sample_segment_frames(
             reject_reasons.append("duplicate")
 
         selected = not reject_reasons
-        filename = frame_filename(sample_index, timestamp)
+        filename = frame_filename(sample_index, timestamp, frame_format)
         output_path: Path | None
         if selected:
             output_path = selected_dir / filename
             selected_hashes.append(current_hash)
-            write_image(output_path, frame)
+            write_image(output_path, frame, frame_format)
         elif save_rejected:
             output_path = rejected_dir / filename
-            write_image(output_path, frame)
+            write_image(output_path, frame, frame_format)
         else:
             output_path = None
 
@@ -519,7 +559,7 @@ def sample_segment_frames(
                 segment_id=segment.id,
                 path=relative_path(output_path, repo_root) if output_path else None,
                 timestamp_sec=timestamp,
-                frame_index=frame_number,
+                frame_index=absolute_frame_index if frame_source == "source" else frame_number,
                 selected=selected,
                 blur_score=round(float(blur), 3),
                 overexposed_ratio=round(float(over), 6),
@@ -675,6 +715,8 @@ def resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
         "underexposed_ratio": args.underexposed_ratio,
         "duplicate_hash_threshold": args.duplicate_hash_threshold,
         "save_rejected": args.save_rejected,
+        "frame_format": args.frame_format,
+        "frame_source": args.frame_source,
     }
     validate_window_settings(
         settings["segment_length_sec"],
@@ -718,6 +760,11 @@ def preprocess(args: argparse.Namespace) -> Path:
     source_metadata = probe_video(source)
     normalized_path = segments_dir / "normalized.mp4"
     normalized_metadata = normalize_video(source, normalized_path, source_metadata, settings["max_long_edge"])
+    source_frame_dimensions = scaled_dimensions(
+        source_metadata.width,
+        source_metadata.height,
+        settings["max_long_edge"],
+    )
 
     planned_segments = build_segment_windows(
         duration_sec=normalized_metadata.duration_sec,
@@ -749,6 +796,10 @@ def preprocess(args: argparse.Namespace) -> Path:
                 duplicate_hash_threshold=settings["duplicate_hash_threshold"],
                 save_rejected=settings["save_rejected"],
                 repo_root=repo_root,
+                frame_format=settings["frame_format"],
+                frame_source=settings["frame_source"],
+                source_video=source if settings["frame_source"] == "source" else None,
+                resize_to=source_frame_dimensions if settings["frame_source"] == "source" else None,
             )
         )
 
@@ -787,7 +838,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overexposed-ratio", type=float, default=0.6, help="Reject frames above this white-pixel ratio.")
     parser.add_argument("--underexposed-ratio", type=float, default=0.6, help="Reject frames above this black-pixel ratio.")
     parser.add_argument("--duplicate-hash-threshold", type=int, default=4, help="Reject near-duplicate average hashes.")
-    parser.add_argument("--save-rejected", action="store_true", help="Write rejected frame JPEGs as well as manifest rows.")
+    parser.add_argument("--save-rejected", action="store_true", help="Write rejected frame images as well as manifest rows.")
+    parser.add_argument(
+        "--frame-format",
+        choices=["jpg", "png"],
+        default="jpg",
+        help="Image format for selected and rejected frames.",
+    )
+    parser.add_argument(
+        "--frame-source",
+        choices=["segment", "source"],
+        default="segment",
+        help="Read sampled frames from generated segments or directly from the source video.",
+    )
     parser.add_argument("--force", action="store_true", help="Overwrite existing output directories for this video id.")
     return parser
 

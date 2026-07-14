@@ -151,6 +151,18 @@ def test_write_image_supports_unicode_paths(tmp_path: Path) -> None:
     assert decoded.shape == image.shape
 
 
+def test_write_image_supports_png(tmp_path: Path) -> None:
+    destination = tmp_path / "selected.png"
+    image = np.full((16, 16, 3), 127, dtype=np.uint8)
+
+    pv.write_image(destination, image, frame_format="png")
+
+    assert destination.exists()
+    decoded = cv2.imdecode(np.frombuffer(destination.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert decoded is not None
+    assert decoded.shape == image.shape
+
+
 def test_manifest_writes_stable_relative_paths(tmp_path: Path) -> None:
     source = ROOT / "data" / "raw_videos" / "sample.mp4"
     normalized = ROOT / "data" / "segments" / "sample" / "normalized.mp4"
@@ -247,3 +259,68 @@ def test_preprocess_smoke_with_synthetic_video(tmp_path: Path) -> None:
     assert manifest["video_id"] == "synthetic"
     assert manifest["segments"]
     assert manifest["frames"]
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required for preprocess smoke tests",
+)
+def test_preprocess_smoke_with_source_png_frames(tmp_path: Path) -> None:
+    source = tmp_path / "synthetic.mp4"
+    output_root = tmp_path / "data"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=160x120:rate=10:duration=2",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = pv.main(
+        [
+            str(source),
+            "--video-id",
+            "synthetic_png",
+            "--output-root",
+            str(output_root),
+            "--segment-method",
+            "time",
+            "--segment-length-sec",
+            "1.0",
+            "--segment-overlap-sec",
+            "0.25",
+            "--target-fps",
+            "2",
+            "--blur-threshold",
+            "0",
+            "--frame-source",
+            "source",
+            "--frame-format",
+            "png",
+            "--force",
+        ]
+    )
+
+    manifest_path = output_root / "manifests" / "synthetic_png" / "preprocess_manifest.json"
+    assert result == 0
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["settings"]["frame_format"] == "png"
+    assert manifest["settings"]["frame_source"] == "source"
+    assert manifest["frames"]
+    selected_paths = [frame["path"] for frame in manifest["frames"] if frame["selected"]]
+    assert selected_paths
+    assert all(path.endswith(".png") for path in selected_paths)
+    for relative_path in selected_paths:
+        output_path = Path(relative_path)
+        if not output_path.is_absolute():
+            output_path = ROOT / output_path
+        assert output_path.exists()

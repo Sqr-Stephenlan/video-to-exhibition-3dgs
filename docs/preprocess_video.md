@@ -42,6 +42,17 @@ Useful options:
   --force
 ```
 
+For higher-fidelity reconstruction frames, keep the compatible MP4 segment
+outputs but sample PNG frames directly from the source video:
+
+```bash
+./dev.sh python scripts/preprocess_video.py data/raw_videos/sample.mp4 \
+  --video-id sample_png \
+  --frame-source source \
+  --frame-format png \
+  --force
+```
+
 Presets:
 
 - `baseline`: 5 fps frame sampling, max long edge 1600, 30 second segments, 10 second overlap.
@@ -62,16 +73,22 @@ data/segments/sample/
   segment_0002.mp4
 
 data/frames/sample/
-  selected/segment_0001/*.jpg
-  rejected/segment_0001/*.jpg
+  selected/segment_0001/*.jpg or *.png
+  rejected/segment_0001/*.jpg or *.png
 
 data/manifests/sample/
   preprocess_manifest.json
 ```
 
-Rejected JPEGs are written only with `--save-rejected`. Rejected frame manifest
+Rejected images are written only with `--save-rejected`. Rejected frame manifest
 entries still exist when rejected images are not saved, with `path` set to
 `null`.
+
+By default frames are sampled from generated segment MP4s and written as JPGs.
+Use `--frame-source source --frame-format png` to avoid sampling from the
+second-generation H.264 segment files and avoid JPEG compression for the final
+frame assets. The normalized and segment videos remain H.264 MP4s for tool
+compatibility.
 
 Existing output directories are protected. Use `--force` to replace generated
 outputs for the same `video_id`.

@@ -1,11 +1,12 @@
 # Preprocess Video Feature Status
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 ## Current Phase
 
 Stage 2 - Minimal preprocess MVP implemented and aligned with the main-branch
-test and API conventions.
+test and API conventions. Fidelity frame extraction is implemented on branch
+`codex/preprocess-fidelity-frames`.
 
 The feature now has a single CLI entrypoint, focused tests, and user-facing
 documentation. FFmpeg and ffprobe are now installed on PATH, and the FFmpeg
@@ -48,6 +49,15 @@ smoke test passes.
 - Installed FFmpeg 8.1.2 through winget as a user-scoped package. Both
   `ffmpeg` and `ffprobe` resolve from the installed `bin` directory, with the
   required `libx264` H.264 encoder and MP4 muxer available.
+- Added an optional fidelity frame path:
+  - `--frame-format jpg|png` controls selected/rejected frame image encoding.
+  - `--frame-source segment|source` controls whether frames are sampled from
+    generated segment MP4s or directly from the original source video using the
+    segment time windows.
+  - The default remains `segment` + `jpg` for backward compatibility.
+  - `source` + `png` avoids second-generation segment-video sampling and JPEG
+    compression for final reconstruction frames while keeping H.264 MP4
+    normalized/segment outputs for downstream tool compatibility.
 
 ## Verification
 
@@ -66,6 +76,12 @@ smoke test passes.
   selected and rejected manifest paths exist.
 - Ran CLI help successfully:
   `./dev.sh python scripts/preprocess_video.py --help`
+- Ran the fidelity frame extraction tests through the project Python entrypoint:
+  `./dev.sh pytest tests/unit/test_preprocess_video.py`; result: `14 passed`.
+- Ran the full test suite through the project Python entrypoint:
+  `./dev.sh pytest`; result: `14 passed`.
+- Ran compile check:
+  `./dev.sh python -m compileall -q scripts tests/unit`.
 - Ran the missing-FFmpeg failure path successfully; it exits with a clear setup
   message before writing outputs.
 - Ran a real-video baseline pressure pass on
@@ -111,6 +127,13 @@ run the longsplat preset on a real sample video:
 - PySceneDetect emits deprecation warnings for `FrameTimecode.get_seconds()` in
   the current scene-window conversion code. Resolved by using the `seconds`
   property; a representative real-video scene run is still recommended.
+- The fidelity frame path improves the final frame assets but does not make
+  resizing mathematically lossless; downscaling still resamples pixels. It is a
+  project-compatible way to avoid extra H.264 and JPEG generation loss for
+  downstream reconstruction inputs.
+- Source-based frame sampling currently uses OpenCV FPS/frame-index seeking.
+  The synthetic CFR smoke test passes, but representative phone/AR footage,
+  especially variable-frame-rate input, still needs timing-alignment validation.
 
 ## Current Non-Goals
 
