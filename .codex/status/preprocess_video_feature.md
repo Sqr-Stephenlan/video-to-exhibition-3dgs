@@ -190,6 +190,34 @@ smoke test passes.
     selected-frame sharpness.
 - Generated the iOS quality-first visual review video at:
   `data/frames/ios_test_blur200_fps5_dup4/selected/selected_review.mp4`.
+- Ran a retained tuning matrix on `data/raw_videos/restricted_test.mp4`, a
+  62.167-second 960x720 controlled sample. All runs used source-frame PNG
+  extraction, `max_long_edge=1600`, `duplicate_hash_threshold=4` unless
+  explicitly noted, and `save_rejected=false` to limit output volume:
+  - Locked baseline `blur=55`, `fps=5`, `overlap=10`: 411 sampled, 115
+    selected (27.98%), selected mean blur 91.14, selected PNGs 47.0 MiB.
+  - `blur=60`, `fps=5`, `overlap=10`: 105 selected (25.55%), mean 94.38;
+    this is the current balanced quality candidate.
+  - `blur=65`: 89 selected (21.65%), mean 100.03.
+  - `blur=70`: 81 selected (19.71%), mean 103.29.
+  - `blur=80`: 69 selected (16.79%), mean 108.99; quality-first extreme.
+  - `blur=60`, `duplicate_hash_threshold=3`: 107 selected, mean 93.86;
+    loosening duplicate rejection added only two frames and slightly reduced
+    mean quality, so it is not recommended.
+  - `blur=60`, `fps=4`: 81/310 selected (26.13%), mean 92.62; lower sampling
+    did not improve quality.
+  - `blur=60`, `fps=6`: 110/493 selected (22.31%), mean 95.75; it added only
+    five selected frames over fps 5 while increasing candidate volume.
+  - `blur=60`, `fps=5`, `overlap=6`: 93/371 selected (25.07%), mean 92.04;
+    it reduces segment output from 42.3 MiB to 39.8 MiB but slightly lowers
+    selected-frame quality.
+- The restricted-video matrix supports keeping `duplicate_hash_threshold=4`,
+  `target_fps=5`, and `segment_overlap_sec=10`. The current recommendation is
+  `blur_threshold=60` for balanced reconstruction coverage, with `70` or `80`
+  reserved for a quality-first run after visual review.
+- Generated review videos for the two decision points:
+  - `data/frames/restricted_test_blur60_d4_fps5_r1600/selected/selected_review.mp4`
+  - `data/frames/restricted_test_blur80_d4_fps5_r1600/selected/selected_review.mp4`
 
 ## Next Step
 
@@ -198,6 +226,10 @@ Review the retained comparison outputs, especially
 the quality-first iOS threshold should become a separate profile before
 updating `configs/preprocess/baseline_real_video.json` and comparing against
 the `longsplat` preset:
+
+For `restricted_test`, review the `blur=60` and `blur=80` outputs before
+deciding whether the baseline should move from `55` to `60`, or whether the
+quality-first setting should remain an explicit per-video override.
 
 - candidate baseline update for the next pass:
   - `blur_threshold: 55.0`
