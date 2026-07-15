@@ -34,9 +34,13 @@ from scripts.longsplat.runner import LongSplatConfig  # noqa: E402
 
 
 def _make_ply(path: Path, attributes: list[str], count: int = 10) -> None:
-    """Write a minimal synthetic PLY for testing."""
+    """Write a minimal synthetic PLY for testing with valid defaults."""
     dtype = [(a, "f4") for a in attributes]
     verts = np.zeros(count, dtype=dtype)
+    # Use identity quaternions (rot_0=1) to pass degeneracy checks.
+    for attr in ("rot_0", "scale_0", "scale_1", "scale_2", "opacity"):
+        if attr in attributes:
+            verts[attr] = 1.0
     el = PlyElement.describe(verts, "vertex")
     PlyData([el], text=True).write(str(path))
 

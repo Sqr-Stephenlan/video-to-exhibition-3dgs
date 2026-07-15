@@ -168,6 +168,25 @@ def test_rejects_path_escape(tmp_path, valid_manifest_path):
         validate_manifest(str(p))
 
 
+def test_rejects_prefix_escape(tmp_path, valid_manifest_path):
+    """Prefix attack: ``../base_evil`` shares prefix with ``/tmp/base``."""
+    base = tmp_path / "base"
+    base.mkdir()
+    # Create a sibling directory that would share a prefix
+    evil = tmp_path / "base_evil"
+    evil.mkdir()
+    (evil / "frame.jpg").write_text("evil")
+
+    with open(valid_manifest_path) as fh:
+        data = json.load(fh)
+    data["base"] = str(base)
+    data["frames"][0]["path"] = "../base_evil/frame.jpg"
+    p = tmp_path / "prefix_escape.json"
+    p.write_text(json.dumps(data))
+    with pytest.raises(ManifestValidationError, match="escapes"):
+        validate_manifest(str(p))
+
+
 def test_rejects_invalid_width(tmp_path, valid_manifest_path):
     with open(valid_manifest_path) as fh:
         data = json.load(fh)

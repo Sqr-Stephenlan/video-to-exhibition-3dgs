@@ -12,6 +12,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from scripts.longsplat.runner import (
     LongSplatConfig,
     _check_repo,
@@ -28,10 +30,6 @@ _STANDARD_3DGS_ATTRS = frozenset(
         "rot_0", "rot_1", "rot_2", "rot_3",
     }
 )
-
-# Additional SH attributes that may be present (degrees 1-3).
-_SH_ATTR_PATTERNS = ("f_rest_",)
-
 
 class ConverterError(Exception):
     """Raised when conversion fails or produces invalid output."""
@@ -116,7 +114,6 @@ def _validate_converted_ply(ply_path: Path) -> dict[str, Any]:
             f"Converted PLY not found: {ply_path}"
         )
 
-    # Basic size check — empty PLY header is ~20 bytes
     file_size = ply_path.stat().st_size
     if file_size < 100:
         raise ConvertedPLYValidationError(
@@ -125,10 +122,13 @@ def _validate_converted_ply(ply_path: Path) -> dict[str, Any]:
 
     sha = _sha256_hex(ply_path)
 
-    # Read PLY header to validate attributes
     from plyfile import PlyData
 
     ply = PlyData.read(ply_path)
+    if "vertex" not in ply:
+        raise ConvertedPLYValidationError(
+            f"Converted PLY has no 'vertex' element: {ply_path}"
+        )
     vertex = ply["vertex"]
     if vertex.count == 0:
         raise ConvertedPLYValidationError(
@@ -142,13 +142,64 @@ def _validate_converted_ply(ply_path: Path) -> dict[str, Any]:
             f"Converted PLY missing core 3DGS attributes: {sorted(missing_core)}"
         )
 
+    # --- dtype checks ---
+    _check_dtype(vertex, "x", "f4")
+    _check_dtype(vertex, "y", "f4")
+    _check_dtype(vertex, "z", "f4")
+    _check_dtype(vertex, "opacity", "f4")
+    for attr in ("scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"):
+        _check_dtype(vertex, attr, "f4")
+
+    # --- NaN/Inf checks on position, opacity, scale, rotation ---
+    _finite_fields = [
+        "x", "y", "z", "opacity",
+        "scale_0", "scale_1", "scale_2",
+        "rot_0", "rot_1", "rot_2", "rot_3",
+    ]
+    for field in _finite_fields:
+        if field in attr_names:
+            values = vertex.data[field]
+            if not np.all(np.isfinite(values)):
+                raise ConvertedPLYValidationError(
+                    f"Converted PLY contains NaN/Inf in '{field}': {ply_path}"
+                )
+
+    # --- quaternion non-degeneracy check (sum of squares > 0) ---
+    rot_fields = ["rot_0", "rot_1", "rot_2", "rot_3"]
+    if all(r in attr_names for r in rot_fields):
+        rot_data = np.stack(
+            [vertex.data[r] for r in rot_fields], axis=-1
+        )
+        rot_norms = np.sum(rot_data ** 2, axis=-1)
+        if np.any(rot_norms == 0):
+            raise ConvertedPLYValidationError(
+                f"Converted PLY contains degenerate quaternions (zero norm): {ply_path}"
+            )
+
+    # --- SH attribute count consistency (informational, not a hard failure) ---
+    sh_attrs = [a for a in attr_names if a.startswith("f_rest_")]
+    sh_order = len(sh_attrs)
+
     return {
         "path": str(ply_path),
         "vertex_count": int(vertex.count),
         "attributes": sorted(attr_names),
         "sha256": sha,
         "file_size": file_size,
+        "sh_rest_count": sh_order,
     }
+
+
+def _check_dtype(vertex, name: str, expected: str) -> None:
+    """Check that a vertex attribute has the expected numpy dtype."""
+    if name not in vertex.data.dtype.names:
+        return
+    actual_dtype = vertex.data.dtype[name]
+    if np.dtype(actual_dtype) != np.dtype(expected):
+        raise ConvertedPLYValidationError(
+            f"PLY attribute '{name}' has dtype {actual_dtype}, "
+            f"expected {expected}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,13 @@
 """
 Frame manifest validator for the LongSplat module.
 
-Read-only consumer: validates a frame manifest against the consumption
-contract required by this branch. Does not modify the manifest or the
-frame source directory.
+Read-only consumer: validates a LongSplat-internal manifest against the
+contract required by the LongSplat backend.
 
-The full manifest schema is owned by ``feature/preprocess-video``.
-This module only enforces the subset needed by the LongSplat backend.
+The full manifest schema is owned by ``feature/preprocess-video``.  Use
+:mod:`manifest_adapter` to translate real preprocess manifests into the
+format validated here.  This module only enforces the subset needed by
+the LongSplat backend.
 """
 
 from __future__ import annotations
@@ -169,7 +170,9 @@ def _validate_frames(manifest: dict[str, Any], source: Path) -> None:
                 f"Manifest {source}: frames[{i}].path must be a non-empty string"
             )
         resolved = (base / rel).resolve()
-        if not str(resolved).startswith(str(base.resolve())):
+        try:
+            resolved.relative_to(base.resolve())
+        except ValueError:
             raise ManifestValidationError(
                 f"Manifest {source}: frames[{i}].path {rel!r} escapes base directory"
             )

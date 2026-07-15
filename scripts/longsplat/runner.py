@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass, field
-
 from pathlib import Path
 from typing import Any
 
@@ -23,13 +22,35 @@ from typing import Any
 LONGSPLAT_REPO_URL = "https://github.com/NVlabs/LongSplat"
 LONGSPLAT_COMMIT = "19750775a9d19f30aa05a8333c4c6c231b2d5f4a"
 
-# Submodules expected at the locked commit
-_LONGSPLAT_SUBMODULES = [
-    "submodules/mast3r",
-    "submodules/diff-gaussian-rasterization",
-    "submodules/fused-ssim",
-    "submodules/simple-knn",
-]
+# Submodules expected at the locked commit, with their pinned gitlink SHAs.
+_LONGSPLAT_SUBMODULE_LINKS = {
+    "submodules/mast3r": "f186332c5a4cf19ff4563ea6f55a5a3efe1c43bb",
+    "submodules/diff-gaussian-rasterization": (
+        "59f5f77e3e3415b362ab259b1af7f8bc7e9e87c2"
+    ),
+    "submodules/fused-ssim": "59f5f77e3e3415b362ab259b1af7f8bc7e9e87c2",
+    "submodules/simple-knn": "59f5f77e3e3415b362ab259b1af7f8bc7e9e87c2",
+}
+
+# LongSplat train.py boolean flags that are store_true (no value argument).
+_STORE_TRUE_FLAGS = frozenset(
+    {
+        "quiet",
+        "test_iterations",
+        "skip_test",
+        "skip_train",
+        "detect_anomaly",
+        "eval",
+        "use_wandb",
+    }
+)
+
+# LongSplat train.py boolean flags that are store_false.
+_STORE_FALSE_FLAGS = frozenset(
+    {
+        "no_save",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,8 +68,10 @@ class LongSplatConfig:
     resolution: int = -1
     sh_degree: int = 3
     iterations: int = 30_000
-    seed: int = 42
-    # Passthrough args forwarded directly to train.py
+    mode: str = "custom"
+    seed: int = 0
+    # Stage-specific iteration overrides for LongSplat.
+    # Defaults (from locked train.py) are long runs; smoke tests need these.
     extra_train_args: dict[str, Any] = field(default_factory=dict)
     # Converter settings
     convert_iteration: int = 30_000
@@ -65,7 +88,8 @@ class BackendValidationError(Exception):
 
 
 def _check_repo(repo_root: str | Path) -> Path:
-    """Verify the LongSplat repo exists and is at the locked commit."""
+    """Verify the LongSplat repo exists, is at the locked commit, and all
+    submodules are at their pinned gitlink SHAs."""
     root = Path(repo_root).resolve()
     if not root.is_dir():
         raise BackendValidationError(f"LongSplat repo not found: {root}")
@@ -74,7 +98,7 @@ def _check_repo(repo_root: str | Path) -> Path:
     if not git_dir.exists():
         raise BackendValidationError(f"Not a git repository: {root}")
 
-    # Check commit
+    # Check superproject commit
     result = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
         capture_output=True, text=True,
@@ -86,15 +110,36 @@ def _check_repo(repo_root: str | Path) -> Path:
             f"got {actual}"
         )
 
-    # Check submodules
-    missing_subs = []
-    for sub in _LONGSPLAT_SUBMODULES:
+    # Check submodule init and gitlink SHAs (before dirty check: missing
+    # submodules are more critical than uncommitted local changes).
+    for sub, expected_sha in _LONGSPLAT_SUBMODULE_LINKS.items():
         sub_path = root / sub
         if not sub_path.is_dir() or not (sub_path / ".git").exists():
-            missing_subs.append(sub)
-    if missing_subs:
+            raise BackendValidationError(
+                f"LongSplat submodule not initialized: {sub}"
+            )
+
+        sha_result = subprocess.run(
+            ["git", "-C", str(sub_path), "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+        )
+        actual_sha = sha_result.stdout.strip()
+        if actual_sha != expected_sha:
+            raise BackendValidationError(
+                f"Submodule {sub} SHA mismatch: expected {expected_sha}, "
+                f"got {actual_sha}"
+            )
+
+    # Check dirty state after submodules — a dirty repo is a warning-worthy
+    # condition but missing/wrong submodules are hard failures.
+    status_result = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    if status_result.stdout.strip():
         raise BackendValidationError(
-            f"LongSplat submodules not initialized: {missing_subs}"
+            f"LongSplat repo is dirty — commit any changes before running:\n"
+            f"{status_result.stdout[:500]}"
         )
 
     return root
@@ -143,13 +188,29 @@ def build_train_command(
         "--resolution", str(config.resolution),
         "--sh_degree", str(config.sh_degree),
         "--iterations", str(config.iterations),
+        "--mode", config.mode,
+        "--seed", str(config.seed),
         "--quiet",
     ]
 
-    # Append extra passthrough args
+    # Append extra passthrough args with correct bool handling.
     for key, value in config.extra_train_args.items():
-        cmd.append(f"--{key}")
-        if not isinstance(value, bool):
+        flag = f"--{key}"
+        if key in _STORE_TRUE_FLAGS:
+            if value:
+                cmd.append(flag)
+            # store_true=False means omit the flag
+        elif key in _STORE_FALSE_FLAGS:
+            if not value:
+                cmd.append(flag)
+            # store_false=True means omit the flag
+        elif isinstance(value, bool):
+            # For boolean-valued flags that are NOT store_true/store_false,
+            # keep the old behavior: emit flag if value is truthy.
+            if value:
+                cmd.append(flag)
+        else:
+            cmd.append(flag)
             cmd.append(str(value))
 
     return cmd
@@ -217,7 +278,8 @@ def load_config(path: str | Path) -> LongSplatConfig:
     """Load a LongSplatConfig from a JSON file."""
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
-    return LongSplatConfig(**data)
+    return LongSplatConfig(**{k: v for k, v in data.items()
+                              if k in LongSplatConfig.__dataclass_fields__})
 
 
 def config_to_dict(config: LongSplatConfig) -> dict[str, Any]:

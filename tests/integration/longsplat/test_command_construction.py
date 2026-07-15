@@ -7,6 +7,7 @@ Uses fake subprocess fixtures — no real GPU, LongSplat, or checkpoint.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from unittest import mock
@@ -67,14 +68,34 @@ def fake_longsplat_repo(tmp_path):
     )
     actual_commit = result.stdout.strip()
 
-    # Create submodule directories
+    # Create submodule directories as real git repos (needed for SHA checks)
+    sub_commits = {}
     for sub in ["submodules/mast3r", "submodules/diff-gaussian-rasterization",
                 "submodules/fused-ssim", "submodules/simple-knn"]:
         sub_dir = repo / sub
         sub_dir.mkdir(parents=True)
-        (sub_dir / ".git").mkdir()
+        subprocess.run(["git", "-C", str(sub_dir), "init"], capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(sub_dir), "config", "user.email", "test@test"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(sub_dir), "config", "user.name", "test"],
+            capture_output=True,
+        )
+        (sub_dir / "stub").write_text("sub stub")
+        subprocess.run(["git", "-C", str(sub_dir), "add", "."], capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(sub_dir), "commit", "-m", "sub init"],
+            capture_output=True,
+        )
+        sha_result = subprocess.run(
+            ["git", "-C", str(sub_dir), "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+        )
+        sub_commits[sub] = sha_result.stdout.strip()
 
-    return repo, actual_commit
+    return repo, actual_commit, sub_commits
 
 
 @pytest.fixture
@@ -171,7 +192,7 @@ def test_check_repo_missing_raises(tmp_path):
 
 def test_check_repo_commit_mismatch_raises(fake_longsplat_repo):
     """Repo exists but at a different commit than locked."""
-    repo, actual_commit = fake_longsplat_repo
+    repo, actual_commit, _sub_commits = fake_longsplat_repo
     # Create a new commit so the repo diverges from LONGSPLAT_COMMIT
     (repo / "new_file").write_text("diverged")
     import subprocess
@@ -183,19 +204,22 @@ def test_check_repo_commit_mismatch_raises(fake_longsplat_repo):
 
 def test_check_repo_missing_submodules_raises(fake_longsplat_repo):
     """Repo at right commit but missing a submodule."""
-    repo, actual_commit = fake_longsplat_repo
-    # Remove a submodule
+    repo, actual_commit, sub_commits = fake_longsplat_repo
+    # Remove a submodule (handle Windows read-only git objects)
     import shutil
-    shutil.rmtree(repo / "submodules" / "mast3r")
-    # Patch LONGSPLAT_COMMIT to match this fake repo so we reach the
-    # submodule check instead of failing on commit mismatch.
+
+    def _on_rm_error(func, path, exc_info):
+        os.chmod(path, 0o666)
+        func(path)
+
+    shutil.rmtree(repo / "submodules" / "mast3r", onerror=_on_rm_error)
+    # Patch LONGSPLAT_COMMIT and submodule links to match this fake repo.
     with mock.patch("scripts.longsplat.runner.LONGSPLAT_COMMIT", actual_commit):
         with mock.patch(
-            "scripts.longsplat.runner._LONGSPLAT_SUBMODULES",
-            ["submodules/mast3r", "submodules/diff-gaussian-rasterization",
-             "submodules/fused-ssim", "submodules/simple-knn"],
+            "scripts.longsplat.runner._LONGSPLAT_SUBMODULE_LINKS",
+            sub_commits,
         ):
-            with pytest.raises(BackendValidationError, match="submodules"):
+            with pytest.raises(BackendValidationError, match="not initialized"):
                 _check_repo(repo)
 
 
