@@ -53,7 +53,29 @@ prepare_input(manifest, 'runs/run_001')
 "
 ```
 
-### 3. Run training and conversion
+### 3. Run the full pipeline (recommended)
+
+The single-entry orchestrator handles validation, preparation, training,
+conversion, PLY validation, and run recording:
+
+```bash
+./dev.sh python -c "
+from scripts.longsplat.orchestrator import run_pipeline
+from scripts.longsplat.runner import load_config
+
+config = load_config('configs/longsplat/smoke.json')
+exit_code = run_pipeline(
+    manifest_path='path/to/preprocess_manifest.json',
+    segment_id='your_segment_id',
+    config=config,
+    repo_root='/path/to/LongSplat',
+    output_dir='runs',
+)
+raise SystemExit(exit_code)
+"
+```
+
+Or run training and conversion separately (advanced):
 
 ```bash
 ./dev.sh python -c "
@@ -62,7 +84,7 @@ from scripts.longsplat.runner import (
 )
 
 config = load_config('configs/longsplat/smoke.json')
-config.source_path = 'runs/run_001/input/images'
+config.source_path = 'runs/run_001/input'
 config.model_path = 'runs/run_001/longsplat_model'
 
 run_training('/path/to/LongSplat', config)
@@ -77,7 +99,7 @@ run_conversion('/path/to/LongSplat', config)
 from scripts.longsplat.convert import validate_converted_ply
 
 meta = validate_converted_ply('runs/run_001/longsplat_model/converted_3dgs/point_cloud.ply')
-print(f'{meta[\"vertex_count\"]} gaussians, {meta[\"file_size\"]} bytes')
+print(f'{meta[\"vertex_count\"]} gaussians, SHA-256: {meta[\"sha256\"][:12]}...')
 "
 ```
 
@@ -93,7 +115,8 @@ Drop a JSON file into `configs/longsplat/` matching the `LongSplatConfig` schema
 | `resolution` | int | `-1` | Resolution override (-1 = native) |
 | `sh_degree` | int | `3` | Spherical harmonics degree |
 | `iterations` | int | `30000` | Training iterations |
-| `seed` | int | `42` | Random seed |
+| `seed` | int | `0` | Random seed (locked backend uses 0) |
+| `mode` | str | `custom` | Dataset mode (must be `custom` for video input) |
 | `extra_train_args` | dict | `{}` | Passthrough args to `train.py` |
 | `convert_iteration` | int | `30000` | Iteration to convert at |
 | `convert_prune_ratio` | float | `0.6` | Prune ratio for conversion |
