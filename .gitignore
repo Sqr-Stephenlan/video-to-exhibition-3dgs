@@ -113,16 +113,16 @@ third_party/*
 !third_party/README.md
 !third_party/*.txt
 
-# Demo / experimental data (large binary files)
-box/
-data/demo_object/
-data/demo_object_masked/
-outputs/demo_object/
-outputs/demo_object_masked/
-outputs/demo_object_v2/
-
-# Papers and PDFs
-*.pdf
+# Preprocessing utility scripts — kept locally for rendering tests;
+# the canonical preprocessing pipeline lives in feature/preprocess-video.
+scripts/extract_frames.py
+scripts/split_video.py
+scripts/build_manifest.py
+scripts/filter_blurry_frames.py
+scripts/normalize_exposure.py
+scripts/align_segments.py
+scripts/run_video_depth.py
+scripts/replace_bg_white_to_black.py
 
 # Local notes and moved documents (kept outside version control)
 .obsidian/
