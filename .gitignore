@@ -129,7 +129,6 @@ scripts/replace_bg_white_to_black.py
 README.md
 dev.ps1
 environment.yml
-requirements.txt
 docs/framework_risk_review.md
 docs/reproduction_plan.md
 

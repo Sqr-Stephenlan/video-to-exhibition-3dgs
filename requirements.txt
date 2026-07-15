@@ -1,0 +1,12 @@
+# === CPU CI 依赖 ===
+# 仅包含 tests/unit 和 tests/integration 所需的包。
+# GPU 训练依赖 (torch, gsplat 等) 需在 GPU 节点上单独安装。
+
+# 测试框架
+pytest
+
+# 科学计算
+numpy
+
+# 3D 文件解析
+plyfile
