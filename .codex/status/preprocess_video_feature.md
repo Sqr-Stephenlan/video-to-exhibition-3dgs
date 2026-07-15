@@ -1,6 +1,6 @@
 # Preprocess Video Feature Status
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 ## Current Phase
 
@@ -172,12 +172,30 @@ smoke test passes.
 - Generated a visual review video from the selected frames of
   `pressure_keep_blur60_dup4_fps5` at:
   `data/frames/pressure_keep_blur60_dup4_fps5/selected/selected_review.mp4`
+- Ran a second retained real-video matrix on the supplied 39.1-second iOS HEVC
+  sample. Output identifiers use `ios_test_*` because CLI video IDs cannot
+  contain spaces. All runs used source-frame PNG extraction, time fallback
+  segmentation, duplicate threshold `4`, and did not save rejected images to
+  limit disk usage:
+  - `ios_test_blur55_fps5_dup4`, `blur=55`, `fps=5`: 118/246 selected
+    (47.97%), selected-frame mean blur score 421.16.
+  - `ios_test_blur60_fps5_dup4` and `ios_test_blur65_fps5_dup4`: identical
+    result to `blur=55`; the threshold did not reject any additional frame.
+  - `ios_test_blur100_fps5_dup4`: 116/246 selected (47.15%), mean 426.89.
+  - `ios_test_blur150_fps5_dup4`: 113/246 selected (45.93%), mean 434.97.
+  - `ios_test_blur200_fps5_dup4`: 109/246 selected (44.31%), mean 445.40;
+    this is the sharpest retained practical candidate for this sample.
+  - `ios_test_blur60_fps6_dup4`: 122/295 selected (41.36%), mean 403.94;
+    raising sampling density added only four selected frames and reduced mean
+    selected-frame sharpness.
+- Generated the iOS quality-first visual review video at:
+  `data/frames/ios_test_blur200_fps5_dup4/selected/selected_review.mp4`.
 
 ## Next Step
 
 Review the retained comparison outputs, especially
-`pressure_keep_blur60_dup4_fps5`, and decide whether the small increase in
-clarity over `blur=55` is worth the additional selected-frame drop before
+`ios_test_blur200_fps5_dup4/selected/selected_review.mp4`, and decide whether
+the quality-first iOS threshold should become a separate profile before
 updating `configs/preprocess/baseline_real_video.json` and comparing against
 the `longsplat` preset:
 
@@ -187,6 +205,10 @@ the `longsplat` preset:
   - optionally set `target_fps: 4.0` if storage and review load need to come
     down
   - keep exposure thresholds at `0.6`
+- iOS quality-first candidate, kept separate pending manual visual acceptance:
+  - `blur_threshold: 200.0`
+  - `target_fps: 5.0`
+  - `duplicate_hash_threshold: 4`
 - confirmation command:
 
 ```bash
