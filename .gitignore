@@ -124,6 +124,15 @@ scripts/align_segments.py
 scripts/run_video_depth.py
 scripts/replace_bg_white_to_black.py
 
+# Shared-governance files restored by commit 57d32c4 — changes to these must
+# go through a separate controlled PR against main, not this branch.
+README.md
+dev.ps1
+environment.yml
+requirements.txt
+docs/framework_risk_review.md
+docs/reproduction_plan.md
+
 # Local notes and moved documents (kept outside version control)
 .obsidian/
 docs/2308.04079v1.pdf
