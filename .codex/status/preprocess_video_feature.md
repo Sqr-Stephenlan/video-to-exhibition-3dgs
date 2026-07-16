@@ -235,7 +235,7 @@ progress through the PR body update.
 
 ## Next Step
 
-Update the PR body to reflect the current HEAD `373ea4e`, complete the Ready
+Update the PR body to reflect the current HEAD `a8fff7c`, complete the Ready
 for review checklist, and request reviewer approval before switching the PR
 out of Draft.
 
