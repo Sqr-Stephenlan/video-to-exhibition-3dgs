@@ -4,13 +4,14 @@ Last updated: 2026-07-15
 
 ## Current Phase
 
-Stage 2 - Minimal preprocess MVP implemented and aligned with the main-branch
-test and API conventions. Fidelity frame extraction is implemented on branch
-`codex/preprocess-fidelity-frames`.
+Stage 2 - Minimal preprocess MVP implemented, review feedback addressed, and
+aligned with the main-branch test and API conventions. Fidelity frame
+extraction is implemented on branch `codex/preprocess-fidelity-frames`.
 
 The feature now has a single CLI entrypoint, focused tests, and user-facing
-documentation. FFmpeg and ffprobe are now installed on PATH, and the FFmpeg
-smoke test passes.
+documentation. FFmpeg and ffprobe are now installed on PATH, the FFmpeg smoke
+test passes, and the remaining Ready for review checklist items are now in
+progress through the PR body update.
 
 ## Completed
 
@@ -29,6 +30,14 @@ smoke test passes.
   - optional PySceneDetect scene segmentation with time-window fallback.
   - OpenCV frame sampling, blur/exposure scoring, average-hash duplicate
     filtering, selected/rejected frame handling, and manifest generation.
+- Addressed the outstanding review feedback by:
+  - ensuring `cv2.VideoCapture` is released in a `finally` block even when
+    frame sampling raises an error;
+  - adding `-hide_banner -loglevel error` to per-segment FFmpeg calls so long
+    runs do not buffer banner noise in memory.
+- Added regression tests covering:
+  - quiet segment FFmpeg command construction;
+  - `VideoCapture` release on frame-write failure.
 - Added `tests/unit/test_preprocess_video.py` covering:
   - time-window segmentation and tiny-tail merge behavior.
   - offset window math.
@@ -111,6 +120,11 @@ smoke test passes.
   `./dev.sh pytest`; result: `14 passed`.
 - Re-ran the full test suite after adding JSON tuning support through the
   project Python entrypoint: `./dev.sh pytest`; result: `20 passed`.
+- Re-ran `./dev.sh pytest tests/unit/test_preprocess_video.py` after the review
+  feedback fix; result: `20 passed, 2 skipped`.
+- Re-ran `./dev.sh python -m compileall -q scripts tests/unit`.
+- Re-ran the full test suite after the review feedback fix:
+  `./dev.sh pytest`; result: `20 passed, 2 skipped`.
 - Ran CLI help and compile checks after the config change:
   `./dev.sh python scripts/preprocess_video.py --help` and
   `./dev.sh python -m compileall -q scripts tests/unit`.
@@ -221,11 +235,9 @@ smoke test passes.
 
 ## Next Step
 
-Review the retained comparison outputs, especially
-`ios_test_blur200_fps5_dup4/selected/selected_review.mp4`, and decide whether
-the quality-first iOS threshold should become a separate profile before
-updating `configs/preprocess/baseline_real_video.json` and comparing against
-the `longsplat` preset:
+Update the PR body to reflect the current HEAD `373ea4e`, complete the Ready
+for review checklist, and request reviewer approval before switching the PR
+out of Draft.
 
 For `restricted_test`, review the `blur=60` and `blur=80` outputs before
 deciding whether the baseline should move from `55` to `60`, or whether the

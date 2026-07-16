@@ -433,6 +433,9 @@ def write_segment(normalized_path: Path, segment: SegmentWindow, destination: Pa
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [
         "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-y",
         "-ss",
         f"{segment.start_sec:.3f}",
@@ -542,90 +545,91 @@ def sample_segment_frames(
 
     sampling_path = source_video if frame_source == "source" else segment.path
     cap = cv2.VideoCapture(str(sampling_path))
-    if not cap.isOpened():
-        raise PreprocessError(f"OpenCV could not open video for frame sampling: {sampling_path}.")
+    try:
+        if not cap.isOpened():
+            raise PreprocessError(f"OpenCV could not open video for frame sampling: {sampling_path}.")
 
-    segment_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    sample_every = 1 if segment_fps <= 0 else max(1, int(round(segment_fps / target_fps)))
-    start_frame_index = 0
-    end_frame_index: int | None = None
-    if frame_source == "source" and segment_fps > 0:
-        start_frame_index = max(0, int(round(segment.start_sec * segment_fps)))
-        end_frame_index = max(start_frame_index, int(round(segment.end_sec * segment_fps)))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_index)
+        segment_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        sample_every = 1 if segment_fps <= 0 else max(1, int(round(segment_fps / target_fps)))
+        start_frame_index = 0
+        end_frame_index: int | None = None
+        if frame_source == "source" and segment_fps > 0:
+            start_frame_index = max(0, int(round(segment.start_sec * segment_fps)))
+            end_frame_index = max(start_frame_index, int(round(segment.end_sec * segment_fps)))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_index)
 
-    selected_hashes: list[np.ndarray] = []
-    records: list[FrameRecord] = []
-    selected_dir = selected_root / segment.id
-    rejected_dir = rejected_root / segment.id
-    selected_dir.mkdir(parents=True, exist_ok=True)
-    if save_rejected:
-        rejected_dir.mkdir(parents=True, exist_ok=True)
+        selected_hashes: list[np.ndarray] = []
+        records: list[FrameRecord] = []
+        selected_dir = selected_root / segment.id
+        rejected_dir = rejected_root / segment.id
+        selected_dir.mkdir(parents=True, exist_ok=True)
+        if save_rejected:
+            rejected_dir.mkdir(parents=True, exist_ok=True)
 
-    frame_number = 0
-    source_frame_index = start_frame_index
-    sample_index = 0
-    while True:
-        if end_frame_index is not None and source_frame_index >= end_frame_index:
-            break
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frame_number += 1
-        absolute_frame_index = source_frame_index + 1
-        source_frame_index += 1
-        if (frame_number - 1) % sample_every != 0:
-            continue
+        frame_number = 0
+        source_frame_index = start_frame_index
+        sample_index = 0
+        while True:
+            if end_frame_index is not None and source_frame_index >= end_frame_index:
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_number += 1
+            absolute_frame_index = source_frame_index + 1
+            source_frame_index += 1
+            if (frame_number - 1) % sample_every != 0:
+                continue
 
-        frame = resize_frame(frame, resize_to if frame_source == "source" else None)
-        sample_index += 1
-        local_timestamp = 0.0 if segment_fps <= 0 else (frame_number - 1) / segment_fps
-        timestamp = round_sec(segment.start_sec + local_timestamp)
-        blur = blur_score(frame)
-        over, under = exposure_ratios(frame)
-        current_hash = average_hash(frame)
-        duplicate = min((hash_distance(current_hash, item) for item in selected_hashes), default=None)
+            frame = resize_frame(frame, resize_to if frame_source == "source" else None)
+            sample_index += 1
+            local_timestamp = 0.0 if segment_fps <= 0 else (frame_number - 1) / segment_fps
+            timestamp = round_sec(segment.start_sec + local_timestamp)
+            blur = blur_score(frame)
+            over, under = exposure_ratios(frame)
+            current_hash = average_hash(frame)
+            duplicate = min((hash_distance(current_hash, item) for item in selected_hashes), default=None)
 
-        reject_reasons = []
-        if blur < blur_threshold:
-            reject_reasons.append("blur")
-        if over > overexposed_ratio:
-            reject_reasons.append("overexposed")
-        if under > underexposed_ratio:
-            reject_reasons.append("underexposed")
-        if duplicate is not None and duplicate <= duplicate_hash_threshold:
-            reject_reasons.append("duplicate")
+            reject_reasons = []
+            if blur < blur_threshold:
+                reject_reasons.append("blur")
+            if over > overexposed_ratio:
+                reject_reasons.append("overexposed")
+            if under > underexposed_ratio:
+                reject_reasons.append("underexposed")
+            if duplicate is not None and duplicate <= duplicate_hash_threshold:
+                reject_reasons.append("duplicate")
 
-        selected = not reject_reasons
-        filename = frame_filename(sample_index, timestamp, frame_format)
-        output_path: Path | None
-        if selected:
-            output_path = selected_dir / filename
-            selected_hashes.append(current_hash)
-            write_image(output_path, frame, frame_format)
-        elif save_rejected:
-            output_path = rejected_dir / filename
-            write_image(output_path, frame, frame_format)
-        else:
-            output_path = None
+            selected = not reject_reasons
+            filename = frame_filename(sample_index, timestamp, frame_format)
+            output_path: Path | None
+            if selected:
+                output_path = selected_dir / filename
+                selected_hashes.append(current_hash)
+                write_image(output_path, frame, frame_format)
+            elif save_rejected:
+                output_path = rejected_dir / filename
+                write_image(output_path, frame, frame_format)
+            else:
+                output_path = None
 
-        records.append(
-            FrameRecord(
-                id=f"{segment.id}_frame_{sample_index:06d}",
-                segment_id=segment.id,
-                path=relative_path(output_path, repo_root) if output_path else None,
-                timestamp_sec=timestamp,
-                frame_index=absolute_frame_index if frame_source == "source" else frame_number,
-                selected=selected,
-                blur_score=round(float(blur), 3),
-                overexposed_ratio=round(float(over), 6),
-                underexposed_ratio=round(float(under), 6),
-                duplicate_score=duplicate,
-                reject_reasons=reject_reasons,
+            records.append(
+                FrameRecord(
+                    id=f"{segment.id}_frame_{sample_index:06d}",
+                    segment_id=segment.id,
+                    path=relative_path(output_path, repo_root) if output_path else None,
+                    timestamp_sec=timestamp,
+                    frame_index=absolute_frame_index if frame_source == "source" else frame_number,
+                    selected=selected,
+                    blur_score=round(float(blur), 3),
+                    overexposed_ratio=round(float(over), 6),
+                    underexposed_ratio=round(float(under), 6),
+                    duplicate_score=duplicate,
+                    reject_reasons=reject_reasons,
+                )
             )
-        )
-
-    cap.release()
+    finally:
+        cap.release()
     return records
 
 

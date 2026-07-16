@@ -190,6 +190,25 @@ def test_build_segment_windows_splits_scene_windows(monkeypatch: pytest.MonkeyPa
     assert all(segment.duration_sec <= 30.0 for segment in segments)
 
 
+def test_write_segment_uses_quiet_ffmpeg_logging(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_command(command: list[str], description: str) -> None:
+        captured["command"] = command
+        captured["description"] = description
+
+    monkeypatch.setattr(pv, "require_tool", lambda _name: "ffmpeg")
+    monkeypatch.setattr(pv, "run_command", fake_run_command)
+    segment = pv.SegmentWindow(id="segment_0001", index=1, start_sec=0.0, end_sec=5.0, reason="time")
+    destination = tmp_path / "segment_0001.mp4"
+
+    result = pv.write_segment(Path("normalized.mp4"), segment, destination)
+
+    assert captured["command"][:5] == ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    assert captured["description"] == "Writing segment_0001"
+    assert result.path == destination
+
+
 def test_validate_video_id_rejects_parent_or_current_directory() -> None:
     with pytest.raises(pv.PreprocessError):
         pv.validate_video_id(".")
@@ -305,6 +324,61 @@ def test_manifest_writes_stable_relative_paths(tmp_path: Path) -> None:
     assert loaded["segments"][0]["path"] == "data/segments/sample/segment_0001.mp4"
     assert loaded["frames"][0]["path"] == frame_path
     assert loaded["summary"]["selected_frames"] == 1
+
+
+def test_sample_segment_frames_releases_capture_when_frame_write_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeCapture:
+        def __init__(self) -> None:
+            self.released = False
+
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, _property_id: int) -> float:
+            return 1.0
+
+        def set(self, _property_id: int, _value: float) -> bool:
+            return True
+
+        def read(self) -> tuple[bool, np.ndarray]:
+            return True, np.full((8, 8, 3), 127, dtype=np.uint8)
+
+        def release(self) -> None:
+            self.released = True
+
+    capture = FakeCapture()
+
+    def fail_write(_path: Path, _frame: np.ndarray, _frame_format: str = "jpg") -> None:
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(pv.cv2, "VideoCapture", lambda _path: capture)
+    monkeypatch.setattr(pv, "write_image", fail_write)
+    segment = pv.SegmentWindow(
+        id="segment_0001",
+        index=1,
+        start_sec=0.0,
+        end_sec=1.0,
+        reason="time",
+        path=tmp_path / "segment_0001.mp4",
+    )
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        pv.sample_segment_frames(
+            segment=segment,
+            selected_root=tmp_path / "selected",
+            rejected_root=tmp_path / "rejected",
+            target_fps=1.0,
+            blur_threshold=0.0,
+            overexposed_ratio=1.0,
+            underexposed_ratio=1.0,
+            duplicate_hash_threshold=4,
+            save_rejected=False,
+            repo_root=tmp_path,
+        )
+
+    assert capture.released is True
 
 
 @pytest.mark.skipif(
