@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 
 CHECKPOINT_NAMES = {
     ("relative", "vits"): "video_depth_anything_vits.pth",
@@ -34,7 +35,6 @@ def resolve_checkpoint(repo_dir: Path, backend: dict[str, Any]) -> Path:
         path = Path(configured)
         if path.is_absolute():
             raise ValueError("backend.checkpoint must be repository-relative")
-        # Allow either repo-relative or project-relative; prefer under repo_dir/checkpoints.
         candidate = repo_dir / configured
         if candidate.is_file():
             return candidate
@@ -69,7 +69,7 @@ def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     backend = config["backend"]
     repo_dir = (root / backend["repo_dir"]).resolve()
     report: dict[str, Any] = {
-        "repo_dir": repo_dir.as_posix(),
+        "repo_dir": backend["repo_dir"],
         "repo_exists": repo_dir.is_dir(),
         "run_py": (repo_dir / "run.py").is_file() if repo_dir.is_dir() else False,
         "pinned_commit": backend.get("commit"),
@@ -101,13 +101,16 @@ def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
 
     try:
         ckpt = resolve_checkpoint(repo_dir, backend)
-        report["checkpoint"] = ckpt.as_posix()
+        try:
+            report["checkpoint"] = ckpt.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            report["checkpoint"] = ckpt.as_posix()
         report["checkpoint_exists"] = ckpt.is_file()
         if ckpt.is_file():
             report["checkpoint_sha256"] = sha256_file(ckpt)
         else:
             report["issues"].append(
-                f"Missing checkpoint: {ckpt.as_posix()}. Download the vitb relative weights."
+                f"Missing checkpoint: {report['checkpoint']}. Download the vitb relative weights."
             )
     except (OSError, ValueError) as exc:
         report["issues"].append(str(exc))
@@ -124,20 +127,21 @@ def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     ffmpeg = shutil.which("ffmpeg")
     report["ffmpeg"] = ffmpeg
     if not ffmpeg:
-        report["issues"].append("ffmpeg not found on PATH (needed to assemble frames into a temp video)")
+        report["issues"].append(
+            "ffmpeg not found on PATH (needed to assemble frames into a temp video)"
+        )
 
     return report
 
 
-def run_vda_on_video(
+def build_vda_command(
     *,
     repo_dir: Path,
     input_video: Path,
     output_dir: Path,
     backend: dict[str, Any],
     python_exe: str | None = None,
-) -> subprocess.CompletedProcess[str]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+) -> list[str]:
     cmd = [
         python_exe or sys.executable,
         str(repo_dir / "run.py"),
@@ -157,14 +161,98 @@ def run_vda_on_video(
     if backend.get("fp16", True) is False:
         cmd.append("--fp32")
     cmd.extend(["--save_npz", "--grayscale"])
+    return cmd
 
-    return subprocess.run(
+
+def run_vda_on_video(
+    *,
+    repo_dir: Path,
+    input_video: Path,
+    output_dir: Path,
+    backend: dict[str, Any],
+    python_exe: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cmd = build_vda_command(
+        repo_dir=repo_dir,
+        input_video=input_video,
+        output_dir=output_dir,
+        backend=backend,
+        python_exe=python_exe,
+    )
+    result = subprocess.run(
         cmd,
         cwd=str(repo_dir),
         check=False,
         capture_output=True,
         text=True,
     )
+    return result, cmd
+
+
+def find_vda_depths_npz(output_dir: Path) -> Path:
+    candidates = sorted(output_dir.rglob("*_depths.npz"))
+    if not candidates:
+        candidates = sorted(output_dir.rglob("*.npz"))
+    if not candidates:
+        raise FileNotFoundError(f"No VDA depth NPZ found under {output_dir.as_posix()}")
+    if len(candidates) > 1:
+        # Prefer the canonical *_depths.npz produced by run.py.
+        preferred = [path for path in candidates if path.name.endswith("_depths.npz")]
+        if len(preferred) == 1:
+            return preferred[0]
+        raise ValueError(
+            "Multiple depth NPZ files found; expected a single VDA *_depths.npz. "
+            f"Found: {[path.name for path in candidates]}"
+        )
+    return candidates[0]
+
+
+def load_vda_depths_array(npz_path: Path) -> np.ndarray:
+    with np.load(npz_path, allow_pickle=False) as data:
+        if "depths" not in data:
+            raise ValueError(
+                f"VDA NPZ missing 'depths' key: {npz_path.as_posix()} "
+                f"(keys={list(data.keys())})"
+            )
+        depths = np.asarray(data["depths"])
+    if depths.ndim < 3:
+        raise ValueError(
+            f"VDA depths array must be (N,H,W[+C]); got shape {depths.shape} "
+            f"from {npz_path.as_posix()}"
+        )
+    return depths
+
+
+def split_vda_depths_to_frame_files(
+    *,
+    depths: np.ndarray,
+    frames: list[dict[str, Any]],
+    depth_dir: Path,
+    root: Path,
+    depth_type: str,
+) -> list[dict[str, Any]]:
+    if depths.shape[0] != len(frames):
+        raise ValueError(
+            f"VDA depths frame count {depths.shape[0]} != selected frames {len(frames)}"
+        )
+    depth_dir.mkdir(parents=True, exist_ok=True)
+    frame_records: list[dict[str, Any]] = []
+    for index, frame in enumerate(frames):
+        frame_id = frame["frame_id"]
+        dest = depth_dir / f"{frame_id}.npz"
+        np.savez_compressed(dest, depth=np.asarray(depths[index]))
+        frame_records.append(
+            {
+                "frame_id": frame_id,
+                "rgb_path": frame["path"],
+                "depth_path": dest.resolve().relative_to(root.resolve()).as_posix(),
+                "depth_type": depth_type,
+                "confidence_path": None,
+                "depth_index": index,
+            }
+        )
+    return frame_records
 
 
 def write_run_record(path: Path, record: dict[str, Any]) -> None:

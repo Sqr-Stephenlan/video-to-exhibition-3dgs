@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from scripts.depth.config import validate_frame_id
+
 
 def load_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
@@ -37,6 +39,7 @@ def selected_frames(frames_manifest: dict[str, Any]) -> list[dict[str, Any]]:
         for key in ("frame_id", "path"):
             if key not in frame or not frame[key]:
                 raise ValueError(f"frames[{index}].{key} is required")
+        validate_frame_id(str(frame["frame_id"]))
         selected.append(frame)
     if not selected:
         raise ValueError("No selected frames in frames_manifest")

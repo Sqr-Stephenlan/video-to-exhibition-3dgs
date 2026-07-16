@@ -47,6 +47,8 @@ Git Bash / WSL (when `.venv/bin/python` exists):
 
 ## Outputs
 
-- `data/depth/<frame_id>.npz`
+- `data/depth/<frame_id>.npz` — one file per selected frame; each stores a single `depth` array
 - `data/manifests/depth_manifest.json`
-- `outputs/reconstructions/depth_prior/run_record.json`
+- `outputs/reconstructions/depth_prior/run_record.json` — repository-relative paths, command, backend commit, I/O
+
+VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)`. The orchestrator validates `N` against the selected frame count and splits into per-frame NPZ files.

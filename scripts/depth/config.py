@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ import yaml
 
 ALLOWED_ENCODERS = {"vits", "vitb", "vitl"}
 ALLOWED_DEPTH_TYPES = {"relative", "metric"}
+FRAME_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -40,8 +42,32 @@ def validate_config(data: dict[str, Any]) -> None:
             raise ValueError(f"config.io.{key} is required")
 
 
+def validate_frame_id(frame_id: str) -> str:
+    if not isinstance(frame_id, str) or not FRAME_ID_RE.fullmatch(frame_id):
+        raise ValueError(
+            "frame_id must be 1-128 chars of [A-Za-z0-9._-] and start with alphanumeric; "
+            f"got {frame_id!r}"
+        )
+    return frame_id
+
+
 def resolve_repo_path(root: Path, relative: str | Path) -> Path:
     path = Path(relative)
     if path.is_absolute():
         raise ValueError(f"Absolute paths are not allowed in configs: {path}")
-    return (root / path).resolve()
+    root_resolved = root.resolve()
+    candidate = (root_resolved / path).resolve()
+    try:
+        candidate.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"Path escapes repository root: {relative}") from exc
+    return candidate
+
+
+def to_repo_relative(root: Path, path: Path) -> str:
+    root_resolved = root.resolve()
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(root_resolved).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"Path is outside repository root: {path}") from exc

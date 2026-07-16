@@ -15,8 +15,15 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.depth.backend_vda import doctor_backend, run_vda_on_video, write_run_record
-from scripts.depth.config import load_config, resolve_repo_path
+from scripts.depth.backend_vda import (
+    doctor_backend,
+    find_vda_depths_npz,
+    load_vda_depths_array,
+    run_vda_on_video,
+    split_vda_depths_to_frame_files,
+    write_run_record,
+)
+from scripts.depth.config import load_config, resolve_repo_path, to_repo_relative
 from scripts.depth.manifest import (
     build_depth_manifest,
     load_json,
@@ -34,7 +41,7 @@ def cmd_doctor(config_path: Path) -> int:
     config = load_config(config_path)
     report = doctor_backend(root, config)
     print("depth-prior doctor")
-    print(f"  config: {config_path.as_posix()}")
+    print(f"  config: {to_repo_relative(root, config_path)}")
     print(f"  encoder: {config['backend']['encoder']} ({config['backend']['depth_type']})")
     print(f"  repo_exists: {report['repo_exists']}")
     print(f"  pinned_commit: {report['pinned_commit']}")
@@ -104,13 +111,15 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
     io = config["io"]
     runtime = config.get("runtime") or {}
 
-    frames_manifest_path = resolve_repo_path(root, io["frames_manifest"])
+    config_rel = to_repo_relative(root, config_path)
+    frames_manifest_rel = io["frames_manifest"]
+    frames_manifest_path = resolve_repo_path(root, frames_manifest_rel)
     if not frames_manifest_path.is_file():
         example = root / "configs" / "depth" / "frames_manifest.example.json"
         print(
             "frames_manifest not found. Place selected frames and a manifest first.\n"
-            f"  expected: {io['frames_manifest']}\n"
-            f"  example schema: {example.as_posix()}"
+            f"  expected: {frames_manifest_rel}\n"
+            f"  example schema: {to_repo_relative(root, example)}"
         )
         return 2
 
@@ -133,75 +142,94 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
     if dry_run:
         print("dry-run ok")
         print(f"  selected_frames: {len(frames)}")
-        print(f"  depth_dir: {depth_dir.as_posix()}")
-        print(f"  depth_manifest: {depth_manifest_path.as_posix()}")
+        print(f"  depth_dir: {to_repo_relative(root, depth_dir)}")
+        print(f"  depth_manifest: {to_repo_relative(root, depth_manifest_path)}")
         return 0
 
-    with tempfile.TemporaryDirectory(prefix="depth_prior_") as tmp:
-        tmp_dir = Path(tmp)
-        temp_video = tmp_dir / "input.mp4"
-        vda_out = tmp_dir / "vda_out"
-        _assemble_temp_video(frame_paths, float(runtime.get("target_fps", 5)), temp_video)
-        result = run_vda_on_video(
-            repo_dir=repo_dir,
-            input_video=temp_video,
-            output_dir=vda_out,
-            backend=backend,
-        )
+    started_at = datetime.now(timezone.utc).isoformat()
+    command: list[str] = []
+    result_code = 1
+    stdout_tail = ""
+    stderr_tail = ""
+    vda_npz_rel: str | None = None
+    frame_count_written = 0
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="depth_prior_") as tmp:
+            tmp_dir = Path(tmp)
+            temp_video = tmp_dir / "input.mp4"
+            vda_out = tmp_dir / "vda_out"
+            _assemble_temp_video(frame_paths, float(runtime.get("target_fps", 5)), temp_video)
+            result, command = run_vda_on_video(
+                repo_dir=repo_dir,
+                input_video=temp_video,
+                output_dir=vda_out,
+                backend=backend,
+            )
+            result_code = result.returncode
+            stdout_tail = (result.stdout or "")[-4000:]
+            stderr_tail = (result.stderr or "")[-4000:]
+            if result.returncode != 0:
+                print("Video Depth Anything failed. See run_record for stdout/stderr tails.")
+                print(to_repo_relative(root, run_record_path))
+                return result.returncode
+
+            # VDA writes one *_depths.npz with depths shaped (N,H,W).
+            vda_npz = find_vda_depths_npz(vda_out)
+            depths = load_vda_depths_array(vda_npz)
+            # Keep a repo-relative note of the source artifact name only (temp path is not retained).
+            vda_npz_rel = vda_npz.name
+            frame_records = split_vda_depths_to_frame_files(
+                depths=depths,
+                frames=frames,
+                depth_dir=depth_dir,
+                root=root,
+                depth_type=backend["depth_type"],
+            )
+            frame_count_written = len(frame_records)
+            depth_manifest = build_depth_manifest(
+                frames_manifest=frames_manifest,
+                frame_records=frame_records,
+                backend={
+                    **backend,
+                    "commit": doctor.get("actual_commit") or backend.get("commit"),
+                },
+                depth_type=backend["depth_type"],
+            )
+            save_json(depth_manifest_path, depth_manifest)
+            print(f"wrote {frame_count_written} depth maps")
+            print(f"depth_manifest: {to_repo_relative(root, depth_manifest_path)}")
+            return 0
+    finally:
         write_run_record(
             run_record_path,
             {
                 "module": "depth-prior",
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "config": config_path.as_posix(),
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "config": config_rel,
+                "frames_manifest": frames_manifest_rel,
+                "backend_name": backend.get("name"),
+                "backend_repo_dir": backend.get("repo_dir"),
                 "backend_commit": doctor.get("actual_commit"),
                 "encoder": backend["encoder"],
                 "depth_type": backend["depth_type"],
-                "command_returncode": result.returncode,
-                "stdout_tail": (result.stdout or "")[-4000:],
-                "stderr_tail": (result.stderr or "")[-4000:],
+                "checkpoint": doctor.get("checkpoint"),
                 "checkpoint_sha256": doctor.get("checkpoint_sha256"),
+                "command": command,
+                "random_seed": None,
+                "command_returncode": result_code,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "vda_depths_npz": vda_npz_rel,
+                "outputs": {
+                    "depth_dir": to_repo_relative(root, depth_dir),
+                    "depth_manifest": to_repo_relative(root, depth_manifest_path),
+                    "run_record": to_repo_relative(root, run_record_path),
+                    "frame_count": frame_count_written,
+                },
             },
         )
-        if result.returncode != 0:
-            print("Video Depth Anything failed. See run_record for stdout/stderr tails.")
-            print(run_record_path.as_posix())
-            return result.returncode
-
-        # VDA writes NPZ under output_dir; map by sorted order to selected frames.
-        npz_files = sorted(vda_out.rglob("*.npz"))
-        if len(npz_files) < len(frames):
-            print(
-                f"VDA produced {len(npz_files)} depth files for {len(frames)} frames; "
-                "refusing to write a partial depth_manifest."
-            )
-            return 3
-
-        depth_dir.mkdir(parents=True, exist_ok=True)
-        frame_records = []
-        for frame, npz_path in zip(frames, npz_files[: len(frames)], strict=True):
-            dest = depth_dir / f"{frame['frame_id']}.npz"
-            shutil.copy2(npz_path, dest)
-            frame_records.append(
-                {
-                    "frame_id": frame["frame_id"],
-                    "rgb_path": frame["path"],
-                    "depth_path": dest.relative_to(root).as_posix(),
-                    "depth_type": backend["depth_type"],
-                    "confidence_path": None,
-                }
-            )
-
-        depth_manifest = build_depth_manifest(
-            frames_manifest=frames_manifest,
-            frame_records=frame_records,
-            backend={**backend, "commit": doctor.get("actual_commit") or backend.get("commit")},
-            depth_type=backend["depth_type"],
-        )
-        save_json(depth_manifest_path, depth_manifest)
-        print(f"wrote {len(frame_records)} depth maps")
-        print(f"depth_manifest: {depth_manifest_path.as_posix()}")
-        return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -225,7 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config_path = project_root() / args.config
+    config_path = resolve_repo_path(project_root(), args.config)
     if args.command == "doctor":
         return cmd_doctor(config_path)
     if args.command == "run":

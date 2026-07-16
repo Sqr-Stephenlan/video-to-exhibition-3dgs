@@ -12,11 +12,11 @@
 | License note | Base/Large weights use CC-BY-NC-4.0 |
 | Invoked by | `scripts/depth/run_depth_prior.py` → backend `run.py` |
 
-Default config fingerprint:
+Default config fingerprint (canonical Git blob / LF bytes; use `git show HEAD:configs/depth/default_vitb.yaml | sha256sum`):
 
 | File | SHA-256 |
 |---|---|
-| `configs/depth/default_vitb.yaml` | `675774b99b94f86094eb91b04c49c19c8f47440da97da68c63268608650a8d59` |
+| `configs/depth/default_vitb.yaml` | `254be26a1330708b27713690c5c670df11d4648b84b1b3714f7d0ba1553deb52` |
 
 ## Clone (do not commit the clone)
 
