@@ -20,7 +20,9 @@ from scripts.depth.backend_vda import (
     find_vda_depths_npz,
     load_vda_depths_array,
     run_vda_on_video,
+    sanitize_command_for_record,
     split_vda_depths_to_frame_files,
+    stage_checkpoint_for_vda,
     write_run_record,
 )
 from scripts.depth.config import load_config, resolve_repo_path, to_repo_relative
@@ -147,12 +149,13 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
         return 0
 
     started_at = datetime.now(timezone.utc).isoformat()
-    command: list[str] = []
+    command_record: list[str] = []
     result_code = 1
     stdout_tail = ""
     stderr_tail = ""
     vda_npz_rel: str | None = None
     frame_count_written = 0
+    checkpoint_meta: dict = {}
 
     try:
         with tempfile.TemporaryDirectory(prefix="depth_prior_") as tmp:
@@ -160,11 +163,17 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
             temp_video = tmp_dir / "input.mp4"
             vda_out = tmp_dir / "vda_out"
             _assemble_temp_video(frame_paths, float(runtime.get("target_fps", 5)), temp_video)
-            result, command = run_vda_on_video(
+            result, command, checkpoint_meta = run_vda_on_video(
+                root=root,
                 repo_dir=repo_dir,
                 input_video=temp_video,
                 output_dir=vda_out,
                 backend=backend,
+            )
+            command_record = sanitize_command_for_record(
+                root=root,
+                command=command,
+                temp_dir=tmp_dir,
             )
             result_code = result.returncode
             stdout_tail = (result.stdout or "")[-4000:]
@@ -214,9 +223,13 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
                 "backend_commit": doctor.get("actual_commit"),
                 "encoder": backend["encoder"],
                 "depth_type": backend["depth_type"],
-                "checkpoint": doctor.get("checkpoint"),
-                "checkpoint_sha256": doctor.get("checkpoint_sha256"),
-                "command": command,
+                "checkpoint": checkpoint_meta.get("checkpoint_source") or doctor.get("checkpoint"),
+                "checkpoint_vda_path": checkpoint_meta.get("checkpoint_vda_path")
+                or doctor.get("checkpoint_vda_path"),
+                "checkpoint_staged": checkpoint_meta.get("checkpoint_staged"),
+                "checkpoint_sha256": checkpoint_meta.get("checkpoint_sha256")
+                or doctor.get("checkpoint_sha256"),
+                "command": command_record,
                 "random_seed": None,
                 "command_returncode": result_code,
                 "stdout_tail": stdout_tail,

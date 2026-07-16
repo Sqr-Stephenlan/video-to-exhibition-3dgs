@@ -14,7 +14,9 @@ backend:
   input_size: 518
   max_res: 1280
   fp16: true
-  # Leave empty to use repo_dir/checkpoints default for encoder+depth_type.
+  # Optional project-relative weight path. If set, it is staged into the
+  # filename hardcoded by VDA run.py under repo_dir/checkpoints/.
+  # Leave empty to use the default encoder/depth_type checkpoint name.
   checkpoint: ""
 
 io:

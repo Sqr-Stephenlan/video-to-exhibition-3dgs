@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 
+from scripts.depth.config import resolve_repo_path, to_repo_relative
+
 CHECKPOINT_NAMES = {
     ("relative", "vits"): "video_depth_anything_vits.pth",
     ("relative", "vitb"): "video_depth_anything_vitb.pth",
@@ -29,18 +31,43 @@ def expected_checkpoint_name(depth_type: str, encoder: str) -> str:
     return CHECKPOINT_NAMES[key]
 
 
-def resolve_checkpoint(repo_dir: Path, backend: dict[str, Any]) -> Path:
-    configured = backend.get("checkpoint") or ""
-    if configured:
-        path = Path(configured)
-        if path.is_absolute():
-            raise ValueError("backend.checkpoint must be repository-relative")
-        candidate = repo_dir / configured
-        if candidate.is_file():
-            return candidate
-        raise FileNotFoundError(f"Configured checkpoint not found under backend repo: {configured}")
+def expected_vda_checkpoint_path(repo_dir: Path, backend: dict[str, Any]) -> Path:
+    """Path hardcoded by pinned VDA run.py under the backend repo."""
     name = expected_checkpoint_name(backend.get("depth_type", "relative"), backend["encoder"])
     return repo_dir / "checkpoints" / name
+
+
+def resolve_checkpoint(root: Path, backend: dict[str, Any]) -> Path:
+    """Resolve the configured or default checkpoint; must stay inside the project root."""
+    repo_dir = resolve_repo_path(root, backend["repo_dir"])
+    configured = str(backend.get("checkpoint") or "").strip()
+    if configured:
+        return resolve_repo_path(root, configured)
+    return expected_vda_checkpoint_path(repo_dir, backend)
+
+
+def stage_checkpoint_for_vda(root: Path, backend: dict[str, Any]) -> dict[str, Any]:
+    """
+    Ensure pinned VDA run.py loads the intended weights.
+
+    VDA always reads ./checkpoints/{metric_?}video_depth_anything_{encoder}.pth.
+    If backend.checkpoint points elsewhere inside the repo, copy it to that path.
+    """
+    repo_dir = resolve_repo_path(root, backend["repo_dir"])
+    source = resolve_checkpoint(root, backend)
+    target = expected_vda_checkpoint_path(repo_dir, backend)
+    if not source.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {to_repo_relative(root, source)}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged = source.resolve() != target.resolve()
+    if staged:
+        shutil.copy2(source, target)
+    return {
+        "checkpoint_source": to_repo_relative(root, source),
+        "checkpoint_vda_path": to_repo_relative(root, target),
+        "checkpoint_staged": staged,
+        "checkpoint_sha256": sha256_file(source),
+    }
 
 
 def sha256_file(path: Path) -> str:
@@ -65,22 +92,73 @@ def git_head(repo_dir: Path) -> str | None:
     return result.stdout.strip()
 
 
+def _path_under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def sanitize_command_for_record(
+    *,
+    root: Path,
+    command: list[str],
+    temp_dir: Path | None = None,
+) -> list[str]:
+    """Rewrite absolute machine/temp paths to <project>/<temp> placeholders for run records."""
+    root_resolved = root.resolve()
+    temp_resolved = temp_dir.resolve() if temp_dir is not None else None
+    sanitized: list[str] = []
+    for arg in command:
+        if arg.startswith("-"):
+            sanitized.append(arg)
+            continue
+        path = Path(arg)
+        if not path.is_absolute():
+            sanitized.append(arg.replace("\\", "/"))
+            continue
+        try:
+            resolved = path.resolve()
+        except OSError:
+            sanitized.append(f"<external>/{path.name}")
+            continue
+        if temp_resolved is not None and _path_under(resolved, temp_resolved):
+            rel = resolved.relative_to(temp_resolved).as_posix()
+            sanitized.append("<temp>" if rel == "." else f"<temp>/{rel}")
+            continue
+        if _path_under(resolved, root_resolved):
+            sanitized.append(f"<project>/{resolved.relative_to(root_resolved).as_posix()}")
+            continue
+        sanitized.append(f"<external>/{resolved.name}")
+    return sanitized
+
+
 def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     backend = config["backend"]
-    repo_dir = (root / backend["repo_dir"]).resolve()
     report: dict[str, Any] = {
-        "repo_dir": backend["repo_dir"],
-        "repo_exists": repo_dir.is_dir(),
-        "run_py": (repo_dir / "run.py").is_file() if repo_dir.is_dir() else False,
+        "repo_dir": backend.get("repo_dir"),
+        "repo_exists": False,
+        "run_py": False,
         "pinned_commit": backend.get("commit"),
         "actual_commit": None,
         "checkpoint": None,
         "checkpoint_exists": False,
         "checkpoint_sha256": None,
+        "checkpoint_vda_path": None,
         "torch_importable": False,
         "cuda_available": False,
         "issues": [],
     }
+
+    try:
+        repo_dir = resolve_repo_path(root, backend["repo_dir"])
+    except ValueError as exc:
+        report["issues"].append(str(exc))
+        return report
+
+    report["repo_exists"] = repo_dir.is_dir()
+    report["run_py"] = (repo_dir / "run.py").is_file() if repo_dir.is_dir() else False
 
     if not report["repo_exists"]:
         report["issues"].append(
@@ -100,11 +178,10 @@ def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         )
 
     try:
-        ckpt = resolve_checkpoint(repo_dir, backend)
-        try:
-            report["checkpoint"] = ckpt.resolve().relative_to(root.resolve()).as_posix()
-        except ValueError:
-            report["checkpoint"] = ckpt.as_posix()
+        ckpt = resolve_checkpoint(root, backend)
+        vda_ckpt = expected_vda_checkpoint_path(repo_dir, backend)
+        report["checkpoint"] = to_repo_relative(root, ckpt)
+        report["checkpoint_vda_path"] = to_repo_relative(root, vda_ckpt)
         report["checkpoint_exists"] = ckpt.is_file()
         if ckpt.is_file():
             report["checkpoint_sha256"] = sha256_file(ckpt)
@@ -166,12 +243,15 @@ def build_vda_command(
 
 def run_vda_on_video(
     *,
+    root: Path,
     repo_dir: Path,
     input_video: Path,
     output_dir: Path,
     backend: dict[str, Any],
     python_exe: str | None = None,
-) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+) -> tuple[subprocess.CompletedProcess[str], list[str], dict[str, Any]]:
+    """Run VDA after staging checkpoint to the path run.py hardcodes."""
+    checkpoint_meta = stage_checkpoint_for_vda(root, backend)
     output_dir.mkdir(parents=True, exist_ok=True)
     cmd = build_vda_command(
         repo_dir=repo_dir,
@@ -187,7 +267,7 @@ def run_vda_on_video(
         capture_output=True,
         text=True,
     )
-    return result, cmd
+    return result, cmd, checkpoint_meta
 
 
 def find_vda_depths_npz(output_dir: Path) -> Path:
@@ -197,7 +277,6 @@ def find_vda_depths_npz(output_dir: Path) -> Path:
     if not candidates:
         raise FileNotFoundError(f"No VDA depth NPZ found under {output_dir.as_posix()}")
     if len(candidates) > 1:
-        # Prefer the canonical *_depths.npz produced by run.py.
         preferred = [path for path in candidates if path.name.endswith("_depths.npz")]
         if len(preferred) == 1:
             return preferred[0]
@@ -246,7 +325,7 @@ def split_vda_depths_to_frame_files(
             {
                 "frame_id": frame_id,
                 "rgb_path": frame["path"],
-                "depth_path": dest.resolve().relative_to(root.resolve()).as_posix(),
+                "depth_path": to_repo_relative(root, dest),
                 "depth_type": depth_type,
                 "confidence_path": None,
                 "depth_index": index,

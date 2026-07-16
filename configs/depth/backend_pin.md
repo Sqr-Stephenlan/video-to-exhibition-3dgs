@@ -16,7 +16,7 @@ Default config fingerprint (canonical Git blob / LF bytes; use `git show HEAD:co
 
 | File | SHA-256 |
 |---|---|
-| `configs/depth/default_vitb.yaml` | `254be26a1330708b27713690c5c670df11d4648b84b1b3714f7d0ba1553deb52` |
+| `configs/depth/default_vitb.yaml` | `da17eedf3c45fe27da8975e1901389e14a8c18b3f0f95a916234bbb6137573c4` |
 
 ## Clone (do not commit the clone)
 
@@ -32,6 +32,11 @@ mkdir -p third_party/Video-Depth-Anything/checkpoints
 # Hugging Face:
 # https://huggingface.co/depth-anything/Video-Depth-Anything-Base/resolve/main/video_depth_anything_vitb.pth
 ```
+
+`backend.checkpoint` may point to another project-relative weight file. Before inference,
+the orchestrator copies it to the filename that pinned VDA `run.py` hardcodes under
+`third_party/Video-Depth-Anything/checkpoints/`. Both source and staged paths are
+recorded as repository-relative paths.
 
 ## Local environment notes (Windows)
 

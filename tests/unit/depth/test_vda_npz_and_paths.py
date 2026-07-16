@@ -11,9 +11,12 @@ import sys
 sys.path.insert(0, str(ROOT))
 
 from scripts.depth.backend_vda import (
+    build_vda_command,
     find_vda_depths_npz,
     load_vda_depths_array,
+    sanitize_command_for_record,
     split_vda_depths_to_frame_files,
+    stage_checkpoint_for_vda,
 )
 from scripts.depth.config import resolve_repo_path, to_repo_relative, validate_frame_id
 
@@ -100,4 +103,86 @@ def test_split_vda_depths_rejects_frame_count_mismatch(tmp_path: Path) -> None:
             depth_dir=depth_dir,
             root=root,
             depth_type="relative",
+        )
+
+
+def test_real_command_builder_is_sanitized_for_run_record(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    repo_dir = root / "third_party" / "Video-Depth-Anything"
+    temp_dir = tmp_path / "depth_prior_abc"
+    repo_dir.mkdir(parents=True)
+    temp_dir.mkdir()
+    command = build_vda_command(
+        repo_dir=repo_dir,
+        input_video=temp_dir / "input.mp4",
+        output_dir=temp_dir / "vda_out",
+        backend={
+            "encoder": "vitb",
+            "depth_type": "relative",
+            "input_size": 518,
+            "max_res": 1280,
+        },
+        python_exe=str(root / ".venv" / "Scripts" / "python.exe"),
+    )
+    sanitized = sanitize_command_for_record(
+        root=root,
+        command=command,
+        temp_dir=temp_dir,
+    )
+    assert sanitized[0] == "<project>/.venv/Scripts/python.exe"
+    assert sanitized[1] == "<project>/third_party/Video-Depth-Anything/run.py"
+    assert "<temp>/input.mp4" in sanitized
+    assert "<temp>/vda_out" in sanitized
+    assert str(tmp_path) not in " ".join(sanitized)
+    assert not any(Path(arg).is_absolute() for arg in sanitized)
+
+
+def test_custom_checkpoint_is_staged_to_vda_expected_path(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    repo_dir = root / "third_party" / "Video-Depth-Anything"
+    custom = root / "weights" / "custom_vitb.pth"
+    repo_dir.mkdir(parents=True)
+    custom.parent.mkdir(parents=True)
+    custom.write_bytes(b"custom-weights")
+    backend = {
+        "repo_dir": "third_party/Video-Depth-Anything",
+        "checkpoint": "weights/custom_vitb.pth",
+        "encoder": "vitb",
+        "depth_type": "relative",
+    }
+    metadata = stage_checkpoint_for_vda(root, backend)
+    target = repo_dir / "checkpoints" / "video_depth_anything_vitb.pth"
+    assert target.read_bytes() == b"custom-weights"
+    assert metadata["checkpoint_source"] == "weights/custom_vitb.pth"
+    assert (
+        metadata["checkpoint_vda_path"]
+        == "third_party/Video-Depth-Anything/checkpoints/video_depth_anything_vitb.pth"
+    )
+    assert metadata["checkpoint_staged"] is True
+
+
+def test_backend_repo_and_checkpoint_reject_escape(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    with pytest.raises(ValueError, match="escapes"):
+        stage_checkpoint_for_vda(
+            root,
+            {
+                "repo_dir": "../backend",
+                "checkpoint": "",
+                "encoder": "vitb",
+                "depth_type": "relative",
+            },
+        )
+    backend = root / "third_party" / "Video-Depth-Anything"
+    backend.mkdir(parents=True)
+    with pytest.raises(ValueError, match="escapes"):
+        stage_checkpoint_for_vda(
+            root,
+            {
+                "repo_dir": "third_party/Video-Depth-Anything",
+                "checkpoint": "../outside.pth",
+                "encoder": "vitb",
+                "depth_type": "relative",
+            },
         )

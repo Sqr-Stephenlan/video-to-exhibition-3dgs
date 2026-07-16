@@ -93,20 +93,16 @@ def test_synthetic_vda_npz_to_depth_manifest(tmp_path: Path) -> None:
     assert run_payload["outputs"]["frame_count"] == 2
 
 
-def test_default_vitb_fingerprint_matches_git_blob() -> None:
+def test_default_vitb_fingerprint_matches_canonical_lf_bytes() -> None:
     import hashlib
-    import subprocess
 
-    blob = subprocess.check_output(
-        ["git", "show", "HEAD:configs/depth/default_vitb.yaml"],
-        cwd=ROOT,
-    )
-    expected = "254be26a1330708b27713690c5c670df11d4648b84b1b3714f7d0ba1553deb52"
-    assert hashlib.sha256(blob).hexdigest() == expected
+    expected = "da17eedf3c45fe27da8975e1901389e14a8c18b3f0f95a916234bbb6137573c4"
+    # This test targets the proposed worktree content before it is committed.
+    worktree = (ROOT / "configs" / "depth" / "default_vitb.yaml").read_bytes()
+    canonical_worktree = worktree.replace(b"\r\n", b"\n")
+    assert hashlib.sha256(canonical_worktree).hexdigest() == expected
     pin = (ROOT / "configs" / "depth" / "backend_pin.md").read_text(encoding="utf-8")
     assert expected in pin
-    # Worktree may differ by line endings on Windows; blob fingerprint is the contract.
-    worktree = (ROOT / "configs" / "depth" / "default_vitb.yaml").read_bytes()
     # Ensure YAML still loads after any checkout conversion.
     data = yaml.safe_load(worktree.decode("utf-8"))
     assert data["backend"]["encoder"] == "vitb"
