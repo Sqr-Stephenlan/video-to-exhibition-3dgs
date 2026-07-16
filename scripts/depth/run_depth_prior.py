@@ -227,6 +227,10 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
                 "checkpoint_vda_path": checkpoint_meta.get("checkpoint_vda_path")
                 or doctor.get("checkpoint_vda_path"),
                 "checkpoint_staged": checkpoint_meta.get("checkpoint_staged"),
+                "checkpoint_target_restored": checkpoint_meta.get("checkpoint_target_restored"),
+                "checkpoint_target_originally_present": checkpoint_meta.get(
+                    "checkpoint_target_originally_present"
+                ),
                 "checkpoint_sha256": checkpoint_meta.get("checkpoint_sha256")
                 or doctor.get("checkpoint_sha256"),
                 "command": command_record,

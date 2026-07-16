@@ -22,6 +22,7 @@ backend:
 io:
   frames_manifest: data/manifests/frames_manifest.json
   depth_dir: data/depth
+  # Deferred in this PR: mask generation / confidence export is not implemented yet.
   mask_dir: data/masks
   depth_manifest: data/manifests/depth_manifest.json
   run_record: outputs/reconstructions/depth_prior/run_record.json
@@ -30,5 +31,7 @@ runtime:
   # When frames_manifest points at image sequences, a temp video is built for VDA.
   # target_fps is used only for that assembly step.
   target_fps: 5
+  # Deferred in this PR: the current VDA wrapper does not yet plumb device selection.
   device: cuda
+  # Deferred in this PR: rerun / cache skipping policy is not implemented yet.
   skip_existing: false

@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.depth.backend_vda import (
     build_vda_command,
+    doctor_backend,
     find_vda_depths_npz,
     load_vda_depths_array,
     sanitize_command_for_record,
@@ -150,22 +151,45 @@ def test_custom_checkpoint_is_staged_to_vda_expected_path(tmp_path: Path) -> Non
         "encoder": "vitb",
         "depth_type": "relative",
     }
-    metadata = stage_checkpoint_for_vda(root, backend)
     target = repo_dir / "checkpoints" / "video_depth_anything_vitb.pth"
-    assert target.read_bytes() == b"custom-weights"
-    assert metadata["checkpoint_source"] == "weights/custom_vitb.pth"
-    assert (
-        metadata["checkpoint_vda_path"]
-        == "third_party/Video-Depth-Anything/checkpoints/video_depth_anything_vitb.pth"
-    )
-    assert metadata["checkpoint_staged"] is True
+    with stage_checkpoint_for_vda(root, backend) as metadata:
+        assert target.read_bytes() == b"custom-weights"
+        assert metadata["checkpoint_source"] == "weights/custom_vitb.pth"
+        assert (
+            metadata["checkpoint_vda_path"]
+            == "third_party/Video-Depth-Anything/checkpoints/video_depth_anything_vitb.pth"
+        )
+        assert metadata["checkpoint_staged"] is True
+    assert not target.exists()
+
+
+def test_custom_checkpoint_restore_existing_target_after_failure(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    repo_dir = root / "third_party" / "Video-Depth-Anything"
+    custom = root / "weights" / "custom_vitb.pth"
+    target = repo_dir / "checkpoints" / "video_depth_anything_vitb.pth"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    custom.parent.mkdir(parents=True)
+    custom.write_bytes(b"custom-weights")
+    target.write_bytes(b"official-weights")
+    backend = {
+        "repo_dir": "third_party/Video-Depth-Anything",
+        "checkpoint": "weights/custom_vitb.pth",
+        "encoder": "vitb",
+        "depth_type": "relative",
+    }
+    with pytest.raises(RuntimeError, match="boom"):
+        with stage_checkpoint_for_vda(root, backend):
+            assert target.read_bytes() == b"custom-weights"
+            raise RuntimeError("boom")
+    assert target.read_bytes() == b"official-weights"
 
 
 def test_backend_repo_and_checkpoint_reject_escape(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
     with pytest.raises(ValueError, match="escapes"):
-        stage_checkpoint_for_vda(
+        with stage_checkpoint_for_vda(
             root,
             {
                 "repo_dir": "../backend",
@@ -173,11 +197,12 @@ def test_backend_repo_and_checkpoint_reject_escape(tmp_path: Path) -> None:
                 "encoder": "vitb",
                 "depth_type": "relative",
             },
-        )
+        ):
+            pass
     backend = root / "third_party" / "Video-Depth-Anything"
     backend.mkdir(parents=True)
     with pytest.raises(ValueError, match="escapes"):
-        stage_checkpoint_for_vda(
+        with stage_checkpoint_for_vda(
             root,
             {
                 "repo_dir": "third_party/Video-Depth-Anything",
@@ -185,4 +210,53 @@ def test_backend_repo_and_checkpoint_reject_escape(tmp_path: Path) -> None:
                 "encoder": "vitb",
                 "depth_type": "relative",
             },
-        )
+        ):
+            pass
+
+
+def test_doctor_requires_git_head_and_reports_custom_checkpoint(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    repo_dir = root / "third_party" / "Video-Depth-Anything"
+    checkpoint = root / "weights" / "custom_vitb.pth"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "run.py").write_text("print('ok')\n", encoding="utf-8")
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"custom")
+    report = doctor_backend(
+        root,
+        {
+            "backend": {
+                "repo_dir": "third_party/Video-Depth-Anything",
+                "commit": "4f5ae23172ba60fd7bc11ef671cca678842c7072",
+                "checkpoint": "weights/custom_vitb.pth",
+                "encoder": "vitb",
+                "depth_type": "relative",
+            }
+        },
+    )
+    assert any("could not be resolved" in issue for issue in report["issues"])
+    assert any("Non-default backend.checkpoint" in issue for issue in report["issues"])
+
+
+def test_doctor_rejects_default_checkpoint_hash_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    repo_dir = root / "third_party" / "Video-Depth-Anything"
+    checkpoint = repo_dir / "checkpoints" / "video_depth_anything_vitb.pth"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "run.py").write_text("print('ok')\n", encoding="utf-8")
+    (repo_dir / ".git").mkdir()
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"wrong-default")
+    report = doctor_backend(
+        root,
+        {
+            "backend": {
+                "repo_dir": "third_party/Video-Depth-Anything",
+                "commit": "4f5ae23172ba60fd7bc11ef671cca678842c7072",
+                "checkpoint": "",
+                "encoder": "vitb",
+                "depth_type": "relative",
+            }
+        },
+    )
+    assert any("Default checkpoint SHA-256 mismatch" in issue for issue in report["issues"])

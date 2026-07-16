@@ -53,4 +53,14 @@ Git Bash / WSL (when `.venv/bin/python` exists):
 
 VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)`. The orchestrator validates `N` against the selected frame count and splits into per-frame NPZ files.
 
-If `backend.checkpoint` is set, it must be project-relative. The orchestrator stages that file to the checkpoint filename hardcoded by pinned VDA before inference and records both paths without machine-specific absolute paths.
+If `backend.checkpoint` is set, it must be project-relative. The orchestrator stages that file to the checkpoint filename hardcoded by pinned VDA before inference, restores the original target afterward, and records both paths without machine-specific absolute paths.
+
+## Current deferred items
+
+The following config fields are intentionally documented but not implemented in this PR:
+
+- `runtime.device`
+- `runtime.skip_existing`
+- `io.mask_dir` / `confidence_path`
+
+They remain deferred until sample frames and the next execution path changes are ready. Do not assume they currently affect runtime behavior.

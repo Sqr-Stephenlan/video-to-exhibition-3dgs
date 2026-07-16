@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,10 @@ CHECKPOINT_NAMES = {
     ("metric", "vits"): "metric_video_depth_anything_vits.pth",
     ("metric", "vitb"): "metric_video_depth_anything_vitb.pth",
     ("metric", "vitl"): "metric_video_depth_anything_vitl.pth",
+}
+
+DEFAULT_CHECKPOINT_SHA256 = {
+    ("relative", "vitb"): "775e578e8f9431ec0496514aa466bd0a1f67c28d0f518267809f35a43c04329b",
 }
 
 
@@ -46,13 +53,15 @@ def resolve_checkpoint(root: Path, backend: dict[str, Any]) -> Path:
     return expected_vda_checkpoint_path(repo_dir, backend)
 
 
-def stage_checkpoint_for_vda(root: Path, backend: dict[str, Any]) -> dict[str, Any]:
-    """
-    Ensure pinned VDA run.py loads the intended weights.
+def expected_default_checkpoint_sha256(backend: dict[str, Any]) -> str | None:
+    return DEFAULT_CHECKPOINT_SHA256.get(
+        (backend.get("depth_type", "relative"), backend["encoder"])
+    )
 
-    VDA always reads ./checkpoints/{metric_?}video_depth_anything_{encoder}.pth.
-    If backend.checkpoint points elsewhere inside the repo, copy it to that path.
-    """
+
+@contextmanager
+def stage_checkpoint_for_vda(root: Path, backend: dict[str, Any]):
+    """Temporarily stage the configured/default checkpoint to the pinned VDA path, then restore it."""
     repo_dir = resolve_repo_path(root, backend["repo_dir"])
     source = resolve_checkpoint(root, backend)
     target = expected_vda_checkpoint_path(repo_dir, backend)
@@ -60,14 +69,39 @@ def stage_checkpoint_for_vda(root: Path, backend: dict[str, Any]) -> dict[str, A
         raise FileNotFoundError(f"Checkpoint not found: {to_repo_relative(root, source)}")
     target.parent.mkdir(parents=True, exist_ok=True)
     staged = source.resolve() != target.resolve()
-    if staged:
-        shutil.copy2(source, target)
-    return {
-        "checkpoint_source": to_repo_relative(root, source),
-        "checkpoint_vda_path": to_repo_relative(root, target),
-        "checkpoint_staged": staged,
-        "checkpoint_sha256": sha256_file(source),
-    }
+    backup_path: Path | None = None
+    target_existed = target.exists()
+    try:
+        if staged:
+            if target_existed:
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f"{target.stem}.backup.",
+                    suffix=target.suffix,
+                    dir=target.parent,
+                )
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                Path(tmp_name).unlink(missing_ok=True)
+                backup_path = Path(tmp_name)
+                shutil.copy2(target, backup_path)
+            shutil.copy2(source, target)
+        yield {
+            "checkpoint_source": to_repo_relative(root, source),
+            "checkpoint_vda_path": to_repo_relative(root, target),
+            "checkpoint_staged": staged,
+            "checkpoint_sha256": sha256_file(source),
+            "checkpoint_target_restored": staged,
+            "checkpoint_target_originally_present": target_existed,
+        }
+    finally:
+        if staged:
+            if backup_path is not None and backup_path.exists():
+                shutil.copy2(backup_path, target)
+                backup_path.unlink(missing_ok=True)
+            elif not target_existed and target.exists():
+                target.unlink()
 
 
 def sha256_file(path: Path) -> str:
@@ -172,6 +206,11 @@ def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     actual = git_head(repo_dir)
     report["actual_commit"] = actual
     pinned = str(backend.get("commit") or "")
+    if not actual:
+        report["issues"].append(
+            "Backend commit could not be resolved from the local clone; "
+            "the pinned VDA source tree must be a git checkout with a readable HEAD."
+        )
     if actual and pinned and not actual.startswith(pinned) and pinned not in actual:
         report["issues"].append(
             f"Backend commit mismatch: expected pin starting with {pinned}, got {actual}"
@@ -185,6 +224,18 @@ def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         report["checkpoint_exists"] = ckpt.is_file()
         if ckpt.is_file():
             report["checkpoint_sha256"] = sha256_file(ckpt)
+            expected_sha = expected_default_checkpoint_sha256(backend)
+            if not str(backend.get("checkpoint") or "").strip() and expected_sha:
+                if report["checkpoint_sha256"] != expected_sha:
+                    report["issues"].append(
+                        "Default checkpoint SHA-256 mismatch: "
+                        f"expected {expected_sha}, got {report['checkpoint_sha256']}"
+                    )
+            elif str(backend.get("checkpoint") or "").strip():
+                report["issues"].append(
+                    "Non-default backend.checkpoint is configured; doctor recorded it, "
+                    "but end-to-end validation still requires explicit review of that weight source."
+                )
         else:
             report["issues"].append(
                 f"Missing checkpoint: {report['checkpoint']}. Download the vitb relative weights."
@@ -251,23 +302,23 @@ def run_vda_on_video(
     python_exe: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], dict[str, Any]]:
     """Run VDA after staging checkpoint to the path run.py hardcodes."""
-    checkpoint_meta = stage_checkpoint_for_vda(root, backend)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cmd = build_vda_command(
-        repo_dir=repo_dir,
-        input_video=input_video,
-        output_dir=output_dir,
-        backend=backend,
-        python_exe=python_exe,
-    )
-    result = subprocess.run(
-        cmd,
-        cwd=str(repo_dir),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return result, cmd, checkpoint_meta
+    with stage_checkpoint_for_vda(root, backend) as checkpoint_meta:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cmd = build_vda_command(
+            repo_dir=repo_dir,
+            input_video=input_video,
+            output_dir=output_dir,
+            backend=backend,
+            python_exe=python_exe,
+        )
+        result = subprocess.run(
+            cmd,
+            cwd=str(repo_dir),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result, cmd, checkpoint_meta
 
 
 def find_vda_depths_npz(output_dir: Path) -> Path:
