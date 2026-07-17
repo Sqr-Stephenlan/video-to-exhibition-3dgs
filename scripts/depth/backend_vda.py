@@ -30,6 +30,48 @@ DEFAULT_CHECKPOINT_SHA256 = {
     ("relative", "vitb"): "775e578e8f9431ec0496514aa466bd0a1f67c28d0f518267809f35a43c04329b",
 }
 
+# matplotlib>=3.9 removed matplotlib.cm.get_cmap; pinned VDA still uses it when
+# saving visualization videos (which happens before --save_npz in run.py).
+_VDA_GET_CMAP_SNIPPET = 'colormap = np.array(cm.get_cmap("inferno").colors)'
+_VDA_GET_CMAP_PATCH = """try:
+            colormap = np.array(cm.get_cmap("inferno").colors)
+        except AttributeError:  # matplotlib >= 3.9
+            from matplotlib import colormaps
+            colormap = np.array(colormaps["inferno"].colors)"""
+
+
+def ensure_vda_matplotlib_compat(repo_dir: Path) -> dict[str, Any]:
+    """
+    Idempotently patch utils/dc_utils.py for matplotlib 3.9+ colormap API.
+
+    Returns metadata for doctor / run_record. Does not modify files outside repo_dir.
+    """
+    target = repo_dir / "utils" / "dc_utils.py"
+    meta: dict[str, Any] = {
+        "patch": "matplotlib_colormap_compat",
+        "path": "utils/dc_utils.py",
+        "present": target.is_file(),
+        "already_patched": False,
+        "applied": False,
+    }
+    if not target.is_file():
+        meta["error"] = "utils/dc_utils.py missing"
+        return meta
+    text = target.read_text(encoding="utf-8")
+    if "colormaps[\"inferno\"]" in text or "colormaps['inferno']" in text:
+        meta["already_patched"] = True
+        return meta
+    if _VDA_GET_CMAP_SNIPPET not in text:
+        meta["error"] = "expected cm.get_cmap snippet not found; refuse to patch blindly"
+        return meta
+    patched = text.replace(_VDA_GET_CMAP_SNIPPET, _VDA_GET_CMAP_PATCH, 1)
+    if patched == text:
+        meta["error"] = "patch replace produced no change"
+        return meta
+    target.write_text(patched, encoding="utf-8", newline="\n")
+    meta["applied"] = True
+    return meta
+
 
 def expected_checkpoint_name(depth_type: str, encoder: str) -> str:
     key = (depth_type, encoder)
@@ -203,6 +245,14 @@ def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     if not report["run_py"]:
         report["issues"].append("Backend repo is missing run.py")
 
+    patch_meta = ensure_vda_matplotlib_compat(repo_dir)
+    report["local_patch_matplotlib"] = patch_meta
+    if patch_meta.get("error"):
+        report["issues"].append(
+            "VDA matplotlib compat patch failed: "
+            f"{patch_meta['error']}. See configs/depth/backend_pin.md."
+        )
+
     actual = git_head(repo_dir)
     report["actual_commit"] = actual
     pinned = str(backend.get("commit") or "")
@@ -302,6 +352,12 @@ def run_vda_on_video(
     python_exe: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], dict[str, Any]]:
     """Run VDA after staging checkpoint to the path run.py hardcodes."""
+    patch_meta = ensure_vda_matplotlib_compat(repo_dir)
+    if patch_meta.get("error"):
+        raise RuntimeError(
+            "VDA matplotlib compat patch failed: "
+            f"{patch_meta['error']}. See configs/depth/backend_pin.md."
+        )
     with stage_checkpoint_for_vda(root, backend) as checkpoint_meta:
         output_dir.mkdir(parents=True, exist_ok=True)
         cmd = build_vda_command(
@@ -318,6 +374,10 @@ def run_vda_on_video(
             capture_output=True,
             text=True,
         )
+        checkpoint_meta = {
+            **checkpoint_meta,
+            "local_patch_matplotlib": patch_meta,
+        }
         return result, cmd, checkpoint_meta
 
 

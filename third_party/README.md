@@ -26,3 +26,8 @@ git clone --depth 1 https://github.com/naver/mast3r.git third_party/mast3r
 
 Keep local dependency changes inside the dependency repository itself, or document required patches before committing them to the root project.
 
+Depth-prior currently requires one documented local patch on Video Depth Anything
+(`utils/dc_utils.py` matplotlib 3.9+ colormap compat). See `configs/depth/backend_pin.md`
+and `configs/depth/patches/vda_matplotlib_colormap.md`. The orchestrator applies it
+automatically; do not commit the patched third_party tree.
+

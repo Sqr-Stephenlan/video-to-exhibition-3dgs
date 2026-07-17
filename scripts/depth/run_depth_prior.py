@@ -84,9 +84,32 @@ def _assemble_temp_video(frame_paths: list[Path], fps: float, output_video: Path
         for path in frame_paths:
             handle.write(f"file '{path.resolve().as_posix()}'\n")
             handle.write(f"duration {duration:.6f}\n")
+        # ffmpeg concat demuxer requires a trailing file entry so the last
+        # duration applies; that would otherwise emit N+1 frames.
         handle.write(f"file '{frame_paths[-1].resolve().as_posix()}'\n")
 
-    cmd = [
+    cmd = build_ffmpeg_concat_command(
+        ffmpeg=ffmpeg,
+        list_file=list_file,
+        output_video=output_video,
+        frame_count=len(frame_paths),
+    )
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
+
+
+def build_ffmpeg_concat_command(
+    *,
+    ffmpeg: str,
+    list_file: Path,
+    output_video: Path,
+    frame_count: int,
+) -> list[str]:
+    """Build ffmpeg concat command that emits exactly frame_count frames."""
+    if frame_count < 1:
+        raise ValueError("frame_count must be >= 1")
+    return [
         ffmpeg,
         "-y",
         "-f",
@@ -97,13 +120,14 @@ def _assemble_temp_video(frame_paths: list[Path], fps: float, output_video: Path
         str(list_file),
         "-vsync",
         "vfr",
+        # Truncate the duplicated trailing concat entry so VDA sees N frames,
+        # matching selected_frames / strict positional depth mapping.
+        "-frames:v",
+        str(frame_count),
         "-pix_fmt",
         "yuv420p",
         str(output_video),
     ]
-    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
 
 
 def cmd_run(config_path: Path, dry_run: bool = False) -> int:
@@ -234,6 +258,8 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
                 ),
                 "checkpoint_sha256": checkpoint_meta.get("checkpoint_sha256")
                 or doctor.get("checkpoint_sha256"),
+                "local_patch_matplotlib": checkpoint_meta.get("local_patch_matplotlib")
+                or doctor.get("local_patch_matplotlib"),
                 "command": command_record,
                 "random_seed": None,
                 "command_returncode": result_code,

@@ -8,7 +8,7 @@
 | Default model | Relative depth, encoder `vitb` (Video-Depth-Anything-Base) |
 | Default checkpoint | `checkpoints/video_depth_anything_vitb.pth` |
 | Checkpoint SHA-256 | `775e578e8f9431ec0496514aa466bd0a1f67c28d0f518267809f35a43c04329b` |
-| Local patches | none |
+| Local patches | **yes** — `utils/dc_utils.py` matplotlib 3.9+ colormap compat (auto-applied by orchestrator; see below) |
 | License note | Base/Large weights use CC-BY-NC-4.0 |
 | Invoked by | `scripts/depth/run_depth_prior.py` → backend `run.py` |
 
@@ -42,6 +42,31 @@ repository-relative paths.
 `doctor` treats the pinned git commit and the default checkpoint SHA-256 above as
 required invariants. A custom `backend.checkpoint` is recorded, but still requires
 explicit reviewer confirmation before claiming the environment matches the default pin.
+
+## Local patch: matplotlib colormap (required for matplotlib >= 3.9)
+
+Pinned VDA `utils/dc_utils.py` calls `matplotlib.cm.get_cmap`, which was removed in
+matplotlib 3.9+. With newer venvs, VDA can finish inference and then crash while
+saving the visualization video—**before** writing `*_depths.npz`.
+
+This repository records that deviation explicitly (Local patches ≠ none). The
+orchestrator applies an **idempotent** compatibility fix via
+`scripts.depth.backend_vda.ensure_vda_matplotlib_compat()` during `doctor` and
+before `run`:
+
+```python
+try:
+    colormap = np.array(cm.get_cmap("inferno").colors)
+except AttributeError:  # matplotlib >= 3.9
+    from matplotlib import colormaps
+    colormap = np.array(colormaps["inferno"].colors)
+```
+
+Reference copy of the intended change: `configs/depth/patches/vda_matplotlib_colormap.md`.
+Re-cloning VDA at the pinned commit without running `doctor`/`run` leaves the stock
+file; the next `doctor` or `run` re-applies the patch.
+
+Do not commit the `third_party/Video-Depth-Anything` tree into this repo.
 
 ## Local environment notes (Windows)
 

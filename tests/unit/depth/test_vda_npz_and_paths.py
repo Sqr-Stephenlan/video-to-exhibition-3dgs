@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.depth.backend_vda import (
     build_vda_command,
     doctor_backend,
+    ensure_vda_matplotlib_compat,
     find_vda_depths_npz,
     load_vda_depths_array,
     sanitize_command_for_record,
@@ -20,6 +21,7 @@ from scripts.depth.backend_vda import (
     stage_checkpoint_for_vda,
 )
 from scripts.depth.config import resolve_repo_path, to_repo_relative, validate_frame_id
+from scripts.depth.run_depth_prior import build_ffmpeg_concat_command
 
 
 def test_resolve_repo_path_rejects_escape(tmp_path: Path) -> None:
@@ -260,3 +262,35 @@ def test_doctor_rejects_default_checkpoint_hash_mismatch(tmp_path: Path) -> None
         },
     )
     assert any("Default checkpoint SHA-256 mismatch" in issue for issue in report["issues"])
+
+
+def test_ffmpeg_concat_command_truncates_to_exact_frame_count(tmp_path: Path) -> None:
+    cmd = build_ffmpeg_concat_command(
+        ffmpeg="ffmpeg",
+        list_file=tmp_path / "list.txt",
+        output_video=tmp_path / "out.mp4",
+        frame_count=197,
+    )
+    assert "-frames:v" in cmd
+    assert cmd[cmd.index("-frames:v") + 1] == "197"
+
+
+def test_ensure_vda_matplotlib_compat_is_idempotent(tmp_path: Path) -> None:
+    utils = tmp_path / "utils"
+    utils.mkdir()
+    target = utils / "dc_utils.py"
+    target.write_text(
+        'import matplotlib.cm as cm\n'
+        'import numpy as np\n'
+        'def save_video(frames):\n'
+        '    colormap = np.array(cm.get_cmap("inferno").colors)\n'
+        '    return colormap\n',
+        encoding="utf-8",
+    )
+    first = ensure_vda_matplotlib_compat(tmp_path)
+    assert first["applied"] is True
+    text = target.read_text(encoding="utf-8")
+    assert 'colormaps["inferno"]' in text
+    second = ensure_vda_matplotlib_compat(tmp_path)
+    assert second["already_patched"] is True
+    assert second["applied"] is False

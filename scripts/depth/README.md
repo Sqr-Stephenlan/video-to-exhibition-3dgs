@@ -57,6 +57,10 @@ VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)`. T
 
 If `backend.checkpoint` is set, it must be project-relative. The orchestrator stages that file to the checkpoint filename hardcoded by pinned VDA before inference, restores the original target afterward, and records both paths without machine-specific absolute paths.
 
+Temp-video assembly passes `-frames:v N` so the ffmpeg concat demuxer’s trailing duplicate file entry does not produce an extra frame (which would fail the strict N-depth check).
+
+`doctor` / `run` also apply the documented VDA matplotlib 3.9+ colormap local patch when needed (see `configs/depth/backend_pin.md`).
+
 ## Current deferred items
 
 The following config fields are intentionally documented but not implemented in this PR:

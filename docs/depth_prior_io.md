@@ -128,6 +128,14 @@ Frame→depth pairing is **strict positional**: after `selected_frames()` orderi
 4. Read VDA’s single `*_depths.npz` (`depths` shaped `(N,H,W)`), require `N ==` selected frame count  
 5. Write per-frame NPZ + depth manifest + run record  
 
+Temp-video assembly uses ffmpeg concat with a trailing duplicate file entry (so the last
+frame’s `duration` applies). The orchestrator passes `-frames:v N` so the encoded video
+contains exactly `N` frames and matches strict positional depth mapping.
+
+Before calling VDA, the orchestrator idempotently applies the documented matplotlib 3.9+
+colormap patch under `third_party/Video-Depth-Anything/utils/dc_utils.py`
+(see `configs/depth/backend_pin.md`). 
+
 ---
 
 ## Outputs
