@@ -2,6 +2,8 @@
 
 Thin orchestration over **Video Depth Anything** for weak-texture exhibition depth priors.
 
+Full prerequisites, input/output schemas, and deferred fields: [`docs/depth_prior_io.md`](../../docs/depth_prior_io.md).
+
 ## Defaults for this branch
 
 | Item | Value |

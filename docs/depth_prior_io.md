@@ -1,0 +1,209 @@
+# Depth prior I/O contract
+
+Single-page contract for the `research/depth-prior` module (Video Depth Anything Relative Base / `vitb`).
+
+Related files:
+
+| Role | Path |
+|---|---|
+| CLI entry | `scripts/depth/run_depth_prior.py` |
+| Default config | `configs/depth/default_vitb.yaml` |
+| Backend pin | `configs/depth/backend_pin.md` |
+| Setup / commands | `scripts/depth/README.md` |
+| Frames manifest example | `configs/depth/frames_manifest.example.json` |
+
+Depth outputs are a **soft prior** only. Do not treat them as metric ground truth.
+
+---
+
+## Commands
+
+```powershell
+# Environment checks (no frames required)
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py doctor
+
+# Full run (needs frames_manifest + frame files)
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run
+
+# Validate config + manifest only
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run --dry-run
+```
+
+Optional: `--config <repo-relative-yaml>` (default `configs/depth/default_vitb.yaml`).
+
+---
+
+## Prerequisites
+
+### Always (for `doctor` and `run`)
+
+| Requirement | Notes |
+|---|---|
+| Project `.venv` | Install `configs/depth/requirements.txt` |
+| VDA clone | `third_party/Video-Depth-Anything` at pinned commit (see `backend_pin.md`) |
+| VDA Python deps | Install backend `requirements.txt` into the same venv |
+| Default weights | `third_party/Video-Depth-Anything/checkpoints/video_depth_anything_vitb.pth` with pinned SHA-256 |
+| `ffmpeg` on `PATH` | Used to assemble image sequences into a temp video |
+| PyTorch | Importable; CUDA build recommended for real inference |
+
+`doctor` additionally enforces:
+
+- Backend clone has a readable git `HEAD` matching `backend.commit`
+- Default checkpoint SHA-256 matches the pin in `backend_pin.md`
+- A non-empty `backend.checkpoint` is recorded as **non-default** and still surfaces as an explicit doctor issue (reviewer confirmation required)
+
+### Extra for `run`
+
+| Requirement | Notes |
+|---|---|
+| `data/manifests/frames_manifest.json` | Path from config `io.frames_manifest` |
+| Frame image files | Every selected frame `path` must exist and stay inside the repo |
+| `doctor` clean | Non–dry-run `run` aborts if doctor reports issues |
+
+`doctor` does **not** need sample frames. `run` does.
+
+---
+
+## Inputs
+
+### Config (`configs/depth/default_vitb.yaml`)
+
+All paths are **repository-relative**. Absolute paths and `../` escapes are rejected.
+
+| Key | Purpose |
+|---|---|
+| `backend.repo_dir` | Local VDA clone |
+| `backend.commit` | Expected git pin |
+| `backend.encoder` / `depth_type` | Default: `vitb` / `relative` |
+| `backend.checkpoint` | Empty = default VDA filename; else project-relative custom weights (staged temporarily) |
+| `io.frames_manifest` | Input frame list |
+| `io.depth_dir` | Per-frame depth NPZ output directory |
+| `io.depth_manifest` | Depth manifest output |
+| `io.run_record` | Run record output |
+| `runtime.target_fps` | FPS used only when assembling frames into a temp video |
+
+### Frames manifest
+
+Default path: `data/manifests/frames_manifest.json`  
+Example schema: `configs/depth/frames_manifest.example.json`
+
+```json
+{
+  "schema_version": "1.0",
+  "video_id": "demo_short",
+  "source_video": "data/raw_videos/demo_short.mp4",
+  "frames": [
+    {
+      "frame_id": "demo_short_000001",
+      "path": "data/frames/demo_short/000001.png",
+      "timestamp_sec": 0.0,
+      "width": 1280,
+      "height": 720,
+      "selected": true,
+      "reason": "example"
+    }
+  ]
+}
+```
+
+| Field | Required | Rules |
+|---|---|---|
+| `frames` | yes | Non-empty list |
+| `frames[].frame_id` | yes | 1–128 chars of `[A-Za-z0-9._-]`, must start with alphanumeric; no path segments |
+| `frames[].path` | yes | Repository-relative image path |
+| `frames[].selected` | no | Default `true`; `false` skips the frame |
+| `video_id` / `source_video` / geometry fields | no for orchestration | Carried for provenance when present |
+
+At least one frame must remain after selection.
+
+### Runtime data flow (brief)
+
+1. Load selected frames from the manifest  
+2. Assemble a temporary MP4 with `ffmpeg` at `runtime.target_fps`  
+3. Stage checkpoint to the filename hardcoded by pinned VDA `run.py`, run inference, then restore the original target  
+4. Read VDA’s single `*_depths.npz` (`depths` shaped `(N,H,W)`), require `N ==` selected frame count  
+5. Write per-frame NPZ + depth manifest + run record  
+
+---
+
+## Outputs
+
+Default paths from `io.*` in `default_vitb.yaml`.
+
+### Per-frame depth maps
+
+Path pattern: `data/depth/<frame_id>.npz`
+
+| Key | Content |
+|---|---|
+| `depth` | One array per frame (slice of VDA `depths[i]`) |
+
+### Depth manifest
+
+Default path: `data/manifests/depth_manifest.json`
+
+```json
+{
+  "schema_version": "1.0",
+  "source_frames_manifest": "<video_id or null>",
+  "backend": {
+    "name": "video-depth-anything",
+    "commit": "<actual or pinned commit>",
+    "encoder": "vitb",
+    "depth_type": "relative",
+    "checkpoint": null
+  },
+  "frames": [
+    {
+      "frame_id": "demo_short_000001",
+      "rgb_path": "data/frames/demo_short/000001.png",
+      "depth_path": "data/depth/demo_short_000001.npz",
+      "depth_type": "relative",
+      "confidence_path": null,
+      "depth_index": 0
+    }
+  ]
+}
+```
+
+`confidence_path` is always `null` in this PR (mask / confidence export deferred).
+
+### Run record
+
+Default path: `outputs/reconstructions/depth_prior/run_record.json`
+
+| Field | Meaning |
+|---|---|
+| `module` | `"depth-prior"` |
+| `started_at` / `finished_at` | UTC ISO timestamps |
+| `config` / `frames_manifest` | Repository-relative paths |
+| `backend_*` / `encoder` / `depth_type` | Backend identity |
+| `checkpoint` / `checkpoint_vda_path` / `checkpoint_sha256` | Weight source and staged path |
+| `checkpoint_staged` | Whether a custom (or non-identity) file was copied into VDA’s expected name |
+| `checkpoint_target_restored` / `checkpoint_target_originally_present` | Staging restore metadata |
+| `command` | Sanitized argv (`<project>` / `<temp>` / `<external>` placeholders; no machine absolute paths) |
+| `command_returncode` / `stdout_tail` / `stderr_tail` | Subprocess outcome |
+| `vda_depths_npz` | Basename of the VDA NPZ artifact (temp dir is not retained) |
+| `outputs.depth_dir` / `depth_manifest` / `run_record` / `frame_count` | Written artifacts |
+
+---
+
+## Deferred (config present, not implemented)
+
+Documented in config comments and `scripts/depth/README.md`. Do **not** assume these change behavior yet:
+
+- `runtime.device`
+- `runtime.skip_existing`
+- `io.mask_dir`
+- per-frame `confidence_path`
+
+---
+
+## Acceptance notes for this branch
+
+| Goal | Status in current PR |
+|---|---|
+| `doctor` validates clone commit + default checkpoint hash | yes |
+| CPU unit/integration tests for NPZ split, path bounds, staging restore | yes |
+| GPU end-to-end `run` on real exhibition frames | deferred until sample frames exist |
+| Mask / confidence filtering | deferred |
