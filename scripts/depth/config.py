@@ -10,7 +10,18 @@ import yaml
 
 ALLOWED_ENCODERS = {"vits", "vitb", "vitl"}
 ALLOWED_DEPTH_TYPES = {"relative", "metric"}
+SUPPORTED_SCHEMA_VERSIONS = {"1.0"}
 FRAME_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def require_schema_version(data: dict[str, Any], *, label: str) -> str:
+    version = data.get("schema_version")
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise ValueError(
+            f"{label}.schema_version must be one of {sorted(SUPPORTED_SCHEMA_VERSIONS)}; "
+            f"got {version!r}"
+        )
+    return str(version)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -25,6 +36,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def validate_config(data: dict[str, Any]) -> None:
+    require_schema_version(data, label="config")
     backend = data.get("backend")
     if not isinstance(backend, dict):
         raise ValueError("config.backend must be a mapping")

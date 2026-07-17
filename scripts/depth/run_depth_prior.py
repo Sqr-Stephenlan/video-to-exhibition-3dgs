@@ -204,6 +204,7 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
                     "commit": doctor.get("actual_commit") or backend.get("commit"),
                 },
                 depth_type=backend["depth_type"],
+                frames_manifest_path=frames_manifest_rel,
             )
             save_json(depth_manifest_path, depth_manifest)
             print(f"wrote {frame_count_written} depth maps")

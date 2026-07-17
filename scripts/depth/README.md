@@ -50,10 +50,10 @@ Git Bash / WSL (when `.venv/bin/python` exists):
 ## Outputs
 
 - `data/depth/<frame_id>.npz` — one file per selected frame; each stores a single `depth` array
-- `data/manifests/depth_manifest.json`
+- `data/manifests/depth_manifest.json` — includes `source_video_id`, `source_frames_manifest` (path), and `frame_depth_mapping: strict_positional`
 - `outputs/reconstructions/depth_prior/run_record.json` — repository-relative paths, backend commit, I/O, and a sanitized command using `<project>` / `<temp>` placeholders
 
-VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)`. The orchestrator validates `N` against the selected frame count and splits into per-frame NPZ files.
+VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)`. The orchestrator validates `N` against the selected frame count and splits into per-frame NPZ files. When selected frames include `timestamp_sec`, they are sorted ascending before temp-video assembly.
 
 If `backend.checkpoint` is set, it must be project-relative. The orchestrator stages that file to the checkpoint filename hardcoded by pinned VDA before inference, restores the original target afterward, and records both paths without machine-specific absolute paths.
 

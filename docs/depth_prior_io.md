@@ -108,13 +108,17 @@ Example schema: `configs/depth/frames_manifest.example.json`
 
 | Field | Required | Rules |
 |---|---|---|
+| `schema_version` | yes | Currently only `"1.0"` |
 | `frames` | yes | Non-empty list |
 | `frames[].frame_id` | yes | 1–128 chars of `[A-Za-z0-9._-]`, must start with alphanumeric; no path segments |
 | `frames[].path` | yes | Repository-relative image path |
 | `frames[].selected` | no | Default `true`; `false` skips the frame |
-| `video_id` / `source_video` / geometry fields | no for orchestration | Carried for provenance when present |
+| `frames[].timestamp_sec` | no | If any selected frame has it, **all** selected frames must; then frames are sorted ascending before temp-video assembly |
+| `video_id` / `source_video` / geometry fields | no for orchestration | Provenance only |
 
 At least one frame must remain after selection.
+
+Frame→depth pairing is **strict positional**: after `selected_frames()` ordering, `depths[i]` corresponds to selected frame `i`. A count mismatch fails fast.
 
 ### Runtime data flow (brief)
 
@@ -145,7 +149,13 @@ Default path: `data/manifests/depth_manifest.json`
 ```json
 {
   "schema_version": "1.0",
-  "source_frames_manifest": "<video_id or null>",
+  "source_video_id": "demo_short",
+  "source_frames_manifest": "data/manifests/frames_manifest.json",
+  "frame_depth_mapping": "strict_positional",
+  "depth_scale": {
+    "mode": "relative",
+    "unit": null
+  },
   "backend": {
     "name": "video-depth-anything",
     "commit": "<actual or pinned commit>",
@@ -165,6 +175,14 @@ Default path: `data/manifests/depth_manifest.json`
   ]
 }
 ```
+
+| Field | Meaning |
+|---|---|
+| `source_video_id` | From input `video_id` (may be null) |
+| `source_frames_manifest` | Repository-relative path of the input frames manifest |
+| `frame_depth_mapping` | Always `strict_positional` |
+| `depth_scale.mode` | `relative` or `metric` |
+| `depth_scale.unit` | `null` for relative soft prior; `"meters"` when metric |
 
 `confidence_path` is always `null` in this PR (mask / confidence export deferred).
 

@@ -57,7 +57,7 @@ def test_synthetic_vda_npz_to_depth_manifest(tmp_path: Path) -> None:
     save_json(
         depth_manifest_path,
         build_depth_manifest(
-            frames_manifest={"video_id": "demo"},
+            frames_manifest={"schema_version": "1.0", "video_id": "demo"},
             frame_records=records,
             backend={
                 "name": "video-depth-anything",
@@ -65,6 +65,7 @@ def test_synthetic_vda_npz_to_depth_manifest(tmp_path: Path) -> None:
                 "encoder": "vitb",
             },
             depth_type="relative",
+            frames_manifest_path="data/manifests/frames_manifest.json",
         ),
     )
     run_record_path = runs / "run_record.json"
@@ -87,6 +88,9 @@ def test_synthetic_vda_npz_to_depth_manifest(tmp_path: Path) -> None:
     payload = json.loads(depth_manifest_path.read_text(encoding="utf-8"))
     assert len(payload["frames"]) == 2
     assert payload["frames"][0]["depth_path"] == "data/depth/demo_0001.npz"
+    assert payload["source_video_id"] == "demo"
+    assert payload["source_frames_manifest"] == "data/manifests/frames_manifest.json"
+    assert payload["frame_depth_mapping"] == "strict_positional"
     run_payload = json.loads(run_record_path.read_text(encoding="utf-8"))
     assert run_payload["frames_manifest"] == "data/manifests/frames_manifest.json"
     assert not Path(run_payload["config"]).is_absolute()
