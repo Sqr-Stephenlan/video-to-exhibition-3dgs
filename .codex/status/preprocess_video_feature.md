@@ -1,6 +1,6 @@
 # Preprocess Video Feature Status
 
-Last updated: 2026-07-15
+Last updated: 2026-07-17
 
 ## Current Phase
 
@@ -232,6 +232,34 @@ progress through the PR body update.
 - Generated review videos for the two decision points:
   - `data/frames/restricted_test_blur60_d4_fps5_r1600/selected/selected_review.mp4`
   - `data/frames/restricted_test_blur80_d4_fps5_r1600/selected/selected_review.mp4`
+- Ran retained per-video matrices on `data/raw_videos/easy1.mp4` and
+  `data/raw_videos/easy2.mp4`. Both are portrait 720x960 samples, but their
+  Laplacian blur-score distributions differ enough that they cannot safely use
+  one global blur threshold:
+  - `easy1` baseline `blur=55` rejected all 216 sampled frames as blur. Its
+    all-frame median blur score is only 7.43, and visual inspection confirmed
+    genuinely soft footage rather than a metrics-only low-texture artifact.
+  - `easy1 blur=5, dup=4`: 125 selected (57.87%), mean blur 8.93.
+  - `easy1 blur=6.5, dup=4`: 87 selected (40.28%), mean blur 10.33.
+  - `easy1 blur=7.5, dup=4`: 67 selected (31.02%), mean blur 11.34.
+  - `easy1 blur=7.5, dup=3`: 79 selected (36.57%), mean blur 11.22; this is
+    the current balanced candidate because the looser duplicate threshold adds
+    12 frames with only a 1% mean-quality reduction.
+  - `easy1 blur=10, dup=4`: 36 selected; `blur=15` leaves only 7 frames and is
+    too strict for reconstruction coverage.
+  - `easy2` baseline `blur=55, dup=4`: 138/266 selected (51.88%), mean blur
+    159.06.
+  - `easy2 blur=75, dup=4`: 117 selected, mean blur 175.87.
+  - `easy2 blur=75, dup=3`: 130 selected, mean blur 174.59; it adds mostly
+    near-duplicate coverage and is not preferred over the stricter setting.
+  - `easy2 blur=85, dup=4`: 111 selected (41.73%), mean blur 181.14; this is
+    the current balanced candidate because it raises the minimum blur score to
+    85.10 while losing only six frames versus `blur=75`.
+  - `easy2 blur=100, dup=4`: 98 selected; `blur=125` leaves 77 frames and is a
+    quality-first rather than balanced setting.
+- Generated review videos for the selected easy-video candidates:
+  - `data/frames/easy1_b7p5_d3_fps5_o10/selected/selected_review.mp4`
+  - `data/frames/easy2_b85_d4_fps5_o10/selected/selected_review.mp4`
 
 ## Next Step
 
@@ -242,6 +270,12 @@ out of Draft.
 For `restricted_test`, review the `blur=60` and `blur=80` outputs before
 deciding whether the baseline should move from `55` to `60`, or whether the
 quality-first setting should remain an explicit per-video override.
+
+For the easy samples, review `easy1_b7p5_d3_fps5_o10` and
+`easy2_b85_d4_fps5_o10`. The current evidence supports per-video overrides:
+`easy1` needs `blur_threshold=7.5` and `duplicate_hash_threshold=3`, while
+`easy2` performs best at `blur_threshold=85` and
+`duplicate_hash_threshold=4`; both retain `target_fps=5` and overlap 10.
 
 - candidate baseline update for the next pass:
   - `blur_threshold: 55.0`
