@@ -16,7 +16,7 @@ Default config fingerprint (canonical Git blob / LF bytes; use `git show HEAD:co
 
 | File | SHA-256 |
 |---|---|
-| `configs/depth/default_vitb.yaml` | `de5d3ca53902ac0494b9abc39b030d2a42d4406ef70604244bf6a44551a8e14c` |
+| `configs/depth/default_vitb.yaml` | `d0ae1adc17f7ea60ceec74616d53c723a6d28349be6f225c4918121b53e29671` |
 
 ## Clone (do not commit the clone)
 
@@ -33,15 +33,18 @@ mkdir -p third_party/Video-Depth-Anything/checkpoints
 # https://huggingface.co/depth-anything/Video-Depth-Anything-Base/resolve/main/video_depth_anything_vitb.pth
 ```
 
-`backend.checkpoint` may point to another project-relative weight file. Before inference,
-the orchestrator temporarily stages it to the filename that pinned VDA `run.py`
-hardcodes under `third_party/Video-Depth-Anything/checkpoints/`, then restores any
-pre-existing target file after the run. Both source and staged paths are recorded as
-repository-relative paths.
+`backend.checkpoint` may point to another project-relative weight file **only when**
+`backend.allow_custom_checkpoint: true` is set (explicit reviewer opt-in). Before
+inference, the orchestrator temporarily stages it to the filename that pinned VDA
+`run.py` hardcodes under `third_party/Video-Depth-Anything/checkpoints/`, then
+restores any pre-existing target file after the run. Both source and staged paths
+are recorded as repository-relative paths.
 
 `doctor` treats the pinned git commit and the default checkpoint SHA-256 above as
-required invariants. A custom `backend.checkpoint` is recorded, but still requires
-explicit reviewer confirmation before claiming the environment matches the default pin.
+required invariants when using the default checkpoint. A custom `backend.checkpoint`
+without `allow_custom_checkpoint: true` is a hard failure so `run` cannot silently
+skip staging. With the opt-in flag, doctor records a note and skips the default
+SHA-256 pin (the custom weight is outside the published pin).
 
 ## Local patch: matplotlib colormap (required for matplotlib >= 3.9)
 

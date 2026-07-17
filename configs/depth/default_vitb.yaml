@@ -17,7 +17,10 @@ backend:
   # Optional project-relative weight path. If set, it is staged into the
   # filename hardcoded by VDA run.py under repo_dir/checkpoints/.
   # Leave empty to use the default encoder/depth_type checkpoint name.
+  # Non-empty checkpoint also requires allow_custom_checkpoint: true
+  # (explicit reviewer opt-in); otherwise doctor/run fail closed.
   checkpoint: ""
+  allow_custom_checkpoint: false
 
 io:
   frames_manifest: data/manifests/frames_manifest.json

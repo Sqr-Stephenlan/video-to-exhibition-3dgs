@@ -282,10 +282,22 @@ def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
                         f"expected {expected_sha}, got {report['checkpoint_sha256']}"
                     )
             elif str(backend.get("checkpoint") or "").strip():
-                report["issues"].append(
-                    "Non-default backend.checkpoint is configured; doctor recorded it, "
-                    "but end-to-end validation still requires explicit review of that weight source."
-                )
+                report["custom_checkpoint"] = True
+                allowed = bool(backend.get("allow_custom_checkpoint"))
+                report["allow_custom_checkpoint"] = allowed
+                if not allowed:
+                    report["issues"].append(
+                        "Non-default backend.checkpoint is configured but "
+                        "backend.allow_custom_checkpoint is not true. "
+                        "Set allow_custom_checkpoint: true only after explicit "
+                        "reviewer confirmation of that weight source."
+                    )
+                else:
+                    report["notes"] = list(report.get("notes") or [])
+                    report["notes"].append(
+                        "Using non-default backend.checkpoint with "
+                        "allow_custom_checkpoint=true; default SHA-256 pin is skipped."
+                    )
         else:
             report["issues"].append(
                 f"Missing checkpoint: {report['checkpoint']}. Download the vitb relative weights."

@@ -231,13 +231,46 @@ def test_doctor_requires_git_head_and_reports_custom_checkpoint(tmp_path: Path) 
                 "repo_dir": "third_party/Video-Depth-Anything",
                 "commit": "4f5ae23172ba60fd7bc11ef671cca678842c7072",
                 "checkpoint": "weights/custom_vitb.pth",
+                "allow_custom_checkpoint": False,
                 "encoder": "vitb",
                 "depth_type": "relative",
             }
         },
     )
     assert any("could not be resolved" in issue for issue in report["issues"])
-    assert any("Non-default backend.checkpoint" in issue for issue in report["issues"])
+    assert any("allow_custom_checkpoint" in issue for issue in report["issues"])
+
+
+def test_doctor_allows_custom_checkpoint_with_explicit_opt_in(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    repo_dir = root / "third_party" / "Video-Depth-Anything"
+    checkpoint = root / "weights" / "custom_vitb.pth"
+    utils = repo_dir / "utils"
+    utils.mkdir(parents=True)
+    (repo_dir / "run.py").write_text("print('ok')\n", encoding="utf-8")
+    (repo_dir / ".git").mkdir()
+    (utils / "dc_utils.py").write_text(
+        'colormap = np.array(cm.get_cmap("inferno").colors)\n',
+        encoding="utf-8",
+    )
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"custom")
+    report = doctor_backend(
+        root,
+        {
+            "backend": {
+                "repo_dir": "third_party/Video-Depth-Anything",
+                "commit": "4f5ae23172ba60fd7bc11ef671cca678842c7072",
+                "checkpoint": "weights/custom_vitb.pth",
+                "allow_custom_checkpoint": True,
+                "encoder": "vitb",
+                "depth_type": "relative",
+            }
+        },
+    )
+    assert report.get("allow_custom_checkpoint") is True
+    assert not any("allow_custom_checkpoint" in issue for issue in report["issues"])
+    assert any("non-default backend.checkpoint" in note.lower() for note in report.get("notes", []))
 
 
 def test_doctor_rejects_default_checkpoint_hash_mismatch(tmp_path: Path) -> None:

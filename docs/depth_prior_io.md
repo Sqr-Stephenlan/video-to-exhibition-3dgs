@@ -50,7 +50,7 @@ Optional: `--config <repo-relative-yaml>` (default `configs/depth/default_vitb.y
 
 - Backend clone has a readable git `HEAD` matching `backend.commit`
 - Default checkpoint SHA-256 matches the pin in `backend_pin.md`
-- A non-empty `backend.checkpoint` is recorded as **non-default** and still surfaces as an explicit doctor issue (reviewer confirmation required)
+- A non-empty `backend.checkpoint` requires `backend.allow_custom_checkpoint: true`; otherwise doctor/`run` fail closed. With the opt-in, default SHA pin is skipped and a note is recorded.
 
 ### Extra for `run`
 
@@ -76,6 +76,7 @@ All paths are **repository-relative**. Absolute paths and `../` escapes are reje
 | `backend.commit` | Expected git pin |
 | `backend.encoder` / `depth_type` | Default: `vitb` / `relative` |
 | `backend.checkpoint` | Empty = default VDA filename; else project-relative custom weights (staged temporarily) |
+| `backend.allow_custom_checkpoint` | Must be `true` to use a non-empty `checkpoint`; default `false` |
 | `io.frames_manifest` | Input frame list |
 | `io.depth_dir` | Per-frame depth NPZ output directory |
 | `io.depth_manifest` | Depth manifest output |
@@ -84,7 +85,7 @@ All paths are **repository-relative**. Absolute paths and `../` escapes are reje
 
 ### Frames manifest
 
-Default path: `data/manifests/frames_manifest.json`  
+Default path: `data/manifests/frames_manifest.json`
 Example schema: `configs/depth/frames_manifest.example.json`
 
 ```json
@@ -122,11 +123,11 @@ Frame→depth pairing is **strict positional**: after `selected_frames()` orderi
 
 ### Runtime data flow (brief)
 
-1. Load selected frames from the manifest  
-2. Assemble a temporary MP4 with `ffmpeg` at `runtime.target_fps`  
-3. Stage checkpoint to the filename hardcoded by pinned VDA `run.py`, run inference, then restore the original target  
-4. Read VDA’s single `*_depths.npz` (`depths` shaped `(N,H,W)`), require `N ==` selected frame count  
-5. Write per-frame NPZ + depth manifest + run record  
+1. Load selected frames from the manifest
+2. Assemble a temporary MP4 with `ffmpeg` at `runtime.target_fps`
+3. Stage checkpoint to the filename hardcoded by pinned VDA `run.py`, run inference, then restore the original target
+4. Read VDA’s single `*_depths.npz` (`depths` shaped `(N,H,W)`), require `N ==` selected frame count
+5. Write per-frame NPZ + depth manifest + run record
 
 Temp-video assembly uses ffmpeg concat with a trailing duplicate file entry (so the last
 frame’s `duration` applies). The orchestrator passes `-frames:v N` so the encoded video
@@ -134,7 +135,7 @@ contains exactly `N` frames and matches strict positional depth mapping.
 
 Before calling VDA, the orchestrator idempotently applies the documented matplotlib 3.9+
 colormap patch under `third_party/Video-Depth-Anything/utils/dc_utils.py`
-(see `configs/depth/backend_pin.md`). 
+(see `configs/depth/backend_pin.md`).
 
 ---
 

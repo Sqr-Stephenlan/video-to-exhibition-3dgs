@@ -53,6 +53,10 @@ def cmd_doctor(config_path: Path) -> int:
         print(f"  checkpoint: {report['checkpoint']}")
     if report.get("checkpoint_sha256"):
         print(f"  checkpoint_sha256: {report['checkpoint_sha256']}")
+    if report.get("allow_custom_checkpoint"):
+        print(f"  allow_custom_checkpoint: {report['allow_custom_checkpoint']}")
+    for note in report.get("notes") or []:
+        print(f"  note: {note}")
     print(f"  torch_importable: {report['torch_importable']}")
     print(f"  cuda_available: {report['cuda_available']}")
     print(f"  ffmpeg: {report.get('ffmpeg')}")

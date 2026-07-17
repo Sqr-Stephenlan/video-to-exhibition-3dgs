@@ -55,7 +55,10 @@ Git Bash / WSL (when `.venv/bin/python` exists):
 
 VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)`. The orchestrator validates `N` against the selected frame count and splits into per-frame NPZ files. When selected frames include `timestamp_sec`, they are sorted ascending before temp-video assembly.
 
-If `backend.checkpoint` is set, it must be project-relative. The orchestrator stages that file to the checkpoint filename hardcoded by pinned VDA before inference, restores the original target afterward, and records both paths without machine-specific absolute paths.
+If `backend.checkpoint` is set, it must be project-relative **and**
+`backend.allow_custom_checkpoint: true`. The orchestrator stages that file to the
+checkpoint filename hardcoded by pinned VDA before inference, restores the original
+target afterward, and records both paths without machine-specific absolute paths.
 
 Temp-video assembly passes `-frames:v N` so the ffmpeg concat demuxer’s trailing duplicate file entry does not produce an extra frame (which would fail the strict N-depth check).
 
