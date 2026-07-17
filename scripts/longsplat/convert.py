@@ -8,6 +8,7 @@ from the native LongSplat anchor+MLP model.  Validates the output.
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,56 @@ def validate_converted_ply(ply_path: str | Path) -> dict[str, Any]:
     Returns a metadata dict with vertex count, attributes, and SHA-256.
     """
     return _validate_converted_ply(Path(ply_path))
+
+
+def clean_converted_ply(ply_path: str | Path) -> int:
+    """Remove vertices with NaN/Inf in core 3DGS attributes.
+
+    Returns the number of vertices removed.  The file is overwritten in-place
+    only when invalid vertices are found.
+    """
+    import io
+    import tempfile
+    from plyfile import PlyData, PlyElement
+
+    pp = Path(ply_path).resolve()
+    if not pp.is_file():
+        raise ConvertedPLYValidationError(f"PLY not found: {pp}")
+
+    with open(pp, "rb") as fh:
+        raw = fh.read()
+    ply = PlyData.read(io.BytesIO(raw))
+    vertex = ply["vertex"]
+    if vertex.count == 0:
+        return 0
+
+    fields = [
+        "x", "y", "z", "opacity",
+        "scale_0", "scale_1", "scale_2",
+        "rot_0", "rot_1", "rot_2", "rot_3",
+    ]
+    available = [f for f in fields if f in vertex.data.dtype.names]
+    mask = np.ones(vertex.count, dtype=bool)
+    for f in available:
+        mask &= np.isfinite(vertex.data[f])
+
+    removed = vertex.count - int(mask.sum())
+    if removed == 0:
+        return 0
+
+    filtered = vertex.data[mask]
+    elements = np.empty(len(filtered), dtype=vertex.data.dtype)
+    for name in vertex.data.dtype.names:
+        elements[name] = filtered[name]
+
+    el = PlyElement.describe(elements, "vertex")
+    data = PlyData([el])
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".ply", dir=str(pp.parent))
+    os.close(tmp_fd)
+    data.write(tmp_path)
+    pp.unlink()
+    Path(tmp_path).rename(pp)
+    return removed
 
 
 def _validate_converted_ply(ply_path: Path) -> dict[str, Any]:

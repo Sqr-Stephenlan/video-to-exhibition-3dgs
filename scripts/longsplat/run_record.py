@@ -149,7 +149,7 @@ def transition_status(
 
     _valid = {
         RunStatus.PLANNED: {RunStatus.RUNNING},
-        RunStatus.RUNNING: {RunStatus.FAILED, RunStatus.COMPLETE},
+        RunStatus.RUNNING: {RunStatus.RUNNING, RunStatus.FAILED, RunStatus.COMPLETE},
     }
     allowed = _valid.get(current, set())
     if new_status not in allowed:

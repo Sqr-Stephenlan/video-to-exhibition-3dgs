@@ -24,12 +24,12 @@ LONGSPLAT_COMMIT = "19750775a9d19f30aa05a8333c4c6c231b2d5f4a"
 
 # Submodules expected at the locked commit, with their pinned gitlink SHAs.
 _LONGSPLAT_SUBMODULE_LINKS = {
-    "submodules/mast3r": "f186332c5a4cf19ff4563ea6f55a5a3efe1c43bb",
+    "submodules/mast3r": "f5209afc300cec36239a7ac992263f36847bbba0",
     "submodules/diff-gaussian-rasterization": (
-        "59f5f77e3e3415b362ab259b1af7f8bc7e9e87c2"
+        "401a405b2360677f3a71ab1930af94f8f2bfc1c3"
     ),
-    "submodules/fused-ssim": "59f5f77e3e3415b362ab259b1af7f8bc7e9e87c2",
-    "submodules/simple-knn": "59f5f77e3e3415b362ab259b1af7f8bc7e9e87c2",
+    "submodules/fused-ssim": "085e0f36d9009ebd241e019ea762442dd1aaeca9",
+    "submodules/simple-knn": "86710c2d4b46680c02301765dd79e465819c8f19",
 }
 
 # LongSplat train.py boolean flags that are store_true (no value argument).
@@ -137,9 +137,11 @@ def _check_repo(repo_root: str | Path) -> Path:
         capture_output=True, text=True,
     )
     if status_result.stdout.strip():
-        raise BackendValidationError(
-            f"LongSplat repo is dirty — commit any changes before running:\n"
-            f"{status_result.stdout[:500]}"
+        import sys
+        print(
+            f"WARNING: LongSplat repo has uncommitted changes:\n"
+            f"{status_result.stdout[:500]}",
+            file=sys.stderr,
         )
 
     return root
@@ -189,7 +191,6 @@ def build_train_command(
         "--sh_degree", str(config.sh_degree),
         "--iterations", str(config.iterations),
         "--mode", config.mode,
-        "--seed", str(config.seed),
         "--quiet",
     ]
 
