@@ -143,17 +143,21 @@ def main() -> int:
 
     # --- prepare ---
     prep = sub.add_parser("prepare", help="Materialize depth and validate input")
-    prep.add_argument("--source-path", default="data/frames/wall_test")
-    prep.add_argument("--images", default="selected/segment_0002")
+    prep.add_argument("--source-path", required=True,
+                      help="Path to dataset relative to repo root")
+    prep.add_argument("--images", required=True,
+                      help="Subdirectory under source-path containing images")
     prep.add_argument("--depth-manifest", default=None,
                       help="Path to depth_manifest.json relative to repo root")
 
     # --- train ---
     tr = sub.add_parser("train", help="Run LongSplat training")
-    tr.add_argument("--source-path", default="data/frames/wall_test")
+    tr.add_argument("--source-path", required=True,
+                    help="Path to dataset relative to repo root")
     tr.add_argument("--model-path", default=None,
                     help="Output directory (auto-generated if omitted)")
-    tr.add_argument("--images", default="selected/segment_0002")
+    tr.add_argument("--images", required=True,
+                    help="Subdirectory under source-path containing images")
     tr.add_argument("--mode", default="custom")
     tr.add_argument("--resolution", type=int, default=-1)
     tr.add_argument("--depth-source", default=None,
