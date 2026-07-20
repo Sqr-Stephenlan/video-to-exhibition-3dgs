@@ -119,25 +119,6 @@ third_party/*
 !third_party/README.md
 !third_party/*.txt
 
-# Preprocessing utility scripts — kept locally for rendering tests;
-# the canonical preprocessing pipeline lives in feature/preprocess-video.
-scripts/extract_frames.py
-scripts/split_video.py
-scripts/build_manifest.py
-scripts/filter_blurry_frames.py
-scripts/normalize_exposure.py
-scripts/align_segments.py
-scripts/run_video_depth.py
-scripts/replace_bg_white_to_black.py
-
-# Shared-governance files restored by commit 57d32c4 — changes to these must
-# go through a separate controlled PR against main, not this branch.
-README.md
-dev.ps1
-environment.yml
-docs/framework_risk_review.md
-docs/reproduction_plan.md
-
 # Local notes and moved documents (kept outside version control)
 .obsidian/
 docs/2308.04079v1.pdf
