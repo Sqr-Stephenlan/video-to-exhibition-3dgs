@@ -102,11 +102,32 @@ def test_selected_frames_rejects_mixed_timestamp_presence() -> None:
         selected_frames(frames_manifest)
 
 
-def test_selected_frames_rejects_unsupported_schema_version() -> None:
-    with pytest.raises(ValueError, match="schema_version"):
+def test_selected_frames_rejects_duplicate_frame_id() -> None:
+    with pytest.raises(ValueError, match="Duplicate frame_id"):
         selected_frames(
             {
-                "schema_version": "0.1",
-                "frames": [{"frame_id": "a", "path": "data/frames/a.png"}],
+                "schema_version": "1.0",
+                "frames": [
+                    {"frame_id": "a", "path": "data/frames/a.png", "selected": True},
+                    {"frame_id": "a", "path": "data/frames/a2.png", "selected": True},
+                ],
             }
         )
+
+
+def test_selected_frames_treats_null_timestamp_as_absent() -> None:
+    selected = selected_frames(
+        {
+            "schema_version": "1.0",
+            "frames": [
+                {
+                    "frame_id": "a",
+                    "path": "data/frames/a.png",
+                    "selected": True,
+                    "timestamp_sec": None,
+                },
+                {"frame_id": "b", "path": "data/frames/b.png", "selected": True},
+            ],
+        }
+    )
+    assert [item["frame_id"] for item in selected] == ["a", "b"]

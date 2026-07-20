@@ -64,6 +64,19 @@ Temp-video assembly passes `-frames:v N` so the ffmpeg concat demuxer’s traili
 
 `doctor` / `run` also apply the documented VDA matplotlib 3.9+ colormap local patch when needed (see `configs/depth/backend_pin.md`).
 
+## Bridge from preprocess
+
+```powershell
+.\.venv\Scripts\python.exe scripts\depth\adapt_preprocess_manifest.py `
+  data\manifests\<video_id>\preprocess_manifest.json `
+  --output data\manifests\frames_manifest.json
+
+# Optional low-VRAM smoke (resolution only; deferred fields still unused)
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py --config configs/depth/smoke_joint.yaml run
+```
+
+See `docs/depth_prior_io.md` for the full contract.
+
 ## Current deferred items
 
 The following config fields are intentionally documented but not implemented in this PR:

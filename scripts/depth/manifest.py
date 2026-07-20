@@ -52,7 +52,14 @@ def selected_frames(frames_manifest: dict[str, Any]) -> list[dict[str, Any]]:
     if not selected:
         raise ValueError("No selected frames in frames_manifest")
 
-    has_ts = ["timestamp_sec" in frame for frame in selected]
+    ids = [str(frame["frame_id"]) for frame in selected]
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"Duplicate frame_id in selected frames: {ids}")
+
+    def _has_timestamp(frame: dict[str, Any]) -> bool:
+        return "timestamp_sec" in frame and frame["timestamp_sec"] is not None
+
+    has_ts = [_has_timestamp(frame) for frame in selected]
     if any(has_ts) and not all(has_ts):
         raise ValueError(
             "frames_manifest: either all selected frames must include timestamp_sec "

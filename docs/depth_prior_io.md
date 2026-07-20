@@ -7,7 +7,9 @@ Related files:
 | Role | Path |
 |---|---|
 | CLI entry | `scripts/depth/run_depth_prior.py` |
+| Preprocess adapter | `scripts/depth/adapt_preprocess_manifest.py` |
 | Default config | `configs/depth/default_vitb.yaml` |
+| Low-VRAM smoke config | `configs/depth/smoke_joint.yaml` (resolution only; deferred fields still unused) |
 | Backend pin | `configs/depth/backend_pin.md` |
 | Setup / commands | `scripts/depth/README.md` |
 | Frames manifest example | `configs/depth/frames_manifest.example.json` |
@@ -228,7 +230,7 @@ Documented in config comments and `scripts/depth/README.md`. Do **not** assume t
 
 ## Bridge from video preprocessing
 
-Preprocess PR (`feature/preprocess-video`) writes:
+Preprocess PR (`feature/preprocess-video`, not part of this PR) writes:
 
 `data/manifests/<video_id>/preprocess_manifest.json`
 
@@ -243,15 +245,26 @@ Convert with:
   --output data\manifests\frames_manifest.json
 ```
 
-Then run depth-prior as usual. On 6GB-class GPUs without a CUDA-matched
-`xformers` build, use a reduced config such as `configs/depth/smoke_joint.yaml`
-(`input_size: 308`, `max_res: 512`) for smoke verification.
+Adapter rules (fail closed):
+
+- selected frames must have a non-null repository-relative `path`
+- `timestamp_sec` must be all-present or all-absent (null counts as absent)
+- paths may not escape the repository root
+- duplicate `frame_id` values are rejected
+
+Then run depth-prior. Notes for limited GPUs:
+
+- Low VRAM / OOM: use `configs/depth/smoke_joint.yaml` (`input_size: 308`, `max_res: 512`)
+- Broken `xformers` CUDA build: uninstall or reinstall a wheel matching local torch/CUDA; lowering resolution alone does not fix xformers operator errors
+
+This branch records **frame↔depth** correspondence only. Camera pose / intrinsics are out of scope for depth-prior (handled by later SfM / LongSplat stages).
 
 ## Acceptance notes for this branch
 
 | Goal | Status in current PR |
 |---|---|
 | `doctor` validates clone commit + default checkpoint hash | yes |
-| CPU unit/integration tests for NPZ split, path bounds, staging restore | yes |
-| GPU end-to-end `run` on real exhibition frames | deferred until sample frames exist |
+| CPU unit/integration tests for NPZ split, path bounds, staging restore, adapter | yes |
+| GPU end-to-end `run` on real exhibition frames | deferred until sample frames + GPU report / waiver |
 | Mask / confidence filtering | deferred |
+| Camera pose fields in depth_manifest | out of scope (frame correspondence only) |

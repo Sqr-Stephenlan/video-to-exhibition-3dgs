@@ -396,13 +396,10 @@ def run_vda_on_video(
 def find_vda_depths_npz(output_dir: Path) -> Path:
     candidates = sorted(output_dir.rglob("*_depths.npz"))
     if not candidates:
-        candidates = sorted(output_dir.rglob("*.npz"))
-    if not candidates:
-        raise FileNotFoundError(f"No VDA depth NPZ found under {output_dir.as_posix()}")
+        raise FileNotFoundError(
+            f"No VDA *_depths.npz found under {output_dir.as_posix()}"
+        )
     if len(candidates) > 1:
-        preferred = [path for path in candidates if path.name.endswith("_depths.npz")]
-        if len(preferred) == 1:
-            return preferred[0]
         raise ValueError(
             "Multiple depth NPZ files found; expected a single VDA *_depths.npz. "
             f"Found: {[path.name for path in candidates]}"

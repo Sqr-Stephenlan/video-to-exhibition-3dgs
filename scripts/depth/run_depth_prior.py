@@ -184,6 +184,7 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
     vda_npz_rel: str | None = None
     frame_count_written = 0
     checkpoint_meta: dict = {}
+    status = "failed"
 
     try:
         with tempfile.TemporaryDirectory(prefix="depth_prior_") as tmp:
@@ -207,34 +208,46 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
             stdout_tail = (result.stdout or "")[-4000:]
             stderr_tail = (result.stderr or "")[-4000:]
             if result.returncode != 0:
+                status = "vda_failed"
                 print("Video Depth Anything failed. See run_record for stdout/stderr tails.")
                 print(to_repo_relative(root, run_record_path))
                 return result.returncode
 
-            # VDA writes one *_depths.npz with depths shaped (N,H,W).
-            vda_npz = find_vda_depths_npz(vda_out)
-            depths = load_vda_depths_array(vda_npz)
-            # Keep a repo-relative note of the source artifact name only (temp path is not retained).
-            vda_npz_rel = vda_npz.name
-            frame_records = split_vda_depths_to_frame_files(
-                depths=depths,
-                frames=frames,
-                depth_dir=depth_dir,
-                root=root,
-                depth_type=backend["depth_type"],
-            )
-            frame_count_written = len(frame_records)
-            depth_manifest = build_depth_manifest(
-                frames_manifest=frames_manifest,
-                frame_records=frame_records,
-                backend={
-                    **backend,
-                    "commit": doctor.get("actual_commit") or backend.get("commit"),
-                },
-                depth_type=backend["depth_type"],
-                frames_manifest_path=frames_manifest_rel,
-            )
-            save_json(depth_manifest_path, depth_manifest)
+            try:
+                # VDA writes one *_depths.npz with depths shaped (N,H,W).
+                vda_npz = find_vda_depths_npz(vda_out)
+                depths = load_vda_depths_array(vda_npz)
+                # Keep a repo-relative note of the source artifact name only (temp path is not retained).
+                vda_npz_rel = vda_npz.name
+                frame_records = split_vda_depths_to_frame_files(
+                    depths=depths,
+                    frames=frames,
+                    depth_dir=depth_dir,
+                    root=root,
+                    depth_type=backend["depth_type"],
+                )
+                frame_count_written = len(frame_records)
+                depth_manifest = build_depth_manifest(
+                    frames_manifest=frames_manifest,
+                    frame_records=frame_records,
+                    backend={
+                        **backend,
+                        "commit": doctor.get("actual_commit") or backend.get("commit"),
+                    },
+                    depth_type=backend["depth_type"],
+                    frames_manifest_path=frames_manifest_rel,
+                )
+                save_json(depth_manifest_path, depth_manifest)
+            except Exception as exc:  # noqa: BLE001 - record failure in run_record
+                status = "postprocess_failed"
+                result_code = 3
+                stderr_tail = (stderr_tail + f"\npostprocess_error: {exc}")[-4000:]
+                print(f"Depth post-process failed: {exc}")
+                print(to_repo_relative(root, run_record_path))
+                return 3
+
+            status = "ok"
+            result_code = 0
             print(f"wrote {frame_count_written} depth maps")
             print(f"depth_manifest: {to_repo_relative(root, depth_manifest_path)}")
             return 0
@@ -243,6 +256,7 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
             run_record_path,
             {
                 "module": "depth-prior",
+                "status": status,
                 "started_at": started_at,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "config": config_rel,
