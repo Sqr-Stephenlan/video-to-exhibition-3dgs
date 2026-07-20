@@ -252,7 +252,17 @@ Video Depth Anything 或 Depth Anything V2 用于弱纹理区域的深度先验�
 | `feature/export-viewer-annotation` | 模型清理、压缩、转换、Web 展示和标注 | `scripts/export/**`、`scripts/viewer/**`、相关配置、测试、`annotations/**` 和展示源码 | `.sog`/`.compressed.ply`、Web demo、`annotations.json` | 不修改重建、深度和融合算法 |
 | `docs/evaluation-reporting` | 指标、对比评估、失败案例和验收材料 | 评估文档、报告模板；必要的小型评估配置需单独声明 | 质量、大小、耗时、FPS、失败分析 | 不借评估之名修改被评算法 |
 
-### 7.1 禁止跨模块修改
+### 7.1 分支负责人
+
+当前各专项分支及负责人如下。负责人对其分支内的所有推送负责，上传操作必须落在对应分支内，不得推送到其他专项分支。
+
+| 分支 | 负责人 |
+|---|---|
+| `research/longsplat-route` | @01bullet（所有上传均在此分支内） |
+
+其他分支暂未指定单点负责人；新增负责人需在此表登记。
+
+### 7.2 禁止跨模块修改
 
 1. 一个功能分支只实现表中对应模块，不“顺手”重构相邻模块。
 2. `AGENTS.md`、`PROJECT.md`、`dev.sh`、`.gitignore`、依赖清单和 `.github/**` 是受保护共享区；功能或研究分支需要修改时，必须先说明原因并取得负责人确认。
@@ -263,7 +273,7 @@ Video Depth Anything 或 Depth Anything V2 用于弱纹理区域的深度先验�
 7. 不得提交 `data/**`、`outputs/**`、模型权重、日志、视频、PLY 或其他 `.gitignore` 已排除的大资产。
 8. 不确定代码归属时，先按数据流确定生产者和消费者；仍不明确则暂停修改并向负责人说明边界冲突。
 
-### 7.2 跨模块交接规则
+### 7.3 跨模块交接规则
 
 - 上游接口变化必须版本化，并提供迁移说明或兼容期。
 - 消费方不得依赖未写入 manifest 的隐式信息，例如本地目录顺序、文件修改时间或个人路径。
