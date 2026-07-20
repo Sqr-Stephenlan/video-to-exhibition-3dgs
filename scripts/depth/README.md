@@ -75,7 +75,9 @@ Temp-video assembly passes `-frames:v N` so the ffmpeg concat demuxer’s traili
 .\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py --config configs/depth/smoke_joint.yaml run
 ```
 
-See `docs/depth_prior_io.md` for the full contract.
+See `docs/depth_prior_io.md` for the full contract, including the **LongSplat consumer**
+naming rules (`frame_{id:06d}_depth.npy` must match prepared training stems; materialize
+belongs on `research/longsplat-route`, not this module).
 
 ## Current deferred items
 

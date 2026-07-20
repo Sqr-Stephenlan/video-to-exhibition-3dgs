@@ -259,6 +259,49 @@ Then run depth-prior. Notes for limited GPUs:
 
 This branch records **frame↔depth** correspondence only. Camera pose / intrinsics are out of scope for depth-prior (handled by later SfM / LongSplat stages).
 
+## Consumer contract: LongSplat (`research/longsplat-route`)
+
+Depth-prior is a **producer** of `depth_manifest.json` + per-frame NPZ. It does **not**
+rename images for LongSplat training. The LongSplat branch is responsible for
+materializing and wiring depth into its prepared input tree.
+
+### What this module guarantees
+
+| Field | Meaning for consumers |
+|---|---|
+| `frames[].frame_id` | Stable id (often from preprocess `id` after adapt) |
+| `frames[].rgb_path` | Repository-relative RGB used for depth inference |
+| `frames[].depth_path` | Repository-relative NPZ with key `depth` |
+| `frame_depth_mapping` | Always `strict_positional` vs the selected frames order at run time |
+
+### What LongSplat must do (not implemented here)
+
+LongSplat `prepare_input` typically copies/renames RGB to `frame_{id:06d}.jpg` and
+writes a `frame_mapping.json`. Depth files loaded by the VDA injection patch are
+looked up by **training image stem**, e.g. `frame_000000_depth.npy`.
+
+Therefore a reliable depth→LongSplat bridge must:
+
+1. Read `depth_manifest` + the prepared `frame_mapping.json` (or the same `frame_id` rule).
+2. Materialize NPZ → `depths/frame_{id:06d}_depth.npy` next to prepared images.
+3. **Not** name depth files from the preprocess RGB basename
+   (e.g. `frame_000001_t000000.000.jpg` → wrong stem / silent miss).
+4. Enable training with an explicit depth source flag (e.g. `depth_source=vda`).
+5. **Fail closed** (or at least ERROR) when a prepared frame has no matching depth
+   file — never silently fall back to MASt3R as if VDA depth were present.
+
+Until LongSplat `run_pipeline()` calls materialize automatically and smoke configs
+enable the depth source, **preprocess → depth** and **preprocess → LongSplat** may
+work while **depth → LongSplat** remains incomplete. Own that gap on the LongSplat
+branch; do not change depth-prior output naming to LongSplat’s prepared names.
+
+### Joint testing note
+
+A temporary merge branch may be used to verify the three-way wire, but
+`requirements.txt` add/add conflicts across the three feature branches must be
+resolved by hand (union of PyYAML/Pillow, OpenCV/scenedetect, plyfile, numpy bounds).
+Do not permanently fold LongSplat/preprocess sources into this PR.
+
 ## Acceptance notes for this branch
 
 | Goal | Status in current PR |
