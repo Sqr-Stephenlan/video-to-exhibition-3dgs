@@ -1,0 +1,27 @@
+# Smoke config for joint preprocess + depth-prior on limited VRAM (e.g. 6GB laptop).
+schema_version: "1.0"
+module: depth-prior
+
+backend:
+  name: video-depth-anything
+  repo_dir: third_party/Video-Depth-Anything
+  commit: "4f5ae23172ba60fd7bc11ef671cca678842c7072"
+  encoder: vitb
+  depth_type: relative
+  input_size: 308
+  max_res: 512
+  fp16: true
+  checkpoint: ""
+  allow_custom_checkpoint: false
+
+io:
+  frames_manifest: data/manifests/frames_manifest.json
+  depth_dir: data/depth
+  mask_dir: data/masks
+  depth_manifest: data/manifests/depth_manifest.json
+  run_record: outputs/reconstructions/depth_prior/run_record.json
+
+runtime:
+  target_fps: 5
+  device: cuda
+  skip_existing: false

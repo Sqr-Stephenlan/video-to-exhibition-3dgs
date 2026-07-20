@@ -226,6 +226,27 @@ Documented in config comments and `scripts/depth/README.md`. Do **not** assume t
 
 ---
 
+## Bridge from video preprocessing
+
+Preprocess PR (`feature/preprocess-video`) writes:
+
+`data/manifests/<video_id>/preprocess_manifest.json`
+
+with `frames[].id` (not `frame_id`). Depth-prior expects
+`data/manifests/frames_manifest.json` with `frames[].frame_id`.
+
+Convert with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\depth\adapt_preprocess_manifest.py `
+  data\manifests\<video_id>\preprocess_manifest.json `
+  --output data\manifests\frames_manifest.json
+```
+
+Then run depth-prior as usual. On 6GB-class GPUs without a CUDA-matched
+`xformers` build, use a reduced config such as `configs/depth/smoke_joint.yaml`
+(`input_size: 308`, `max_res: 512`) for smoke verification.
+
 ## Acceptance notes for this branch
 
 | Goal | Status in current PR |
