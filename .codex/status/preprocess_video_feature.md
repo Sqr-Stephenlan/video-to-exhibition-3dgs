@@ -1,6 +1,6 @@
 # Preprocess Video Feature Status
 
-Last updated: 2026-07-17
+Last updated: 2026-07-21
 
 ## Current Phase
 
@@ -11,7 +11,10 @@ extraction is implemented on branch `codex/preprocess-fidelity-frames`.
 The feature now has a single CLI entrypoint, focused tests, and user-facing
 documentation. FFmpeg and ffprobe are now installed on PATH, the FFmpeg smoke
 test passes, and the remaining Ready for review checklist items are now in
-progress through the PR body update.
+progress through the PR body update. The feature documentation has also been
+expanded into a handoff-oriented README for usage, configuration, tuning,
+manifest consumption, downstream consumer contracts, troubleshooting, and
+generated-asset boundaries.
 
 ## Completed
 
@@ -96,6 +99,14 @@ progress through the PR body update.
     pressure matter more than maximizing coverage
   - leave exposure thresholds unchanged for now because no frames on
     `pressure_test.mp4` tripped either exposure filter at `0.6` or `0.5`
+- Expanded `docs/preprocess_video.md` so the feature README now documents the
+  owned pipeline boundary, non-goals, CLI option table, preset defaults, config
+  precedence, output layout, manifest handoff contract, tuning guidance,
+  troubleshooting, and generated-asset Git boundaries.
+- Added a preprocess consumer contract to `docs/preprocess_video.md` that
+  defines producer guarantees, downstream adapter responsibilities, manifest
+  ordering rules, backend naming boundaries, LongSplat bridge expectations, and
+  joint testing scope.
 
 ## Verification
 
@@ -260,6 +271,13 @@ progress through the PR body update.
 - Generated review videos for the selected easy-video candidates:
   - `data/frames/easy1_b7p5_d3_fps5_o10/selected/selected_review.mp4`
   - `data/frames/easy2_b85_d4_fps5_o10/selected/selected_review.mp4`
+- Documentation-only README expansion reviewed against
+  `scripts/preprocess_video.py`, `configs/preprocess/baseline_real_video.json`,
+  `.gitignore`, and the current feature status. No code or test behavior was
+  changed.
+- Documentation-only consumer contract reviewed against
+  `scripts/preprocess_video.py` manifest fields and the current preprocess
+  feature contract. No code or test behavior was changed.
 
 ## Next Step
 
