@@ -12,6 +12,7 @@ ALLOWED_ENCODERS = {"vits", "vitb", "vitl"}
 ALLOWED_DEPTH_TYPES = {"relative", "metric"}
 SUPPORTED_SCHEMA_VERSIONS = {"1.0"}
 FRAME_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def require_schema_version(data: dict[str, Any], *, label: str) -> str:
@@ -22,6 +23,38 @@ def require_schema_version(data: dict[str, Any], *, label: str) -> str:
             f"got {version!r}"
         )
     return str(version)
+
+
+def validate_video_id(video_id: str) -> str:
+    if not isinstance(video_id, str) or not VIDEO_ID_RE.fullmatch(video_id):
+        raise ValueError(
+            "video_id must be 1-128 chars of [A-Za-z0-9._-] and start with alphanumeric; "
+            f"got {video_id!r}"
+        )
+    return video_id
+
+
+def format_io_template(
+    template: str,
+    *,
+    video_id: str | None = None,
+    run_id: str | None = None,
+) -> str:
+    """Expand optional {video_id} / {run_id} placeholders in repository-relative IO paths."""
+    text = str(template)
+    if "{video_id}" in text:
+        if not video_id:
+            raise ValueError(
+                f"IO path template requires video_id but none was provided: {template}"
+            )
+        text = text.replace("{video_id}", validate_video_id(video_id))
+    if "{run_id}" in text:
+        if not run_id:
+            raise ValueError(
+                f"IO path template requires run_id but none was provided: {template}"
+            )
+        text = text.replace("{run_id}", validate_video_id(run_id))
+    return text
 
 
 def load_config(path: Path) -> dict[str, Any]:

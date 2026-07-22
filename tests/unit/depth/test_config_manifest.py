@@ -86,7 +86,7 @@ def test_selected_frames_sorts_by_timestamp_sec() -> None:
             },
         ],
     }
-    selected = selected_frames(frames_manifest)
+    selected = selected_frames(frames_manifest, dedupe_timestamps=False)
     assert [item["frame_id"] for item in selected] == ["early", "late"]
 
 

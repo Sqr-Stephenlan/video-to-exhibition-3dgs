@@ -24,14 +24,15 @@ Depth outputs are a **soft prior** only. Do not treat them as metric ground trut
 # Environment checks (no frames required)
 .\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py doctor
 
-# Full run (needs frames_manifest + frame files)
-.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run
+# Full run (needs frames_manifest + frame files; --video-id / --run-id expand IO templates)
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run --video-id demo_short --run-id baseline
 
 # Validate config + manifest only
-.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run --dry-run
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run --video-id demo_short --run-id baseline --dry-run
 ```
 
 Optional: `--config <repo-relative-yaml>` (default `configs/depth/default_vitb.yaml`).
+When `io.*` paths contain `{video_id}` / `{run_id}`, pass matching CLI flags (or set `runtime.run_id`). `--video-id` must match `frames_manifest.video_id` when both are set.
 
 ---
 
@@ -58,9 +59,10 @@ Optional: `--config <repo-relative-yaml>` (default `configs/depth/default_vitb.y
 
 | Requirement | Notes |
 |---|---|
-| `data/manifests/frames_manifest.json` | Path from config `io.frames_manifest` |
+| `data/manifests/<video_id>/<run_id>/frames_manifest.json` | Default `io.frames_manifest` template; expand with `--video-id` / `--run-id` |
 | Frame image files | Every selected frame `path` must exist and stay inside the repo |
 | `doctor` clean | Non–dry-run `run` aborts if doctor reports issues |
+| Non-conflicting outputs | Existing depth NPZ / depth_manifest / run_record refuse overwrite unless `runtime.overwrite: true` |
 
 `doctor` does **not** need sample frames. `run` does.
 
@@ -79,15 +81,18 @@ All paths are **repository-relative**. Absolute paths and `../` escapes are reje
 | `backend.encoder` / `depth_type` | Default: `vitb` / `relative` |
 | `backend.checkpoint` | Empty = default VDA filename; else project-relative custom weights (staged temporarily) |
 | `backend.allow_custom_checkpoint` | Must be `true` to use a non-empty `checkpoint`; default `false` |
-| `io.frames_manifest` | Input frame list |
-| `io.depth_dir` | Per-frame depth NPZ output directory |
+| `io.frames_manifest` | Input frame list (may use `{video_id}` / `{run_id}`) |
+| `io.depth_dir` | Per-frame depth NPZ output directory (namespaced by `{video_id}/{run_id}`) |
 | `io.depth_manifest` | Depth manifest output |
 | `io.run_record` | Run record output |
-| `runtime.target_fps` | FPS used only when assembling frames into a temp video |
+| `runtime.run_id` | Default run namespace when CLI `--run-id` is omitted (default `default`) |
+| `runtime.target_fps` | Fallback frame duration (`1/fps`) when timestamps are absent, and for the last frame when timestamps are present |
+| `runtime.dedupe_identical_timestamps` | Collapse same-`timestamp_sec` frames when image bytes match (default `true`) |
+| `runtime.overwrite` | Allow clobbering existing depth outputs (default `false`) |
 
 ### Frames manifest
 
-Default path: `data/manifests/frames_manifest.json`
+Default path template: `data/manifests/{video_id}/{run_id}/frames_manifest.json`
 Example schema: `configs/depth/frames_manifest.example.json`
 
 ```json
@@ -116,20 +121,23 @@ Example schema: `configs/depth/frames_manifest.example.json`
 | `frames[].frame_id` | yes | 1–128 chars of `[A-Za-z0-9._-]`, must start with alphanumeric; no path segments |
 | `frames[].path` | yes | Repository-relative image path |
 | `frames[].selected` | no | Default `true`; `false` skips the frame |
-| `frames[].timestamp_sec` | no | If any selected frame has it, **all** selected frames must; then frames are sorted ascending before temp-video assembly |
-| `video_id` / `source_video` / geometry fields | no for orchestration | Provenance only |
+| `frames[].timestamp_sec` | no | If any selected frame has it, **all** selected frames must; then frames are sorted ascending; identical timestamps with identical image bytes are collapsed (configurable); assembly uses real inter-frame gaps |
+| `frames[].width` / `height` | required after adapt | Adapter fills from image bytes when preprocess omits them |
+| `frames[].segment_id` / `reason` / quality fields | no | Preserved from preprocess when present; copied into depth_manifest |
+| `video_id` / `source_video` | strongly recommended | Combined with `run_id`, namespaces IO so concurrent preprocess routes do not clobber each other |
 
 At least one frame must remain after selection.
 
-Frame→depth pairing is **strict positional**: after `selected_frames()` ordering, `depths[i]` corresponds to selected frame `i`. A count mismatch fails fast.
+Frame→depth pairing is **strict positional**: after `selected_frames()` ordering (sort + optional timestamp dedupe), `depths[i]` corresponds to selected frame `i`. A count mismatch fails fast.
 
 ### Runtime data flow (brief)
 
-1. Load selected frames from the manifest
-2. Assemble a temporary MP4 with `ffmpeg` at `runtime.target_fps`
-3. Stage checkpoint to the filename hardcoded by pinned VDA `run.py`, run inference, then restore the original target
-4. Read VDA’s single `*_depths.npz` (`depths` shaped `(N,H,W)`), require `N ==` selected frame count
-5. Write per-frame NPZ + depth manifest + run record
+1. Expand `{video_id}` / `{run_id}` IO templates (`--video-id`, `--run-id` / `runtime.run_id`, and/or manifest `video_id`)
+2. Load selected frames; refuse overwrite of prior outputs unless enabled
+3. Assemble a temporary MP4 with `ffmpeg` using timestamp-driven durations when available
+4. Stage checkpoint to the filename hardcoded by pinned VDA `run.py`, run inference, then restore the original target
+5. Read VDA’s single `*_depths.npz` (`depths` shaped `(N,H,W)`), require `N ==` selected frame count
+6. Write per-frame NPZ under `data/depth/<video_id>/<run_id>/` + namespaced depth manifest + run record
 
 Temp-video assembly uses ffmpeg concat with a trailing duplicate file entry (so the last
 frame’s `duration` applies). The orchestrator passes `-frames:v N` so the encoded video
@@ -147,7 +155,7 @@ Default paths from `io.*` in `default_vitb.yaml`.
 
 ### Per-frame depth maps
 
-Path pattern: `data/depth/<frame_id>.npz`
+Path pattern: `data/depth/<video_id>/<run_id>/<frame_id>.npz`
 
 | Key | Content |
 |---|---|
@@ -155,7 +163,7 @@ Path pattern: `data/depth/<frame_id>.npz`
 
 ### Depth manifest
 
-Default path: `data/manifests/depth_manifest.json`
+Default path: `data/manifests/<video_id>/<run_id>/depth_manifest.json`
 
 ```json
 {
@@ -199,7 +207,7 @@ Default path: `data/manifests/depth_manifest.json`
 
 ### Run record
 
-Default path: `outputs/reconstructions/depth_prior/run_record.json`
+Default path: `outputs/reconstructions/depth_prior/<video_id>/<run_id>/run_record.json`
 
 | Field | Meaning |
 |---|---|
@@ -234,25 +242,28 @@ Preprocess PR (`feature/preprocess-video`, not part of this PR) writes:
 
 `data/manifests/<video_id>/preprocess_manifest.json`
 
-with `frames[].id` (not `frame_id`). Depth-prior expects
-`data/manifests/frames_manifest.json` with `frames[].frame_id`.
+with `frames[].id` (not `frame_id`). Depth-prior expects a frames_manifest with
+`frames[].frame_id`, defaulting to `data/manifests/<video_id>/<run_id>/frames_manifest.json`.
 
 Convert with:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\depth\adapt_preprocess_manifest.py `
   data\manifests\<video_id>\preprocess_manifest.json `
-  --output data\manifests\frames_manifest.json
+  --run-id baseline
+# default --output data/manifests/{video_id}/{run_id}/frames_manifest.json
 ```
 
 Adapter rules (fail closed):
 
 - selected frames must have a non-null repository-relative `path`
+- `width`/`height` are required (filled from image bytes when preprocess omits them)
+- preserve `segment_id`, selection `reason`, and quality provenance fields when present
 - `timestamp_sec` must be all-present or all-absent (null counts as absent)
 - paths may not escape the repository root
 - duplicate `frame_id` values are rejected
 
-Then run depth-prior. Notes for limited GPUs:
+Then run depth-prior with matching `--video-id` and `--run-id`. Notes for limited GPUs:
 
 - Low VRAM / OOM: use `configs/depth/smoke_joint.yaml` (`input_size: 308`, `max_res: 512`)
 - Broken `xformers` CUDA build: uninstall or reinstall a wheel matching local torch/CUDA; lowering resolution alone does not fix xformers operator errors
@@ -264,6 +275,10 @@ This branch records **frame↔depth** correspondence only. Camera pose / intrins
 Depth-prior is a **producer** of `depth_manifest.json` + per-frame NPZ. It does **not**
 rename images for LongSplat training. The LongSplat branch is responsible for
 materializing and wiring depth into its prepared input tree.
+
+Reference helper (depth branch only; no LongSplat import):
+`scripts/depth/longsplat_consumer_contract.py`, covered by
+`tests/unit/depth/test_real_product_adaptation.py`.
 
 ### What this module guarantees
 
@@ -282,7 +297,7 @@ looked up by **training image stem**, e.g. `frame_000000_depth.npy`.
 
 Therefore a reliable depth→LongSplat bridge must:
 
-1. Read `depth_manifest` + the prepared `frame_mapping.json` (or the same `frame_id` rule).
+1. Read `depth_manifest` + the prepared `frame_mapping.json` (bind via `frame_id` or `rgb_path`).
 2. Materialize NPZ → `depths/frame_{id:06d}_depth.npy` next to prepared images.
 3. **Not** name depth files from the preprocess RGB basename
    (e.g. `frame_000001_t000000.000.jpg` → wrong stem / silent miss).

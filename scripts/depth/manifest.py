@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
-from scripts.depth.config import require_schema_version, validate_frame_id
+from scripts.depth.config import require_schema_version, resolve_repo_path, validate_frame_id
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -26,13 +27,62 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
         handle.write("\n")
 
 
-def selected_frames(frames_manifest: dict[str, Any]) -> list[dict[str, Any]]:
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dedupe_identical_timestamps(
+    frames: list[dict[str, Any]],
+    *,
+    root: Path,
+) -> list[dict[str, Any]]:
+    """
+    Collapse frames that share the same timestamp_sec when image bytes match.
+
+    Different content at the same timestamp is an error (ambiguous VDA ordering).
+    """
+    by_ts: dict[float, list[dict[str, Any]]] = {}
+    for frame in frames:
+        key = float(frame["timestamp_sec"])
+        by_ts.setdefault(key, []).append(frame)
+
+    kept: list[dict[str, Any]] = []
+    for timestamp in sorted(by_ts):
+        group = by_ts[timestamp]
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+        hashes = {
+            _sha256_file(resolve_repo_path(root, frame["path"])): frame for frame in group
+        }
+        if len(hashes) != 1:
+            ids = [frame["frame_id"] for frame in group]
+            raise ValueError(
+                "Duplicate timestamp_sec with differing image content; "
+                f"timestamp={timestamp}, frame_ids={ids}. "
+                "Split by segment or resolve the conflict before depth-prior."
+            )
+        # Identical bytes: keep the first occurrence (stable provenance).
+        kept.append(group[0])
+    return kept
+
+
+def selected_frames(
+    frames_manifest: dict[str, Any],
+    *,
+    root: Path | None = None,
+    dedupe_timestamps: bool = True,
+) -> list[dict[str, Any]]:
     """
     Return selected frames in VDA input order.
 
     Mapping to depth slices is strict-positional: depths[i] <-> selected[i].
-    When every selected frame has timestamp_sec, sort ascending so temp-video
-    order matches capture time even if the manifest list is unordered.
+    When every selected frame has timestamp_sec, sort ascending and optionally
+    collapse identical-timestamp duplicates (same image bytes).
     """
     require_schema_version(frames_manifest, label="frames_manifest")
     frames = frames_manifest.get("frames")
@@ -72,7 +122,43 @@ def selected_frames(frames_manifest: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(
                 "frames_manifest: timestamp_sec must be numeric on selected frames"
             ) from exc
+        if dedupe_timestamps:
+            if root is None:
+                raise ValueError(
+                    "dedupe_timestamps requires project root to hash frame files"
+                )
+            selected = dedupe_identical_timestamps(selected, root=root)
     return selected
+
+
+def assert_outputs_not_conflicting(
+    *,
+    root: Path,
+    depth_dir: Path,
+    depth_manifest_path: Path,
+    run_record_path: Path,
+    frames: list[dict[str, Any]],
+    overwrite: bool,
+) -> None:
+    """Refuse to clobber prior run artifacts unless overwrite is enabled."""
+    if overwrite:
+        return
+    conflicts: list[str] = []
+    for frame in frames:
+        dest = depth_dir / f"{frame['frame_id']}.npz"
+        if dest.is_file():
+            conflicts.append(dest.as_posix())
+    for path in (depth_manifest_path, run_record_path):
+        if path.is_file():
+            conflicts.append(path.as_posix())
+    if conflicts:
+        preview = "\n  ".join(conflicts[:8])
+        more = "" if len(conflicts) <= 8 else f"\n  ... and {len(conflicts) - 8} more"
+        raise FileExistsError(
+            "Refusing to overwrite existing depth-prior outputs "
+            "(set runtime.overwrite: true to allow):\n  "
+            f"{preview}{more}"
+        )
 
 
 def build_depth_manifest(
@@ -87,7 +173,7 @@ def build_depth_manifest(
     Build depth_manifest.json.
 
     frame_depth_mapping is always strict_positional: depths[i] matches the i-th
-    selected frame after selected_frames() ordering (optional timestamp sort).
+    selected frame after selected_frames() ordering (optional timestamp sort/dedupe).
     """
     return {
         "schema_version": "1.0",

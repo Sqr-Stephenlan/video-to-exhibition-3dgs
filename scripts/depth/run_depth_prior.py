@@ -25,8 +25,9 @@ from scripts.depth.backend_vda import (
     stage_checkpoint_for_vda,
     write_run_record,
 )
-from scripts.depth.config import load_config, resolve_repo_path, to_repo_relative
+from scripts.depth.config import format_io_template, load_config, resolve_repo_path, to_repo_relative
 from scripts.depth.manifest import (
+    assert_outputs_not_conflicting,
     build_depth_manifest,
     load_json,
     save_json,
@@ -69,7 +70,36 @@ def cmd_doctor(config_path: Path) -> int:
     return 0
 
 
-def _assemble_temp_video(frame_paths: list[Path], fps: float, output_video: Path) -> None:
+def frame_durations_sec(
+    frame_count: int,
+    fps: float,
+    timestamps_sec: list[float] | None = None,
+) -> list[float]:
+    """Per-frame display durations for ffmpeg concat (seconds)."""
+    if frame_count < 1:
+        raise ValueError("frame_count must be >= 1")
+    default_duration = 1.0 / float(fps)
+    if timestamps_sec is None:
+        return [default_duration] * frame_count
+    if len(timestamps_sec) != frame_count:
+        raise ValueError("timestamps_sec length must match frame_count")
+    durations: list[float] = []
+    for index in range(frame_count):
+        if index + 1 < frame_count:
+            durations.append(
+                max(float(timestamps_sec[index + 1]) - float(timestamps_sec[index]), 1e-3)
+            )
+        else:
+            durations.append(default_duration)
+    return durations
+
+
+def _assemble_temp_video(
+    frame_paths: list[Path],
+    fps: float,
+    output_video: Path,
+    timestamps_sec: list[float] | None = None,
+) -> None:
     if not frame_paths:
         raise ValueError("No frame paths to assemble")
     missing = [path for path in frame_paths if not path.is_file()]
@@ -81,11 +111,13 @@ def _assemble_temp_video(frame_paths: list[Path], fps: float, output_video: Path
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is required to assemble frames into a temp video")
+    if timestamps_sec is not None and len(timestamps_sec) != len(frame_paths):
+        raise ValueError("timestamps_sec length must match frame_paths")
 
+    durations = frame_durations_sec(len(frame_paths), fps, timestamps_sec)
     list_file = output_video.with_suffix(".txt")
     with list_file.open("w", encoding="utf-8") as handle:
-        duration = 1.0 / float(fps)
-        for path in frame_paths:
+        for path, duration in zip(frame_paths, durations, strict=True):
             handle.write(f"file '{path.resolve().as_posix()}'\n")
             handle.write(f"duration {duration:.6f}\n")
         # ffmpeg concat demuxer requires a trailing file entry so the last
@@ -134,15 +166,33 @@ def build_ffmpeg_concat_command(
     ]
 
 
-def cmd_run(config_path: Path, dry_run: bool = False) -> int:
+def cmd_run(
+    config_path: Path,
+    dry_run: bool = False,
+    video_id: str | None = None,
+    run_id: str | None = None,
+) -> int:
     root = project_root()
     config = load_config(config_path)
     backend = config["backend"]
     io = config["io"]
     runtime = config.get("runtime") or {}
+    effective_run_id = run_id or runtime.get("run_id") or "default"
 
     config_rel = to_repo_relative(root, config_path)
-    frames_manifest_rel = io["frames_manifest"]
+    try:
+        frames_manifest_rel = format_io_template(
+            io["frames_manifest"],
+            video_id=video_id,
+            run_id=effective_run_id,
+        )
+    except ValueError as exc:
+        print(
+            f"{exc}\n"
+            "Pass --video-id / --run-id when io.frames_manifest uses {video_id}/{run_id}, "
+            "or point frames_manifest at an explicit path."
+        )
+        return 2
     frames_manifest_path = resolve_repo_path(root, frames_manifest_rel)
     if not frames_manifest_path.is_file():
         example = root / "configs" / "depth" / "frames_manifest.example.json"
@@ -161,19 +211,74 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
         return 1
 
     frames_manifest = load_json(frames_manifest_path)
-    frames = selected_frames(frames_manifest)
+    manifest_video_id = frames_manifest.get("video_id")
+    if video_id and manifest_video_id and str(video_id) != str(manifest_video_id):
+        print(
+            f"--video-id {video_id!r} does not match frames_manifest.video_id "
+            f"{manifest_video_id!r}"
+        )
+        return 2
+    effective_video_id = video_id or manifest_video_id
+    dedupe_timestamps = bool(runtime.get("dedupe_identical_timestamps", True))
+    frames = selected_frames(
+        frames_manifest,
+        root=root,
+        dedupe_timestamps=dedupe_timestamps,
+    )
     frame_paths = [resolve_repo_path(root, frame["path"]) for frame in frames]
+    timestamps_sec: list[float] | None = None
+    if frames and all(
+        "timestamp_sec" in frame and frame["timestamp_sec"] is not None for frame in frames
+    ):
+        timestamps_sec = [float(frame["timestamp_sec"]) for frame in frames]
 
-    depth_dir = resolve_repo_path(root, io["depth_dir"])
-    depth_manifest_path = resolve_repo_path(root, io["depth_manifest"])
-    run_record_path = resolve_repo_path(root, io["run_record"])
+    try:
+        depth_dir = resolve_repo_path(
+            root,
+            format_io_template(
+                io["depth_dir"],
+                video_id=effective_video_id,
+                run_id=effective_run_id,
+            ),
+        )
+        depth_manifest_path = resolve_repo_path(
+            root,
+            format_io_template(
+                io["depth_manifest"],
+                video_id=effective_video_id,
+                run_id=effective_run_id,
+            ),
+        )
+        run_record_path = resolve_repo_path(
+            root,
+            format_io_template(
+                io["run_record"],
+                video_id=effective_video_id,
+                run_id=effective_run_id,
+            ),
+        )
+    except ValueError as exc:
+        print(str(exc))
+        return 2
     repo_dir = resolve_repo_path(root, backend["repo_dir"])
+    overwrite = bool(runtime.get("overwrite", False))
+    assert_outputs_not_conflicting(
+        root=root,
+        depth_dir=depth_dir,
+        depth_manifest_path=depth_manifest_path,
+        run_record_path=run_record_path,
+        frames=frames,
+        overwrite=overwrite,
+    )
 
     if dry_run:
         print("dry-run ok")
+        print(f"  video_id: {effective_video_id}")
+        print(f"  run_id: {effective_run_id}")
         print(f"  selected_frames: {len(frames)}")
         print(f"  depth_dir: {to_repo_relative(root, depth_dir)}")
         print(f"  depth_manifest: {to_repo_relative(root, depth_manifest_path)}")
+        print(f"  overwrite: {overwrite}")
         return 0
 
     started_at = datetime.now(timezone.utc).isoformat()
@@ -191,7 +296,12 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
             tmp_dir = Path(tmp)
             temp_video = tmp_dir / "input.mp4"
             vda_out = tmp_dir / "vda_out"
-            _assemble_temp_video(frame_paths, float(runtime.get("target_fps", 5)), temp_video)
+            _assemble_temp_video(
+                frame_paths,
+                float(runtime.get("target_fps", 5)),
+                temp_video,
+                timestamps_sec=timestamps_sec,
+            )
             result, command, checkpoint_meta = run_vda_on_video(
                 root=root,
                 repo_dir=repo_dir,
@@ -225,6 +335,7 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
                     depth_dir=depth_dir,
                     root=root,
                     depth_type=backend["depth_type"],
+                    overwrite=overwrite,
                 )
                 frame_count_written = len(frame_records)
                 depth_manifest = build_depth_manifest(
@@ -261,6 +372,8 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "config": config_rel,
                 "frames_manifest": frames_manifest_rel,
+                "video_id": effective_video_id,
+                "run_id": effective_run_id,
                 "backend_name": backend.get("name"),
                 "backend_repo_dir": backend.get("repo_dir"),
                 "backend_commit": doctor.get("actual_commit"),
@@ -284,6 +397,11 @@ def cmd_run(config_path: Path, dry_run: bool = False) -> int:
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
                 "vda_depths_npz": vda_npz_rel,
+                "runtime": {
+                    "overwrite": overwrite,
+                    "dedupe_identical_timestamps": dedupe_timestamps,
+                    "timestamp_driven_assembly": timestamps_sec is not None,
+                },
                 "outputs": {
                     "depth_dir": to_repo_relative(root, depth_dir),
                     "depth_manifest": to_repo_relative(root, depth_manifest_path),
@@ -309,6 +427,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate config and manifest only; do not call VDA",
     )
+    run_parser.add_argument(
+        "--video-id",
+        default=None,
+        help=(
+            "Expand {video_id} in io paths. Required when frames_manifest uses {video_id}. "
+            "Must match frames_manifest.video_id when both are set."
+        ),
+    )
+    run_parser.add_argument(
+        "--run-id",
+        default=None,
+        help=(
+            "Expand {run_id} in io paths (default: runtime.run_id or 'default'). "
+            "Use distinct values for baseline vs LongSplat preprocess on the same video."
+        ),
+    )
     return parser
 
 
@@ -319,7 +453,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return cmd_doctor(config_path)
     if args.command == "run":
-        return cmd_run(config_path, dry_run=bool(args.dry_run))
+        return cmd_run(
+            config_path,
+            dry_run=bool(args.dry_run),
+            video_id=args.video_id,
+            run_id=args.run_id,
+        )
     parser.error(f"Unknown command: {args.command}")
     return 2
 

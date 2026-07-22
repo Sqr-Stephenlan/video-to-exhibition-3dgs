@@ -1,6 +1,6 @@
 # Smoke config for joint preprocess + depth-prior on limited VRAM (e.g. 6GB laptop).
 # Only backend.input_size / max_res / fp16 and io paths are effective for this smoke.
-# device / skip_existing / mask_dir remain deferred (same as default_vitb.yaml).
+# device / skip_existing remain deferred (same as default_vitb.yaml).
 schema_version: "1.0"
 module: depth-prior
 
@@ -17,15 +17,18 @@ backend:
   allow_custom_checkpoint: false
 
 io:
-  frames_manifest: data/manifests/frames_manifest.json
-  depth_dir: data/depth
+  frames_manifest: data/manifests/{video_id}/{run_id}/frames_manifest.json
+  depth_dir: data/depth/{video_id}/{run_id}
   # Deferred: mask generation / confidence export is not implemented yet.
-  mask_dir: data/masks
-  depth_manifest: data/manifests/depth_manifest.json
-  run_record: outputs/reconstructions/depth_prior/run_record.json
+  mask_dir: data/masks/{video_id}/{run_id}
+  depth_manifest: data/manifests/{video_id}/{run_id}/depth_manifest.json
+  run_record: outputs/reconstructions/depth_prior/{video_id}/{run_id}/run_record.json
 
 runtime:
+  run_id: default
   target_fps: 5
+  dedupe_identical_timestamps: true
+  overwrite: false
   # Deferred: not plumbed into VDA yet.
   device: cuda
   # Deferred: rerun / cache skipping is not implemented yet.

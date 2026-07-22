@@ -24,8 +24,8 @@ Project `.venv` uses `Scripts\python.exe` on Windows (`dev.sh` expects Unix path
 .\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py doctor
 
 # After frames_manifest + frames exist
-.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run
-.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run --dry-run
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run --video-id <video_id> --run-id <run_id>
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py run --video-id <video_id> --run-id <run_id> --dry-run
 ```
 
 Git Bash / WSL (when `.venv/bin/python` exists):
@@ -41,19 +41,15 @@ Git Bash / WSL (when `.venv/bin/python` exists):
 3. Install backend `requirements.txt` into the same venv
 4. Download `video_depth_anything_vitb.pth` into `third_party/Video-Depth-Anything/checkpoints/`
 5. Run `doctor` until status is ok
-6. When sample frames arrive, write `data/manifests/frames_manifest.json` and run `run`
-
-## GPU note
-
-`doctor` currently passes with CPU `torch`. For real inference, install a CUDA build of PyTorch that matches the local NVIDIA driver, still targeting `torch==2.1.1` / `torchvision==0.16.1` when possible to stay close to VDA's pin. Re-run `doctor` and confirm `cuda_available: True` before long runs.
+6. Adapt preprocess output (or write `data/manifests/<video_id>/frames_manifest.json`) and run with `--video-id`
 
 ## Outputs
 
-- `data/depth/<frame_id>.npz` — one file per selected frame; each stores a single `depth` array
-- `data/manifests/depth_manifest.json` — includes `source_video_id`, `source_frames_manifest` (path), and `frame_depth_mapping: strict_positional`
-- `outputs/reconstructions/depth_prior/run_record.json` — repository-relative paths, backend commit, I/O, and a sanitized command using `<project>` / `<temp>` placeholders
+- `data/depth/<video_id>/<run_id>/<frame_id>.npz` — one file per selected frame; each stores a single `depth` array
+- `data/manifests/<video_id>/<run_id>/depth_manifest.json` — includes `source_video_id`, `source_frames_manifest` (path), and `frame_depth_mapping: strict_positional`
+- `outputs/reconstructions/depth_prior/<video_id>/<run_id>/run_record.json` — repository-relative paths, backend commit, I/O, and a sanitized command using `<project>` / `<temp>` placeholders
 
-VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)`. The orchestrator validates `N` against the selected frame count and splits into per-frame NPZ files. When selected frames include `timestamp_sec`, they are sorted ascending before temp-video assembly.
+VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)`. The orchestrator validates `N` against the selected frame count and splits into per-frame NPZ files. When selected frames include `timestamp_sec`, they are sorted ascending, identical-timestamp duplicates with matching bytes are collapsed, and temp-video assembly uses real inter-frame gaps (last frame uses `1/target_fps`).
 
 If `backend.checkpoint` is set, it must be project-relative **and**
 `backend.allow_custom_checkpoint: true`. The orchestrator stages that file to the
@@ -69,10 +65,10 @@ Temp-video assembly passes `-frames:v N` so the ffmpeg concat demuxer’s traili
 ```powershell
 .\.venv\Scripts\python.exe scripts\depth\adapt_preprocess_manifest.py `
   data\manifests\<video_id>\preprocess_manifest.json `
-  --output data\manifests\frames_manifest.json
+  --run-id baseline
 
-# Optional low-VRAM smoke (resolution only; deferred fields still unused)
-.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py --config configs/depth/smoke_joint.yaml run
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py `
+  --config configs/depth/smoke_joint.yaml run --video-id <video_id> --run-id baseline
 ```
 
 See `docs/depth_prior_io.md` for the full contract, including the **LongSplat consumer**

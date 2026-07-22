@@ -1,5 +1,7 @@
 # Default depth-prior config: Video Depth Anything Relative Base (vitb).
 # Paths are repository-relative. Do not put absolute personal paths here.
+# IO templates may include {video_id} and {run_id} so baseline/LongSplat runs
+# on the same source video do not clobber each other (frame_id alone is not unique).
 
 schema_version: "1.0"
 module: depth-prior
@@ -23,17 +25,24 @@ backend:
   allow_custom_checkpoint: false
 
 io:
-  frames_manifest: data/manifests/frames_manifest.json
-  depth_dir: data/depth
+  frames_manifest: data/manifests/{video_id}/{run_id}/frames_manifest.json
+  depth_dir: data/depth/{video_id}/{run_id}
   # Deferred in this PR: mask generation / confidence export is not implemented yet.
-  mask_dir: data/masks
-  depth_manifest: data/manifests/depth_manifest.json
-  run_record: outputs/reconstructions/depth_prior/run_record.json
+  mask_dir: data/masks/{video_id}/{run_id}
+  depth_manifest: data/manifests/{video_id}/{run_id}/depth_manifest.json
+  run_record: outputs/reconstructions/depth_prior/{video_id}/{run_id}/run_record.json
 
 runtime:
-  # When frames_manifest points at image sequences, a temp video is built for VDA.
-  # target_fps is used only for that assembly step.
+  # Optional namespace when the same video_id has multiple preprocess routes
+  # (e.g. baseline vs longsplat). Defaults to "default" when omitted on CLI.
+  run_id: default
+  # Fallback frame duration when timestamps are absent; with timestamps, assembly
+  # uses real inter-frame gaps instead of a flat 1/target_fps cadence.
   target_fps: 5
+  # Collapse identical-timestamp duplicates (same image bytes) before VDA.
+  dedupe_identical_timestamps: true
+  # Refuse to overwrite existing depth NPZ / depth_manifest / run_record.
+  overwrite: false
   # Deferred in this PR: the current VDA wrapper does not yet plumb device selection.
   device: cuda
   # Deferred in this PR: rerun / cache skipping policy is not implemented yet.

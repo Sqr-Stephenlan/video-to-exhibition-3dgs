@@ -430,6 +430,7 @@ def split_vda_depths_to_frame_files(
     depth_dir: Path,
     root: Path,
     depth_type: str,
+    overwrite: bool = False,
 ) -> list[dict[str, Any]]:
     if depths.shape[0] != len(frames):
         raise ValueError(
@@ -440,17 +441,31 @@ def split_vda_depths_to_frame_files(
     for index, frame in enumerate(frames):
         frame_id = frame["frame_id"]
         dest = depth_dir / f"{frame_id}.npz"
+        if dest.is_file() and not overwrite:
+            raise FileExistsError(
+                f"Depth output already exists (set runtime.overwrite: true): {dest.as_posix()}"
+            )
         np.savez_compressed(dest, depth=np.asarray(depths[index]))
-        frame_records.append(
-            {
-                "frame_id": frame_id,
-                "rgb_path": frame["path"],
-                "depth_path": to_repo_relative(root, dest),
-                "depth_type": depth_type,
-                "confidence_path": None,
-                "depth_index": index,
-            }
-        )
+        record: dict[str, Any] = {
+            "frame_id": frame_id,
+            "rgb_path": frame["path"],
+            "depth_path": to_repo_relative(root, dest),
+            "depth_type": depth_type,
+            "confidence_path": None,
+            "depth_index": index,
+        }
+        for key in (
+            "segment_id",
+            "timestamp_sec",
+            "width",
+            "height",
+            "reason",
+            "blur_score",
+            "frame_index",
+        ):
+            if key in frame and frame[key] is not None:
+                record[key] = frame[key]
+        frame_records.append(record)
     return frame_records
 
 

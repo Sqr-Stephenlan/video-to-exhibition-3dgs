@@ -27,24 +27,35 @@ def test_adapt_preprocess_manifest_maps_id_and_filters() -> None:
                 "path": "data/frames/joint_smoke/selected/a.jpg",
                 "selected": True,
                 "timestamp_sec": 0.0,
+                "width": 384,
+                "height": 512,
+                "segment_id": "segment_0001",
+                "reason": "sharpest_in_window",
             },
             {
                 "id": "segment_0001_frame_000002",
                 "path": "data/frames/joint_smoke/selected/b.jpg",
                 "selected": False,
                 "timestamp_sec": 0.2,
+                "width": 384,
+                "height": 512,
             },
             {
                 "id": "segment_0001_frame_000003",
                 "path": "data/frames/joint_smoke/selected/c.jpg",
                 "selected": True,
                 "timestamp_sec": 0.4,
+                "width": 384,
+                "height": 512,
+                "segment_id": "segment_0001",
+                "blur_score": 0.9,
             },
         ],
     }
     adapted = adapt_preprocess_to_frames_manifest(
         payload,
         frames_manifest_path="data/manifests/joint_smoke/preprocess_manifest.json",
+        fill_missing_size=False,
     )
     assert adapted["schema_version"] == "1.0"
     assert adapted["video_id"] == "joint_smoke"
@@ -53,8 +64,12 @@ def test_adapt_preprocess_manifest_maps_id_and_filters() -> None:
         "segment_0001_frame_000001",
         "segment_0001_frame_000003",
     ]
+    assert adapted["frames"][0]["segment_id"] == "segment_0001"
+    assert adapted["frames"][0]["reason"] == "sharpest_in_window"
+    assert adapted["frames"][0]["width"] == 384
+    assert adapted["frames"][1]["blur_score"] == 0.9
     # Round-trip into depth-prior selection rules.
-    selected = selected_frames(adapted)
+    selected = selected_frames(adapted, dedupe_timestamps=False)
     assert len(selected) == 2
 
 
@@ -67,17 +82,21 @@ def test_adapt_rejects_null_timestamp_mixed_with_numeric() -> None:
                 "path": "data/frames/a.jpg",
                 "selected": True,
                 "timestamp_sec": 0.0,
+                "width": 64,
+                "height": 64,
             },
             {
                 "id": "segment_0001_frame_000002",
                 "path": "data/frames/b.jpg",
                 "selected": True,
                 "timestamp_sec": None,
+                "width": 64,
+                "height": 64,
             },
         ],
     }
     with pytest.raises(ValueError, match="timestamp_sec"):
-        adapt_preprocess_to_frames_manifest(payload)
+        adapt_preprocess_to_frames_manifest(payload, fill_missing_size=False)
 
 
 def test_adapt_rejects_selected_without_path() -> None:
@@ -88,11 +107,13 @@ def test_adapt_rejects_selected_without_path() -> None:
                 "id": "segment_0001_frame_000001",
                 "path": None,
                 "selected": True,
+                "width": 64,
+                "height": 64,
             }
         ],
     }
     with pytest.raises(ValueError, match="selected but path"):
-        adapt_preprocess_to_frames_manifest(payload)
+        adapt_preprocess_to_frames_manifest(payload, fill_missing_size=False)
 
 
 def test_adapt_rejects_path_escape() -> None:
@@ -103,19 +124,23 @@ def test_adapt_rejects_path_escape() -> None:
                 "id": "segment_0001_frame_000001",
                 "path": "../outside.jpg",
                 "selected": True,
+                "width": 64,
+                "height": 64,
             }
         ],
     }
     with pytest.raises(ValueError, match="escapes"):
-        adapt_preprocess_to_frames_manifest(payload)
+        adapt_preprocess_to_frames_manifest(payload, fill_missing_size=False)
 
 
 def test_adapt_cli_rejects_output_escape(tmp_path: Path) -> None:
     src = ROOT / "data" / "manifests" / "_tmp_adapt_test" / "preprocess_manifest.json"
     src.parent.mkdir(parents=True, exist_ok=True)
     src.write_text(
-        '{"schema_version":"1.0","frames":[{"id":"segment_0001_frame_000001",'
-        '"path":"data/frames/a.jpg","selected":true,"timestamp_sec":0.0}]}',
+        '{"schema_version":"1.0","video_id":"tmp_adapt",'
+        '"frames":[{"id":"segment_0001_frame_000001",'
+        '"path":"data/frames/a.jpg","selected":true,"timestamp_sec":0.0,'
+        '"width":64,"height":64}]}',
         encoding="utf-8",
     )
     try:
