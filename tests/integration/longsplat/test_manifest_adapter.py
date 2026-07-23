@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from scripts.longsplat.manifest_adapter import AdapterError, adapt_manifest
-from scripts.longsplat.validate_input import ManifestValidationError, validate_manifest
+from scripts.longsplat.validate_input import validate_manifest
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +139,7 @@ def _make_producer_manifest(
 def repo_root_with_frames(tmp_path: Path) -> Path:
     """Create a temporary repo root with real frame files matching the manifest."""
     segment_id = "seg_01"
-    frame_dir = (
-        tmp_path / "frames" / "test_video" / "selected" / segment_id
-    )
+    frame_dir = tmp_path / "frames" / "test_video" / "selected" / segment_id
     frame_dir.mkdir(parents=True)
 
     for i in range(3):
@@ -243,9 +241,7 @@ def test_rejects_missing_normalized_dimensions(repo_root_with_frames: Path):
 def test_rejects_missing_frame_file(repo_root_with_frames: Path):
     """If a frame path points to a non-existent file, raise an error."""
     producer = _make_producer_manifest(frame_count=1)
-    producer["frames"][0][
-        "path"
-    ] = "frames/test_video/selected/seg_01/nonexistent.jpg"
+    producer["frames"][0]["path"] = "frames/test_video/selected/seg_01/nonexistent.jpg"
     with pytest.raises(AdapterError, match="Frame file not found"):
         adapt_manifest(producer, "seg_01", repo_root_with_frames)
 

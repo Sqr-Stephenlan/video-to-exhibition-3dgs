@@ -2,7 +2,7 @@
   "source_path": "<run_dir>/input",
   "model_path": "<run_dir>/longsplat_model",
   "images": "images",
-  "resolution": -1,
+  "resolution": 2,
   "sh_degree": 3,
   "iterations": 100,
   "seed": 0,

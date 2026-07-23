@@ -50,15 +50,45 @@ def _make_ply(path: Path, attributes: list[str], count: int = 10) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_finite_conversion_telemetry_patch_contract():
+    """The ordered research patch carries the root fix and all marker schemas."""
+    patch = (
+        _project_root
+        / "docs"
+        / "longsplat"
+        / "patches"
+        / "longsplat_conversion_telemetry.patch"
+    )
+    text = patch.read_text(encoding="utf-8")
+
+    assert "torch.clamp(dist2_raw, min=1e-7" in text
+    assert "if not torch.isfinite(scales).all()" in text
+    assert "CONVERSION_TELEMETRY" in text
+    assert "POSE_TELEMETRY" in text
+    assert "VDA_TELEMETRY" in text
+
+
 def test_valid_ply_passes(tmp_path):
     ply_path = tmp_path / "ok.ply"
-    _make_ply(ply_path, [
-        "x", "y", "z",
-        "f_dc_0", "f_dc_1", "f_dc_2",
-        "opacity",
-        "scale_0", "scale_1", "scale_2",
-        "rot_0", "rot_1", "rot_2", "rot_3",
-    ])
+    _make_ply(
+        ply_path,
+        [
+            "x",
+            "y",
+            "z",
+            "f_dc_0",
+            "f_dc_1",
+            "f_dc_2",
+            "opacity",
+            "scale_0",
+            "scale_1",
+            "scale_2",
+            "rot_0",
+            "rot_1",
+            "rot_2",
+            "rot_3",
+        ],
+    )
     meta = validate_converted_ply(str(ply_path))
     assert meta["vertex_count"] == 10
     assert len(meta["sha256"]) == 64
@@ -97,14 +127,27 @@ def test_tiny_file_raises(tmp_path):
 def test_extra_attrs_allowed(tmp_path):
     """Converted PLY may have additional SH attributes beyond the core set."""
     ply_path = tmp_path / "with_sh.ply"
-    _make_ply(ply_path, [
-        "x", "y", "z",
-        "f_dc_0", "f_dc_1", "f_dc_2",
-        "opacity",
-        "scale_0", "scale_1", "scale_2",
-        "rot_0", "rot_1", "rot_2", "rot_3",
-        "f_rest_0", "f_rest_1",
-    ])
+    _make_ply(
+        ply_path,
+        [
+            "x",
+            "y",
+            "z",
+            "f_dc_0",
+            "f_dc_1",
+            "f_dc_2",
+            "opacity",
+            "scale_0",
+            "scale_1",
+            "scale_2",
+            "rot_0",
+            "rot_1",
+            "rot_2",
+            "rot_3",
+            "f_rest_0",
+            "f_rest_1",
+        ],
+    )
     meta = validate_converted_ply(str(ply_path))
     assert meta["vertex_count"] == 10
 
@@ -115,65 +158,73 @@ def test_extra_attrs_allowed(tmp_path):
 
 
 def test_convert_and_validate_success(tmp_path):
-    """Mock subprocess to return success; PLY validation is mocked."""
+    """FV-01: convert_and_validate delegates to run_conversion, validates PLY."""
     config = LongSplatConfig(
         source_path=str(tmp_path / "input"),
         model_path=str(tmp_path / "model"),
         iterations=100,
+        seed=0,
     )
 
-    with mock.patch("scripts.longsplat.convert._check_repo"):
-        with mock.patch("scripts.longsplat.convert.subprocess.run") as mock_run:
-            mock_run.return_value = mock.MagicMock(returncode=0)
-            with mock.patch("scripts.longsplat.convert._validate_converted_ply") as mock_val:
-                mock_val.return_value = {
-                    "path": str(tmp_path / "model" / "converted_3dgs" / "point_cloud.ply"),
-                    "vertex_count": 100,
-                    "attributes": ["x", "y", "z"],
-                    "sha256": "a" * 64,
-                    "file_size": 1024,
-                }
-                result = convert_and_validate("/fake/repo", config)
+    fake_cp = mock.MagicMock(returncode=0, stderr="")
+    with mock.patch(
+        "scripts.longsplat.convert.run_conversion", return_value=fake_cp
+    ) as mock_conv:
+        with mock.patch(
+            "scripts.longsplat.convert._validate_converted_ply"
+        ) as mock_val:
+            mock_val.return_value = {
+                "path": str(tmp_path / "model" / "converted_3dgs" / "point_cloud.ply"),
+                "vertex_count": 100,
+                "attributes": ["x", "y", "z"],
+                "sha256": "a" * 64,
+                "file_size": 1024,
+            }
+            result = convert_and_validate("/fake/repo", config)
 
     assert "point_cloud.ply" in str(result)
-    mock_run.assert_called_once()
+    mock_conv.assert_called_once()
     mock_val.assert_called_once()
 
 
 def test_convert_and_validate_nonzero_exit_raises(tmp_path):
-    """If the converter subprocess exits non-zero, raise ConverterError."""
+    """FV-01: if run_conversion returns non-zero, raise ConverterError."""
     config = LongSplatConfig(
         source_path=str(tmp_path / "input"),
         model_path=str(tmp_path / "model"),
         iterations=100,
+        seed=0,
     )
 
-    with mock.patch("scripts.longsplat.convert._check_repo"):
-        with mock.patch("scripts.longsplat.convert.subprocess.run") as mock_run:
-            mock_run.return_value = mock.MagicMock(
-                returncode=1, stderr="CUDA OOM",
-            )
-            with pytest.raises(ConverterError, match="exited with 1"):
-                convert_and_validate("/fake/repo", config)
+    fake_cp = mock.MagicMock(returncode=1, stderr="CUDA OOM")
+    with mock.patch("scripts.longsplat.convert.run_conversion", return_value=fake_cp):
+        with pytest.raises(ConverterError, match="exited with 1"):
+            convert_and_validate("/fake/repo", config)
 
 
 def test_convert_and_validate_path_construction(tmp_path):
-    """Verify the PLY output path is constructed correctly."""
+    """FV-01: verify the PLY output path is constructed correctly."""
     model = tmp_path / "trained_model"
     config = LongSplatConfig(
         source_path=str(tmp_path / "input"),
         model_path=str(model),
         iterations=100,
+        seed=0,
     )
 
-    with mock.patch("scripts.longsplat.convert._check_repo"):
-        with mock.patch("scripts.longsplat.convert.subprocess.run") as mock_run:
-            mock_run.return_value = mock.MagicMock(returncode=0)
-            with mock.patch("scripts.longsplat.convert._validate_converted_ply") as mock_val:
-                mock_val.return_value = {"path": "...", "vertex_count": 1,
-                                         "attributes": [], "sha256": "a" * 64,
-                                         "file_size": 200}
-                result = convert_and_validate("/fake/repo", config)
+    fake_cp = mock.MagicMock(returncode=0, stderr="")
+    with mock.patch("scripts.longsplat.convert.run_conversion", return_value=fake_cp):
+        with mock.patch(
+            "scripts.longsplat.convert._validate_converted_ply"
+        ) as mock_val:
+            mock_val.return_value = {
+                "path": "...",
+                "vertex_count": 1,
+                "attributes": [],
+                "sha256": "a" * 64,
+                "file_size": 200,
+            }
+            result = convert_and_validate("/fake/repo", config)
 
     expected = model / "converted_3dgs" / "point_cloud.ply"
     assert result == expected

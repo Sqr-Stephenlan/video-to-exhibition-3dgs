@@ -107,6 +107,11 @@ runs/
 wandb/
 tensorboard/
 
+# Experiment outputs and scratch space
+outputs/
+tmp/
+*.pth.part
+
 # Third-party repositories are managed as external dependencies.
 # Track only documentation or manifests placed directly under third_party/.
 third_party/*

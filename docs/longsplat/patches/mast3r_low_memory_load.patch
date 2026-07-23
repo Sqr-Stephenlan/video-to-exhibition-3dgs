@@ -1,0 +1,36 @@
+diff --git a/mast3r/model.py b/mast3r/model.py
+index 6d7f621..a58772a 100644
+--- a/mast3r/model.py
++++ b/mast3r/model.py
+@@ -4,6 +4,8 @@
+ # --------------------------------------------------------
+ # MASt3R model class
+ # --------------------------------------------------------
++import gc
++
+ import torch
+ import torch.nn.functional as F
+ import os
+@@ -20,7 +22,12 @@ inf = float('inf')
+ def load_model(model_path, device, verbose=True):
+     if verbose:
+         print('... loading model from', model_path)
+-    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
++    ckpt = torch.load(
++        model_path,
++        map_location='cpu',
++        weights_only=False,
++        mmap=True,
++    )
+     args = ckpt['args'].model.replace("ManyAR_PatchEmbed", "PatchEmbedDust3R")
+     if 'landscape_only' not in args:
+         args = args[:-1] + ', landscape_only=False)'
+@@ -33,6 +40,8 @@ def load_model(model_path, device, verbose=True):
+     s = net.load_state_dict(ckpt['model'], strict=False)
+     if verbose:
+         print(s)
++    del ckpt
++    gc.collect()
+     return net.to(device)
+ 
+ 

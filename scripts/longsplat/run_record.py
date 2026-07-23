@@ -4,6 +4,9 @@ Immutable run record for LongSplat reconstruction runs.
 Every run gets a unique run ID and an isolated directory.  The run record
 tracks all inputs, configuration, commands, backend versions, and output
 artifacts.  It is updated at each lifecycle transition.
+
+Schema v2 adds the ``requested`` section (recorded before preflight),
+a richer ``backend`` block, and the ``commands`` section.
 """
 
 from __future__ import annotations
@@ -11,11 +14,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from .runner import LONGSPLAT_COMMIT, LONGSPLAT_REPO_URL
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +38,7 @@ class RunStatus(str, Enum):
 # Schema
 # ---------------------------------------------------------------------------
 
-RUN_RECORD_SCHEMA_VERSION = 1
+RUN_RECORD_SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -43,52 +47,26 @@ RUN_RECORD_SCHEMA_VERSION = 1
 
 
 def create_run_record(
-    run_dir: str | Path,
-    manifest_path: str | Path,
-    config: dict[str, Any],
-    repo_sha: str,
-    backend_repo_url: str,
-    backend_commit: str,
-    python_exe: str,
-    seed: int,
     *,
-    runtime_profile: str = "unvalidated",
+    run_dir: str | Path,
+    run_id: str,
+    manifest_path: str | Path,
+    project_root: str | Path,
+    repo_root: str | Path,
+    depth_manifest_path: str | Path | None = None,
+    backend_url: str = LONGSPLAT_REPO_URL,
+    backend_expected_commit: str = LONGSPLAT_COMMIT,
 ) -> dict[str, Any]:
-    """Create a new run record in ``planned`` state.
+    """Create a new v2 run record in ``planned`` state.
 
-    Parameters
-    ----------
-    run_dir : str or Path
-        Immutable run directory (created if it does not exist).
-    manifest_path : str or Path
-        Path to the input frame manifest consumed by this run.
-    config : dict
-        Effective configuration (LongSplatConfig serialised to dict).
-    repo_sha : str
-        Full 40-char SHA of the main repository at run time.
-    backend_repo_url : str
-        URL of the backend repository (e.g. LongSplat).
-    backend_commit : str
-        Full 40-char SHA of the backend repository.
-    python_exe : str
-        Python executable used for the backend command.
-    seed : int
-        Random seed.
-    runtime_profile : str
-        Label for the runtime environment (default: "unvalidated").
-
-    Returns
-    -------
-    dict
-        The run record dict (also written to ``<run_dir>/reconstruction_run.json``).
+    Call this **before** any fallible preflight check so every failure
+    leaves a terminal record.  All fields that are not yet known are
+    set to JSON ``null`` — never invented values.
     """
     rd = Path(run_dir)
     rd.mkdir(parents=True, exist_ok=True)
 
-    run_id = str(uuid.uuid4())
-    now = datetime.now(UTC).isoformat()
-
-    manifest_sha = _sha256_hex(Path(manifest_path))
+    now = datetime.now(timezone.utc).isoformat()
 
     record: dict[str, Any] = {
         "schema_version": RUN_RECORD_SCHEMA_VERSION,
@@ -96,25 +74,31 @@ def create_run_record(
         "status": RunStatus.PLANNED.value,
         "created_at": now,
         "updated_at": now,
-        "repo_sha": repo_sha,
+        "requested": {
+            "manifest_path": str(Path(manifest_path)),
+            "depth_manifest_path": (
+                None if depth_manifest_path is None else str(Path(depth_manifest_path))
+            ),
+            "project_root": str(Path(project_root)),
+            "repo_root": str(Path(repo_root)),
+        },
+        "repo_sha": None,
         "backend": {
-            "repo_url": backend_repo_url,
-            "commit": backend_commit,
+            "repo_url_expected": backend_url,
+            "commit_expected": backend_expected_commit,
+            "commit_actual": None,
+            "dirty": None,
+            "submodules": {},
+            "mode": None,
+            "diff_sha256": None,
+            "submodule_diffs": {},
         },
-        "runtime": {
-            "python_exe": python_exe,
-            "profile": runtime_profile,
-        },
-        "input": {
-            "manifest_path": str(Path(manifest_path).resolve()),
-            "manifest_sha256": manifest_sha,
-        },
-        "config": config,
-        "seed": seed,
+        "commands": {},
+        "artifacts": [],
         "stages": {},
     }
 
-    _write_record(record, rd)
+    write_run_record(record, rd)
     return record
 
 
@@ -129,26 +113,13 @@ def transition_status(
     """Transition the run record to a new status.
 
     Valid transitions:
-    - planned → running
-    - running → failed | complete
-
-    Parameters
-    ----------
-    record : dict
-        Existing run record.
-    run_dir : str or Path
-        Run directory.
-    new_status : RunStatus
-        Target status.
-    stage : str or None
-        Current stage name (e.g. "training", "conversion").
-    details : dict or None
-        Additional per-stage data (exit code, errors, artifacts).
+    - planned → running | failed
+    - running → running | failed | complete
     """
     current = RunStatus(record["status"])
 
     _valid = {
-        RunStatus.PLANNED: {RunStatus.RUNNING},
+        RunStatus.PLANNED: {RunStatus.RUNNING, RunStatus.FAILED},
         RunStatus.RUNNING: {RunStatus.RUNNING, RunStatus.FAILED, RunStatus.COMPLETE},
     }
     allowed = _valid.get(current, set())
@@ -158,12 +129,12 @@ def transition_status(
         )
 
     record["status"] = new_status.value
-    record["updated_at"] = datetime.now(UTC).isoformat()
+    record["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     if stage and details:
         record["stages"][stage] = details
 
-    _write_record(record, Path(run_dir))
+    write_run_record(record, Path(run_dir))
     return record
 
 
@@ -183,6 +154,7 @@ def add_artifact(
     entry: dict[str, Any] = {
         "path": str(ap.resolve()),
         "type": artifact_type,
+        "stage": stage,
         "sha256": sha,
         "file_size": ap.stat().st_size if ap.is_file() else None,
     }
@@ -190,10 +162,24 @@ def add_artifact(
         entry["metadata"] = metadata
 
     record.setdefault("artifacts", []).append(entry)
-    record["updated_at"] = datetime.now(UTC).isoformat()
+    record["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    _write_record(record, Path(run_dir))
+    write_run_record(record, Path(run_dir))
     return record
+
+
+def write_run_record(record: dict[str, Any], run_dir: Path) -> None:
+    """Atomically write the run record to *run_dir*."""
+    path = run_dir / "reconstruction_run.json"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -208,19 +194,6 @@ class RunStatusTransitionError(Exception):
 # ---------------------------------------------------------------------------
 # Internal
 # ---------------------------------------------------------------------------
-
-
-def _write_record(record: dict[str, Any], run_dir: Path) -> None:
-    path = run_dir / "reconstruction_run.json"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(record, fh, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
-    except Exception:
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
-        raise
 
 
 def _sha256_hex(path: Path) -> str:

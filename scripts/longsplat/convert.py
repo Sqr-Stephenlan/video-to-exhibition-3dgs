@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,20 +17,29 @@ import numpy as np
 
 from scripts.longsplat.runner import (
     LongSplatConfig,
-    _check_repo,
-    build_convert_command,
+    run_conversion,
 )
 
 # Standard 3DGS PLY attributes expected in the converted output.
 _STANDARD_3DGS_ATTRS = frozenset(
     {
-        "x", "y", "z",
-        "f_dc_0", "f_dc_1", "f_dc_2",
+        "x",
+        "y",
+        "z",
+        "f_dc_0",
+        "f_dc_1",
+        "f_dc_2",
         "opacity",
-        "scale_0", "scale_1", "scale_2",
-        "rot_0", "rot_1", "rot_2", "rot_3",
+        "scale_0",
+        "scale_1",
+        "scale_2",
+        "rot_0",
+        "rot_1",
+        "rot_2",
+        "rot_3",
     }
 )
+
 
 class ConverterError(Exception):
     """Raised when conversion fails or produces invalid output."""
@@ -38,6 +47,17 @@ class ConverterError(Exception):
 
 class ConvertedPLYValidationError(Exception):
     """Raised when the converted PLY fails schema or content validation."""
+
+
+@dataclass(frozen=True)
+class PlyCleanResult:
+    """Immutable result of :func:`clean_converted_ply`."""
+
+    original_count: int
+    removed_count: int
+    final_count: int
+    removal_ratio: float
+    replaced: bool
 
 
 # ---------------------------------------------------------------------------
@@ -76,19 +96,13 @@ def convert_and_validate(
     ConvertedPLYValidationError
         If the output PLY is missing, empty, or has wrong schema.
     """
-    _check_repo(repo_root)
-
-    cmd = build_convert_command(repo_root, config, python_exe)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_conversion(repo_root, config, python_exe)
     if result.returncode != 0:
         raise ConverterError(
-            f"convert_3dgs.py exited with {result.returncode}:\n"
-            f"{result.stderr[-2000:]}"
+            f"convert_3dgs.py exited with {result.returncode}:\n{result.stderr[-2000:]}"
         )
 
-    ply_path = (
-        Path(config.model_path) / "converted_3dgs" / "point_cloud.ply"
-    )
+    ply_path = Path(config.model_path) / "converted_3dgs" / "point_cloud.ply"
     _validate_converted_ply(ply_path)
     return ply_path
 
@@ -109,11 +123,36 @@ def validate_converted_ply(ply_path: str | Path) -> dict[str, Any]:
     return _validate_converted_ply(Path(ply_path))
 
 
-def clean_converted_ply(ply_path: str | Path) -> int:
-    """Remove vertices with NaN/Inf in core 3DGS attributes.
+# Maximum allowed fraction of vertices that can be cleaned before the PLY
+# is considered too degraded to use.
+_CLEAN_MAX_REMOVAL_RATIO = 0.5
 
-    Returns the number of vertices removed.  The file is overwritten in-place
-    only when invalid vertices are found.
+# Core attributes that must be finite in every vertex.
+_CORE_FINITE_FIELDS = [
+    "x",
+    "y",
+    "z",
+    "f_dc_0",
+    "f_dc_1",
+    "f_dc_2",
+    "opacity",
+    "scale_0",
+    "scale_1",
+    "scale_2",
+    "rot_0",
+    "rot_1",
+    "rot_2",
+    "rot_3",
+]
+
+
+def clean_converted_ply(ply_path: str | Path) -> PlyCleanResult:
+    """Remove vertices with NaN/Inf in core 3DGS and SH attributes.
+
+    The file is atomically replaced only when invalid vertices are found.
+    Raises if the removal ratio exceeds ``_CLEAN_MAX_REMOVAL_RATIO``.
+
+    Returns a :class:`PlyCleanResult` (even when zero vertices are removed).
     """
     import io
     import tempfile
@@ -128,21 +167,39 @@ def clean_converted_ply(ply_path: str | Path) -> int:
     ply = PlyData.read(io.BytesIO(raw))
     vertex = ply["vertex"]
     if vertex.count == 0:
-        return 0
+        return PlyCleanResult(
+            original_count=0,
+            removed_count=0,
+            final_count=0,
+            removal_ratio=0.0,
+            replaced=False,
+        )
 
-    fields = [
-        "x", "y", "z", "opacity",
-        "scale_0", "scale_1", "scale_2",
-        "rot_0", "rot_1", "rot_2", "rot_3",
-    ]
-    available = [f for f in fields if f in vertex.data.dtype.names]
+    # Build mask from core fields + all f_rest_* fields
+    attr_names = set(vertex.data.dtype.names)
+    fields = [f for f in _CORE_FINITE_FIELDS if f in attr_names]
+    fields += sorted(f for f in attr_names if f.startswith("f_rest_"))
+
     mask = np.ones(vertex.count, dtype=bool)
-    for f in available:
+    for f in fields:
         mask &= np.isfinite(vertex.data[f])
 
     removed = vertex.count - int(mask.sum())
     if removed == 0:
-        return 0
+        return PlyCleanResult(
+            original_count=vertex.count,
+            removed_count=0,
+            final_count=vertex.count,
+            removal_ratio=0.0,
+            replaced=False,
+        )
+
+    ratio = removed / vertex.count
+    if ratio > _CLEAN_MAX_REMOVAL_RATIO:
+        raise ConvertedPLYValidationError(
+            f"PLY clean would remove {removed}/{vertex.count} vertices "
+            f"({ratio:.1%}), exceeds limit of {_CLEAN_MAX_REMOVAL_RATIO:.0%}"
+        )
 
     filtered = vertex.data[mask]
     elements = np.empty(len(filtered), dtype=vertex.data.dtype)
@@ -153,17 +210,24 @@ def clean_converted_ply(ply_path: str | Path) -> int:
     data = PlyData([el])
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".ply", dir=str(pp.parent))
     os.close(tmp_fd)
-    data.write(tmp_path)
-    pp.unlink()
-    Path(tmp_path).rename(pp)
-    return removed
+    try:
+        data.write(tmp_path)
+        os.replace(tmp_path, pp)
+    finally:
+        if Path(tmp_path).exists():
+            Path(tmp_path).unlink(missing_ok=True)
+    return PlyCleanResult(
+        original_count=vertex.count,
+        removed_count=removed,
+        final_count=int(mask.sum()),
+        removal_ratio=ratio,
+        replaced=True,
+    )
 
 
 def _validate_converted_ply(ply_path: Path) -> dict[str, Any]:
     if not ply_path.is_file():
-        raise ConvertedPLYValidationError(
-            f"Converted PLY not found: {ply_path}"
-        )
+        raise ConvertedPLYValidationError(f"Converted PLY not found: {ply_path}")
 
     file_size = ply_path.stat().st_size
     if file_size < 100:
@@ -197,16 +261,20 @@ def _validate_converted_ply(ply_path: Path) -> dict[str, Any]:
     _check_dtype(vertex, "x", "f4")
     _check_dtype(vertex, "y", "f4")
     _check_dtype(vertex, "z", "f4")
+    _check_dtype(vertex, "f_dc_0", "f4")
+    _check_dtype(vertex, "f_dc_1", "f4")
+    _check_dtype(vertex, "f_dc_2", "f4")
     _check_dtype(vertex, "opacity", "f4")
     for attr in ("scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"):
         _check_dtype(vertex, attr, "f4")
 
-    # --- NaN/Inf checks on position, opacity, scale, rotation ---
-    _finite_fields = [
-        "x", "y", "z", "opacity",
-        "scale_0", "scale_1", "scale_2",
-        "rot_0", "rot_1", "rot_2", "rot_3",
-    ]
+    # --- f_rest_* dtype checks ---
+    for attr in sorted(name for name in attr_names if name.startswith("f_rest_")):
+        _check_dtype(vertex, attr, "f4")
+
+    # --- NaN/Inf checks on all core + SH attributes ---
+    _finite_fields = list(_CORE_FINITE_FIELDS)
+    _finite_fields += sorted(f for f in attr_names if f.startswith("f_rest_"))
     for field in _finite_fields:
         if field in attr_names:
             values = vertex.data[field]
@@ -218,10 +286,8 @@ def _validate_converted_ply(ply_path: Path) -> dict[str, Any]:
     # --- quaternion non-degeneracy check (sum of squares > 0) ---
     rot_fields = ["rot_0", "rot_1", "rot_2", "rot_3"]
     if all(r in attr_names for r in rot_fields):
-        rot_data = np.stack(
-            [vertex.data[r] for r in rot_fields], axis=-1
-        )
-        rot_norms = np.sum(rot_data ** 2, axis=-1)
+        rot_data = np.stack([vertex.data[r] for r in rot_fields], axis=-1)
+        rot_norms = np.sum(rot_data**2, axis=-1)
         if np.any(rot_norms == 0):
             raise ConvertedPLYValidationError(
                 f"Converted PLY contains degenerate quaternions (zero norm): {ply_path}"
@@ -248,8 +314,7 @@ def _check_dtype(vertex, name: str, expected: str) -> None:
     actual_dtype = vertex.data.dtype[name]
     if np.dtype(actual_dtype) != np.dtype(expected):
         raise ConvertedPLYValidationError(
-            f"PLY attribute '{name}' has dtype {actual_dtype}, "
-            f"expected {expected}"
+            f"PLY attribute '{name}' has dtype {actual_dtype}, expected {expected}"
         )
 
 

@@ -3,42 +3,62 @@ Single LongSplat orchestration entry point.
 
 Executes the full pipeline in order:
 
-  validate → prepare → create_record → training → conversion →
-  PLY validation → artifact_recording → terminal_status
+  record → preflight → commands → prepare → depth → training →
+  telemetry → conversion → PLY validation → provenance → complete
 
-Any non-zero exit, exception, or missing product creates a failed record
-and returns a non-zero exit code.  This is the single public entry point
-for running LongSplat from this repository.
+Every failure path (including preflight) leaves a terminal ``failed``
+record.  The run record is created before any fallible check so no
+failure is silent.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os as _os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .convert import clean_converted_ply, validate_converted_ply
+
+from .convert import validate_converted_ply
+from .depth_bridge import (
+    DepthContractError,
+    materialize_all,
+)
 from .manifest_adapter import adapt_manifest
 from .prepare_input import prepare_input
+from .provenance import sha256_file
 from .run_record import (
     RunStatus,
     add_artifact,
     create_run_record,
     transition_status,
+    write_run_record,
+)
+from .telemetry import (
+    summarize_conversion_telemetry,
+    summarize_pose_telemetry,
+    summarize_vda_telemetry,
 )
 from .runner import (
     BackendValidationError,
     LongSplatConfig,
+    _check_python,
     _check_repo,
-    build_convert_command,
-    build_train_command,
+    backend_subprocess_env,
+    build_effective_commands,
+    config_to_dict,
 )
-from .validate_input import ManifestValidationError, validate_manifest
+from .validate_input import validate_manifest
+
+_RUN_ID_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$")
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +73,8 @@ def run_pipeline(
     config: LongSplatConfig,
     repo_root: str | Path,
     output_dir: str | Path,
+    project_root: str | Path,
+    depth_manifest_path: str | Path | None = None,
     run_id: str | None = None,
     python_exe: str = "python",
 ) -> int:
@@ -69,8 +91,11 @@ def run_pipeline(
     repo_root : str or Path
         Root of the locked LongSplat repository.
     output_dir : str or Path
-        Parent directory for run-scoped output.  A timestamped run directory
-        is created inside it.
+        Parent directory for run-scoped output.
+    project_root : str or Path
+        Repository root for resolving manifest paths.  Required.
+    depth_manifest_path : str or Path or None
+        Optional depth manifest from depth-prior module.
     run_id : str or None
         Custom run identifier.  Auto-generated when omitted.
     python_exe : str
@@ -81,82 +106,289 @@ def run_pipeline(
     int
         0 on success, non-zero on failure.
     """
-    failed = False
     run_dir: Path | None = None
     record: dict[str, Any] | None = None
 
     try:
-        # 1. Validate the producer manifest and adapt to consumer format
-        _echo("Validating producer manifest ...")
-        with open(manifest_path, encoding="utf-8") as fh:
-            producer = json.load(fh)
-        consumer = adapt_manifest(producer, segment_id, Path.cwd())
+        pr = Path(project_root).resolve(strict=True)
 
-        # 2. Create run directory
+        # --- 1. Create run directory and record BEFORE any preflight ---
         out = Path(output_dir).resolve()
         out.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        r_id = run_id or f"longsplat_{segment_id}_{ts}"
+        safe_seg = _sanitise_run_id(segment_id)
+        if run_id is not None:
+            r_id = _sanitise_run_id(run_id)
+        else:
+            r_id = f"longsplat_{safe_seg}_{ts}_{uuid.uuid4().hex[:12]}"
         run_dir = out / r_id
-        run_dir.mkdir(parents=True)
+        run_dir.mkdir(parents=False, exist_ok=False)
         _echo(f"Run directory: {run_dir}")
-
-        # Write adapted manifest for provenance (needed by create_run_record)
-        consumer_manifest_path = run_dir / "consumer_manifest.json"
-        consumer_manifest_path.write_text(
-            json.dumps(consumer, indent=2) + "\n", encoding="utf-8"
-        )
-
-        # 3. Create run record
-        _echo("Creating run record ...")
-        repo_sha = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        from .runner import LONGSPLAT_REPO_URL, LONGSPLAT_COMMIT
 
         record = create_run_record(
             run_dir=run_dir,
-            manifest_path=consumer_manifest_path,
-            config=config.__dict__,
-            repo_sha=repo_sha,
-            backend_repo_url=LONGSPLAT_REPO_URL,
-            backend_commit=LONGSPLAT_COMMIT,
-            python_exe=python_exe,
-            seed=config.seed,
+            run_id=r_id,
+            manifest_path=manifest_path,
+            project_root=pr,
+            repo_root=repo_root,
+            depth_manifest_path=depth_manifest_path,
         )
 
-        # 4. Prepare input
-        _echo("Preparing input ...")
-        prepare_input(consumer, run_dir)
+        # --- 2. Pre-flight validation (record already exists) ---
+        _echo("Validating backend repository ...")
+        try:
+            validated_repo = _check_repo(repo_root, backend_mode=config.backend_mode)
+        except BackendValidationError as exc:
+            transition_status(
+                record,
+                run_dir,
+                RunStatus.FAILED,
+                stage="preflight",
+                details={
+                    "status": "failed",
+                    "check": "backend_repo",
+                    "reason": type(exc).__name__,
+                    "message": str(exc)[:2000],
+                },
+            )
+            _echo(f"Backend validation failed: {exc}", file=sys.stderr)
+            return 1
 
-        # Update config paths for training
+        try:
+            _check_python(python_exe)
+        except BackendValidationError as exc:
+            transition_status(
+                record,
+                run_dir,
+                RunStatus.FAILED,
+                stage="preflight",
+                details={
+                    "status": "failed",
+                    "check": "python_exe",
+                    "reason": type(exc).__name__,
+                    "message": str(exc)[:2000],
+                },
+            )
+            _echo(f"Python validation failed: {exc}", file=sys.stderr)
+            return 1
+
+        # Validate main repo identity (only when project_root is a git repo)
+        if (pr / ".git").exists():
+            repo_sha_result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=str(pr),
+            )
+            if repo_sha_result.returncode != 0 or not _SHA_RE.match(
+                repo_sha_result.stdout.strip(),
+            ):
+                transition_status(
+                    record,
+                    run_dir,
+                    RunStatus.FAILED,
+                    stage="preflight",
+                    details={
+                        "status": "failed",
+                        "check": "repo_sha",
+                        "reason": "BackendValidationError",
+                        "message": f"Failed to get valid repo SHA: "
+                        f"{repo_sha_result.stdout.strip()[:200]}",
+                    },
+                )
+                return 1
+            repo_sha = repo_sha_result.stdout.strip()
+        else:
+            repo_sha = "unknown"
+        record["repo_sha"] = repo_sha
+
+        # Resolve actual backend identity
+        backend_identity = _resolve_backend_identity(
+            validated_repo,
+            backend_mode=config.backend_mode,
+        )
+        record["backend"]["commit_actual"] = backend_identity["commit"]
+        record["backend"]["dirty"] = backend_identity["dirty"]
+        record["backend"]["submodules"] = backend_identity["submodules"]
+        record["backend"]["mode"] = backend_identity["mode"]
+        record["backend"]["diff_sha256"] = backend_identity["diff_sha256"]
+        record["backend"]["submodule_diffs"] = backend_identity["submodule_diffs"]
+        record["effective_seed"] = 0
+        # Snapshot config before orchestrator mutates source_path / model_path
+        record["config_requested"] = config_to_dict(config)
+        write_run_record(record, run_dir)
+
+        # --- 3. Validate and adapt manifest ---
+        _echo("Validating producer manifest ...")
+        with open(manifest_path, "rb") as fh:
+            producer_raw = fh.read()
+        producer_sha = hashlib.sha256(producer_raw).hexdigest()
+        producer = json.loads(producer_raw)
+        consumer = adapt_manifest(producer, segment_id, pr)
+
+        consumer_manifest_path = run_dir / "consumer_manifest.json"
+        consumer_manifest_path.write_text(
+            json.dumps(consumer, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        validate_manifest(consumer_manifest_path)
+
+        # --- 4. Set run-time config paths, THEN build commands ONCE ---
         config.source_path = str(run_dir / "input")
         config.model_path = str(run_dir / "longsplat_model")
 
-        # 5. Run training
+        _echo("Building effective commands ...")
+        commands = build_effective_commands(validated_repo, config, python_exe)
+        record["commands"] = {
+            "train": {"argv": list(commands.train), "cwd": str(validated_repo)},
+            "convert": {"argv": list(commands.convert), "cwd": str(validated_repo)},
+        }
+        write_run_record(record, run_dir)
+
+        # --- 5. Prepare input ---
+        _echo("Preparing input ...")
+        prepare_input(consumer, run_dir)
+
+        # --- 6. VDA depth materialisation ---
+        depth_source = config.extra_train_args.get("depth_source", "mast3r")
+        if depth_source != "mast3r":
+            _echo(f"VDA depth source={depth_source}, materialising ...")
+            if not depth_manifest_path:
+                raise PipelineError(
+                    "depth_source is VDA but no depth_manifest_path was provided"
+                )
+
+            mapping_path = run_dir / "input" / "frame_mapping.json"
+            if not mapping_path.is_file():
+                raise PipelineError("frame_mapping.json missing in run input directory")
+
+            with mapping_path.open(encoding="utf-8") as fh:
+                frame_mapping = json.load(fh)
+
+            depth_dir = run_dir / "input" / "depths"
+
+            try:
+                mat_result = materialize_all(
+                    depth_manifest_path=Path(depth_manifest_path),
+                    frame_mapping=frame_mapping,
+                    project_root=pr,
+                    output_depth_dir=depth_dir,
+                )
+            except DepthContractError as exc:
+                transition_status(
+                    record,
+                    run_dir,
+                    RunStatus.FAILED,
+                    stage="depth_materialization",
+                    details={
+                        "status": "failed",
+                        "reason": type(exc).__name__,
+                        "message": str(exc)[:2000],
+                    },
+                )
+                raise PipelineError(str(exc)) from exc
+
+            record.setdefault("depth", {})["materialization"] = {
+                "expected_count": mat_result.expected_count,
+                "materialized_count": mat_result.materialized_count,
+                "depth_manifest_sha256": mat_result.depth_manifest_sha256,
+                "frames": [
+                    {
+                        "rgb_path": f.rgb_path,
+                        "prepared_name": f.prepared_name,
+                        "source_sha256": f.source_sha256,
+                        "output_sha256": f.output_sha256,
+                        "shape": list(f.shape),
+                        "dtype": f.dtype,
+                    }
+                    for f in mat_result.frames
+                ],
+            }
+            _echo(
+                f"Depth materialised: {mat_result.materialized_count}/"
+                f"{mat_result.expected_count} frames"
+            )
+            write_run_record(record, run_dir)
+
+        # --- 7. Record provenance ---
+        effective_argv_data = {
+            "train": list(commands.train),
+            "convert": list(commands.convert),
+            "python_exe": python_exe,
+            "backend_cwd": str(validated_repo),
+            "seed": config.seed,
+        }
+        argv_path = run_dir / "effective_argv.json"
+        argv_tmp = argv_path.with_suffix(argv_path.suffix + ".tmp")
+        with open(argv_tmp, "w", encoding="utf-8") as fh:
+            json.dump(effective_argv_data, fh, indent=2, ensure_ascii=False)
+        _os.replace(argv_tmp, argv_path)
+
+        add_artifact(
+            record,
+            run_dir,
+            artifact_path=str(argv_path),
+            artifact_type="effective_argv",
+            stage="provenance",
+            metadata={"sha256": sha256_file(argv_path)},
+        )
+        record["_pv"] = {
+            "project_root": str(pr),
+            "producer_manifest_sha256": producer_sha,
+            "backend_commit_actual": backend_identity["commit"],
+            "backend_dirty": backend_identity["dirty"],
+            "backend_submodules": backend_identity["submodules"],
+        }
+        write_run_record(record, run_dir)
+
+        # --- 8. Run training ---
         _echo("Running training ...")
         transition_status(
-            record, run_dir, RunStatus.RUNNING,
-            stage="training", details={"status": "started"},
+            record,
+            run_dir,
+            RunStatus.RUNNING,
+            stage="training",
+            details={"status": "started"},
         )
         train_start = time.monotonic()
         train_result = subprocess.run(
-            build_train_command(repo_root, config, python_exe),
-            capture_output=True, text=True,
-            env=_subprocess_env(python_exe, Path(repo_root)),
+            list(commands.train),
+            capture_output=True,
+            text=True,
+            cwd=str(validated_repo),
+            env=backend_subprocess_env(validated_repo),
         )
         train_duration = time.monotonic() - train_start
 
+        log_paths = _save_subprocess_logs(
+            run_dir,
+            "train",
+            train_result.stdout,
+            train_result.stderr,
+        )
+
+        # Persist any diagnostics emitted before a crash/non-zero exit.
+        telemetry = record.setdefault("telemetry", {})
+        telemetry["pose"] = summarize_pose_telemetry(train_result.stdout)
+        usage = None
+        if depth_source != "mast3r":
+            usage = _summarize_vda_usage(train_result.stdout)
+            record.setdefault("depth", {})["usage"] = usage
+            telemetry["vda"] = summarize_vda_telemetry(train_result.stdout)
+        write_run_record(record, run_dir)
+
         if train_result.returncode != 0:
             transition_status(
-                record, run_dir, RunStatus.FAILED,
+                record,
+                run_dir,
+                RunStatus.FAILED,
                 stage="training",
                 details={
                     "status": "failed",
                     "exit_code": train_result.returncode,
                     "duration_s": round(train_duration, 1),
                     "stderr": train_result.stderr[-2000:],
+                    **log_paths,
                 },
             )
             raise TrainingFailed(
@@ -168,52 +400,80 @@ def run_pipeline(
 
         _echo(f"Training completed in {train_duration:.1f}s")
         transition_status(
-            record, run_dir, RunStatus.RUNNING,
+            record,
+            run_dir,
+            RunStatus.RUNNING,
             stage="training",
             details={
                 "status": "completed",
                 "exit_code": 0,
                 "duration_s": round(train_duration, 1),
+                **log_paths,
             },
         )
         add_artifact(
-            record, run_dir,
+            record,
+            run_dir,
             artifact_path=str(run_dir / "longsplat_model"),
             artifact_type="longsplat_model",
             stage="training",
             metadata={"iteration": config.iterations},
         )
 
-        # 6. Run conversion
+        # --- 8b. Enforce backward-compatible VDA usage gate ---
+        if depth_source != "mast3r":
+            if usage is None or usage["aligned"] == 0:
+                raise PipelineError(
+                    "VDA was requested but no frame reported aligned depth"
+                )
+
+        # --- 9. Run conversion ---
         _echo("Running conversion ...")
-        # LongSplat's convert_3dgs expects cameras_all.json (without suffix)
-        # when eval=False, but training outputs cameras_all_train.json.
-        # Copy it so the converter can find it.
         cameras_src = Path(config.model_path) / "cameras_all_train.json"
         cameras_dst = Path(config.model_path) / "cameras_all.json"
         if cameras_src.exists() and not cameras_dst.exists():
             shutil.copyfile(cameras_src, cameras_dst)
+
         transition_status(
-            record, run_dir, RunStatus.RUNNING,
-            stage="conversion", details={"status": "started"},
+            record,
+            run_dir,
+            RunStatus.RUNNING,
+            stage="conversion",
+            details={"status": "started"},
         )
         conv_start = time.monotonic()
         conv_result = subprocess.run(
-            build_convert_command(repo_root, config, python_exe),
-            capture_output=True, text=True,
-            env=_subprocess_env(python_exe, Path(repo_root)),
+            list(commands.convert),
+            capture_output=True,
+            text=True,
+            cwd=str(validated_repo),
+            env=backend_subprocess_env(validated_repo),
         )
         conv_duration = time.monotonic() - conv_start
 
+        log_paths = _save_subprocess_logs(
+            run_dir,
+            "convert",
+            conv_result.stdout,
+            conv_result.stderr,
+        )
+        record.setdefault("telemetry", {})["conversion"] = (
+            summarize_conversion_telemetry(conv_result.stdout)
+        )
+        write_run_record(record, run_dir)
+
         if conv_result.returncode != 0:
             transition_status(
-                record, run_dir, RunStatus.FAILED,
+                record,
+                run_dir,
+                RunStatus.FAILED,
                 stage="conversion",
                 details={
                     "status": "failed",
                     "exit_code": conv_result.returncode,
                     "duration_s": round(conv_duration, 1),
                     "stderr": conv_result.stderr[-2000:],
+                    **log_paths,
                 },
             )
             raise ConversionFailed(
@@ -225,36 +485,39 @@ def run_pipeline(
 
         _echo(f"Conversion completed in {conv_duration:.1f}s")
         transition_status(
-            record, run_dir, RunStatus.RUNNING,
+            record,
+            run_dir,
+            RunStatus.RUNNING,
             stage="conversion",
             details={
                 "status": "completed",
                 "exit_code": 0,
                 "duration_s": round(conv_duration, 1),
+                **log_paths,
             },
         )
-
-        # 7. Clean and validate converted PLY
-        converted_ply = (
-            Path(config.model_path) / "converted_3dgs" / "point_cloud.ply"
-        )
-        removed = clean_converted_ply(converted_ply)
-        if removed:
-            _echo(f"Cleaned {removed} NaN/Inf vertices from PLY")
+        # --- 10. Strictly validate the raw converted PLY ---
+        converted_ply = Path(config.model_path) / "converted_3dgs" / "point_cloud.ply"
         _echo("Validating PLY ...")
         try:
             meta = validate_converted_ply(converted_ply)
-            _echo(f"PLY valid: {meta['vertex_count']} vertices, sha256={meta['sha256'][:12]}...")
+            _echo(
+                f"PLY valid: {meta['vertex_count']} vertices, "
+                f"sha256={meta['sha256'][:12]}..."
+            )
         except Exception as exc:
             transition_status(
-                record, run_dir, RunStatus.FAILED,
+                record,
+                run_dir,
+                RunStatus.FAILED,
                 stage="ply_validation",
                 details={"status": "failed", "error": str(exc)},
             )
             raise PLYValidationFailed(str(exc)) from exc
 
         add_artifact(
-            record, run_dir,
+            record,
+            run_dir,
             artifact_path=str(converted_ply),
             artifact_type="ply",
             stage="ply_validation",
@@ -263,22 +526,30 @@ def run_pipeline(
                 "prune_ratio": config.convert_prune_ratio,
                 "vertex_count": meta["vertex_count"],
                 "sha256": meta["sha256"],
+                "finite_validation": "passed",
             },
         )
 
-        # 8. Final status
+        # --- 11. Complete ---
         transition_status(record, run_dir, RunStatus.COMPLETE)
         _echo("Pipeline complete.")
         return 0
 
+    except KeyboardInterrupt:
+        _write_failed_safe(record, run_dir, "interrupted", "KeyboardInterrupt")
+        _echo("Interrupted.", file=sys.stderr)
+        return 130
     except Exception as exc:
-        failed = True
+        _write_failed_safe(
+            record,
+            run_dir,
+            "exception",
+            f"{type(exc).__name__}: {exc}",
+        )
         _echo(f"FAILED: {exc}", file=sys.stderr)
-        return 1
-
-    finally:
-        if failed and run_dir is not None and run_dir.exists():
+        if run_dir is not None and run_dir.exists():
             _echo(f"Run directory preserved for debugging: {run_dir}")
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -315,16 +586,249 @@ class PLYValidationFailed(PipelineError):
 # ---------------------------------------------------------------------------
 
 
-def _subprocess_env(python_exe: str, repo_root: Path) -> dict[str, str]:
-    """Build environment for LongSplat subprocess calls."""
-    import os as _os
-    env = _os.environ.copy()
-    mast3r_path = str((repo_root / "submodules" / "mast3r").resolve())
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = mast3r_path + (_os.pathsep + existing if existing else "")
-    return env
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _summarize_vda_usage(stdout: str) -> dict[str, int]:
+    """Parse VDA_USAGE markers from backend stdout and return counts."""
+    counts: dict[str, int] = {"aligned": 0, "missing": 0, "rejected": 0}
+    for result in counts:
+        counts[result] = stdout.count(f"VDA_USAGE result={result} ")
+    return counts
 
 
 def _echo(msg: str, file=sys.stdout) -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", file=file, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _sanitise_run_id(run_id: str) -> str:
+    """Validate and return *run_id* if it matches the allowed pattern."""
+    if not _RUN_ID_RE.match(run_id):
+        raise PipelineError(
+            f"Invalid run_id {run_id!r}: must match {_RUN_ID_RE.pattern}"
+        )
+    return run_id
+
+
+def _resolve_backend_identity(repo_root: Path, *, backend_mode: str) -> dict[str, Any]:
+    """Query the actual backend identity: commit, dirty flag, submodule SHAs,
+    and in research_local mode a SHA-256 of ``git diff --binary HEAD``.
+
+    CR-T123-07: submodule diffs are hashed recursively so the run record
+    can distinguish different local patches at the same HEAD.
+    CR-T123-09: all git query failures are fail-closed — a non-zero exit
+    code or missing output is a ``BackendValidationError``, never a
+    silent default to clean / empty.
+    """
+    commit_result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if commit_result.returncode != 0:
+        raise BackendValidationError(
+            f"Failed to get backend HEAD commit: exit {commit_result.returncode}"
+        )
+    commit = commit_result.stdout.strip()
+    if not _SHA_RE.match(commit):
+        raise BackendValidationError(f"Backend commit is not a valid SHA: {commit!r}")
+
+    # ---- dirty check: fail closed (CR-T123-09) ----
+    dirty_result = subprocess.run(
+        ["git", "-C", str(repo_root), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    if dirty_result.returncode != 0:
+        raise BackendValidationError(
+            f"git status failed with exit {dirty_result.returncode}: "
+            f"{dirty_result.stderr.strip()[:500]}"
+        )
+    dirty = bool(dirty_result.stdout.strip())
+
+    # ---- discover submodules recursively ----
+    # $displaypath is relative to the top-level superproject, unlike $sm_path
+    # which is relative to the immediate parent (FV-02).
+    sub_list_result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "submodule",
+            "foreach",
+            "--recursive",
+            "--quiet",
+            "echo $displaypath",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if sub_list_result.returncode != 0:
+        raise BackendValidationError(
+            f"git submodule foreach failed with exit "
+            f"{sub_list_result.returncode}: "
+            f"{sub_list_result.stderr.strip()[:500]}"
+        )
+    sub_paths = [
+        p.strip() for p in sub_list_result.stdout.strip().splitlines() if p.strip()
+    ]
+
+    canonical_root = repo_root.resolve()
+
+    submodules: dict[str, str] = {}
+    resolved_sub_paths: dict[str, Path] = {}  # saved for diff loop (RC-FV-F05)
+    for sub_path in sub_paths:
+        sp = (canonical_root / sub_path).resolve()
+        # Containment: resolved path must be inside the canonical repo root
+        try:
+            sp.relative_to(canonical_root)
+        except ValueError:
+            raise BackendValidationError(
+                f"Submodule path {sub_path} resolves outside repo root "
+                f"{canonical_root}: {sp}"
+            )
+        if not sp.is_dir():
+            # Fail closed: if git foreach reported a path it must exist (FV-02)
+            raise BackendValidationError(
+                f"Submodule path reported by git foreach does not exist: {sub_path}"
+            )
+        sha_result = subprocess.run(
+            ["git", "-C", str(sp), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        if sha_result.returncode != 0:
+            # CR-T123-09: fail closed instead of silent omit
+            raise BackendValidationError(
+                f"Failed to get HEAD for submodule {sub_path}: "
+                f"exit {sha_result.returncode} — "
+                f"{sha_result.stderr.strip()[:500]}"
+            )
+        sha = sha_result.stdout.strip()
+        if not _SHA_RE.match(sha):
+            raise BackendValidationError(
+                f"Submodule {sub_path} HEAD is not a valid SHA: {sha!r}"
+            )
+        submodules[sub_path] = sha
+        resolved_sub_paths[sub_path] = sp
+
+    # Fingerprint local patches in research_local mode
+    diff_sha256: str | None = None
+    submodule_diffs: dict[str, str | None] = {}
+    if backend_mode == "research_local":
+        diff_result = subprocess.run(
+            ["git", "-C", str(canonical_root), "diff", "--binary", "HEAD", "--"],
+            capture_output=True,
+        )
+        if diff_result.returncode != 0:
+            raise BackendValidationError("Failed to fingerprint backend diff")
+        diff_sha256 = (
+            hashlib.sha256(diff_result.stdout).hexdigest()
+            if diff_result.stdout
+            else None
+        )
+        if dirty and diff_sha256 is None:
+            raise BackendValidationError(
+                "research_local backend is dirty but git diff produced no output"
+            )
+
+        # ---- recursive submodule diffs (CR-T123-07) ----
+        for sub_path in sub_paths:
+            # Re-resolve and re-validate containment before each diff query
+            # (LATEST-FV-03): the path could have been replaced with a symlink
+            # or junction pointing outside the repo after the HEAD loop.
+            expected = resolved_sub_paths[sub_path]
+            current = (canonical_root / sub_path).resolve()
+            try:
+                current.relative_to(canonical_root)
+            except ValueError as exc:
+                raise BackendValidationError(
+                    f"Submodule path {sub_path} resolves outside repo root "
+                    f"during diff query: {current}"
+                ) from exc
+            if current != expected:
+                raise BackendValidationError(
+                    f"Submodule path {sub_path} changed between HEAD and diff "
+                    f"queries: was {expected}, now {current}"
+                )
+            if not current.is_dir():
+                raise BackendValidationError(
+                    f"Submodule path vanished between HEAD and diff queries: {sub_path}"
+                )
+            sd_result = subprocess.run(
+                ["git", "-C", str(current), "diff", "--binary", "HEAD", "--"],
+                capture_output=True,
+            )
+            if sd_result.returncode != 0:
+                raise BackendValidationError(
+                    f"Failed to fingerprint submodule diff for {sub_path}"
+                )
+            submodule_diffs[sub_path] = (
+                hashlib.sha256(sd_result.stdout).hexdigest()
+                if sd_result.stdout
+                else None
+            )
+
+    return {
+        "commit": commit,
+        "dirty": dirty,
+        "submodules": submodules,
+        "mode": backend_mode,
+        "diff_sha256": diff_sha256,
+        "submodule_diffs": submodule_diffs,
+    }
+
+
+def _write_failed_safe(
+    record: dict[str, Any] | None,
+    run_dir: Path | None,
+    reason: str,
+    message: str,
+) -> None:
+    """Best-effort write of a terminal ``failed`` status."""
+    if record is None or run_dir is None:
+        return
+    try:
+        transition_status(
+            record,
+            run_dir,
+            RunStatus.FAILED,
+            stage="exception",
+            details={"reason": reason, "message": str(message)[:2000]},
+        )
+    except Exception:
+        record["status"] = RunStatus.FAILED.value
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        record.setdefault("stages", {})["exception"] = {
+            "reason": reason,
+            "message": str(message)[:2000],
+        }
+        try:
+            write_run_record(record, run_dir)
+        except Exception:
+            pass
+
+
+def _save_subprocess_logs(
+    run_dir: Path,
+    stage: str,
+    stdout: str,
+    stderr: str,
+) -> dict[str, str]:
+    """Save subprocess stdout/stderr to log files and return their paths."""
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = logs_dir / f"{stage}_stdout.log"
+    stderr_path = logs_dir / f"{stage}_stderr.log"
+    stdout_path.write_text(stdout, encoding="utf-8", errors="replace")
+    stderr_path.write_text(stderr, encoding="utf-8", errors="replace")
+    return {
+        "stdout_log": str(stdout_path),
+        "stderr_log": str(stderr_path),
+    }

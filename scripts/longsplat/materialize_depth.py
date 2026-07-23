@@ -1,19 +1,6 @@
-"""Materialize depth-prior NPZ outputs as npy files for LongSplat consumption.
+"""CLI wrapper around ``depth_bridge`` for standalone depth materialisation.
 
-Reads a depth_manifest.json produced by the depth-prior module, converts each
-per-frame NPZ (key ``depth``) to a flat .npy at the path that LongSplat's
-external depth hook expects.
-
-Output path pattern:
-    <source_path>/depths/<image_stem>_depth.npy
-
-where ``image_stem`` is derived from ``rgb_path`` in the depth manifest
-(e.g., ``data/frames/wall_test/selected/seg_0002/frame_000001_t20.000.jpg``
-→ ``frame_000001_t20.000``).
-
-VDA values are written **as-is** (disparity-like: higher = nearer). Direction
-conversion and scene-scale alignment happen inside LongSplat's training loop
-via ``align_vda_depth()`` where a reference z-depth is available.
+For programmatic use prefer :func:`depth_bridge.materialize_all`.
 """
 
 from __future__ import annotations
@@ -23,80 +10,68 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
+from .depth_bridge import DepthContractError, materialize_all
 
 
 def materialize(depth_manifest_path: Path, source_path: Path) -> int:
-    """Convert all frames in *depth_manifest_path* to .npy under *source_path*.
+    """Convert depth NPZ files to npy under *source_path*/depths/.
 
-    Returns the number of frames written (including unchanged re-runs).
+    Thin wrapper that builds a minimal frame_mapping from the depth
+    manifest and delegates to :func:`depth_bridge.materialize_all`.
     """
     if not depth_manifest_path.is_file():
         print(f"ERROR: depth manifest not found: {depth_manifest_path}")
         return 1
 
-    with depth_manifest_path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
+    try:
+        with depth_manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: invalid JSON in depth manifest: {exc}")
+        return 1
 
     frames = manifest.get("frames")
     if not isinstance(frames, list) or not frames:
         print("ERROR: depth manifest has no frames array")
         return 1
 
-    depth_dir = source_path / "depths"
-    depth_dir.mkdir(parents=True, exist_ok=True)
-
-    written = 0
-    skipped = 0
-    missing = 0
-
+    # Build a frame_mapping from the depth manifest itself so the CLI
+    # can work standalone without an orchestrator-provided mapping.
+    frame_mapping: list[dict] = []
     for frame in frames:
-        frame_id = frame.get("frame_id", "?")
-        npz_path = frame.get("depth_path")
         rgb_path = frame.get("rgb_path")
-
-        if not npz_path:
-            print(f"WARNING: {frame_id}: missing depth_path, skipping")
-            missing += 1
-            continue
         if not rgb_path:
-            print(f"WARNING: {frame_id}: missing rgb_path, skipping")
-            missing += 1
             continue
+        stem = Path(rgb_path).stem
+        frame_mapping.append(
+            {
+                "source_path": rgb_path,
+                "prepared_name": stem,
+            }
+        )
 
-        npz_full = Path(npz_path)
-        if not npz_full.is_file():
-            print(f"WARNING: {frame_id}: NPZ not found at {npz_path}, skipping")
-            missing += 1
-            continue
+    if not frame_mapping:
+        print("ERROR: no frames with valid rgb_path in depth manifest")
+        return 1
 
-        image_stem = Path(rgb_path).name.split(".")[0]
-        npy_dest = depth_dir / f"{image_stem}_depth.npy"
+    output_depth_dir = source_path / "depths"
+    project_root = Path.cwd()
 
-        data = np.load(npz_full)
-        if "depth" not in data:
-            print(f"WARNING: {frame_id}: NPZ missing 'depth' key, skipping")
-            missing += 1
-            continue
-
-        depth = data["depth"]
-
-        # Idempotent: skip if destination already holds identical data.
-        if npy_dest.is_file():
-            existing = np.load(npy_dest)
-            if existing.shape == depth.shape and np.allclose(existing, depth):
-                skipped += 1
-                continue
-
-        np.save(npy_dest, depth)
-        written += 1
+    try:
+        result = materialize_all(
+            depth_manifest_path=depth_manifest_path,
+            frame_mapping=frame_mapping,
+            project_root=project_root,
+            output_depth_dir=output_depth_dir,
+        )
+    except DepthContractError as exc:
+        print(f"ERROR: {exc}")
+        return 1
 
     print(
-        f"Materialized {written} depth frames to {depth_dir.as_posix()}"
-        + (f" ({skipped} unchanged, {missing} missing)" if skipped or missing else "")
+        f"Materialized {result.materialized_count}/{result.expected_count} "
+        f"depth frames to {output_depth_dir.as_posix()}"
     )
-    if missing:
-        return 1
     return 0
 
 

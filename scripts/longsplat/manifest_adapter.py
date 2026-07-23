@@ -17,7 +17,6 @@ Versioned handoff contract
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +60,7 @@ def adapt_manifest(
     _validate_producer_schema(producer_manifest)
 
     root = Path(repo_root).resolve()
-    segment = _find_segment(producer_manifest, segment_id, root)
+    _find_segment(producer_manifest, segment_id, root)
 
     # Frame dimensions come from the producer's normalized metadata
     normalized = producer_manifest["normalized"]
@@ -102,9 +101,7 @@ def adapt_manifest(
         )
 
     if not consumer_frames:
-        raise AdapterError(
-            f"No selected frames found for segment {segment_id!r}"
-        )
+        raise AdapterError(f"No selected frames found for segment {segment_id!r}")
 
     return {
         "schema_version": 1,
