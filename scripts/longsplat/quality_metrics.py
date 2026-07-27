@@ -229,8 +229,8 @@ def analyze_camera_trajectory(
     all_pos_finite = True
 
     for cam in cameras:
-        R = np.array(cam["rotation"], dtype=np.float64)
-        t = np.array(cam["position"], dtype=np.float64)
+        R = np.array(cam.get("R", cam.get("rotation")), dtype=np.float64)
+        t = np.array(cam.get("T", cam.get("position")), dtype=np.float64)
 
         all_rot_finite = all_rot_finite and bool(np.all(np.isfinite(R)))
         all_pos_finite = all_pos_finite and bool(np.all(np.isfinite(t)))

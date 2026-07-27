@@ -25,18 +25,15 @@ index ab76b2b..e962118 100755
          self.use_feat_bank = False
          self._source_path = ""
 diff --git a/scene/__init__.py b/scene/__init__.py
-index 60e36b8..07bc910 100755
+index 60e36b8..96ae9a8 100755
 --- a/scene/__init__.py
 +++ b/scene/__init__.py
-@@ -20,6 +20,7 @@ from utils.mast3r_utils import Mast3rMatcher
- from scene.gaussian_model import BasicPointCloud
- from torch.nn import functional as F
- from utils.graphics_utils import align_vda_depth_with_stats
-+from utils.pose_utils import project_to_so3
+@@ -114,11 +114,28 @@ class Scene:
+                 for cam in self.getAllCameras():
+                     cam.update_focal(focal_length)
  
- class Scene:
- 
-@@ -117,8 +118,23 @@ class Scene:
++            from utils.pose_utils import project_to_so3
++
              for i, Rt in enumerate(world2cam):
                  R = Rt[:3, :3].t()
                  T = Rt[:3, 3]
@@ -88,7 +85,7 @@ index e4d7e0a..4eeef4f 100755
          self.T = t.to(device=self.data_device)
  
 diff --git a/train.py b/train.py
-index 93f7fa3..deec67f 100755
+index 93f7fa3..ec7ccaa 100755
 --- a/train.py
 +++ b/train.py
 @@ -32,7 +32,10 @@ from tqdm import tqdm
@@ -277,8 +274,8 @@ index 93f7fa3..deec67f 100755
 +                            if rotation_step > getattr(dataset, 'max_rotation_step_deg', 25.0):
 +                                rejection_reasons.append("rotation_step")
 +
-+                        # Translation step ratio
-+                        if len(accepted_translation_history) >= 3:
++                        # Translation step ratio (need 3+ inter-camera steps, i.e. 4+ cameras)
++                        if len(accepted_translation_history) >= 4:
 +                            recent_trans_steps = []
 +                            for i in range(1, min(8, len(accepted_translation_history))):
 +                                recent_trans_steps.append(
@@ -391,8 +388,26 @@ index 93f7fa3..deec67f 100755
  
                  scale, offset = compute_scale(pre_rendered_depth, viewpoint_cam.pre_depth_map, viewpoint_cam.kp0)
                  viewpoint_cam.depth_map = viewpoint_cam.depth_map * scale + offset
+@@ -376,7 +464,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 image = render_pkg["render"]
+                 rendered_depth = render_pkg["depth"][0]
+                 voxel_visible_mask = render_pkg["visible_mask"]
+-                occ_mask = get_occlusion_mask(viewpoint_cam=pre_viewpoint_cam1, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
++                occ_mask = get_occlusion_mask(viewpoint_cam=ref_viewpoint_cam, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
+ 
+                 if occ_mask.sum() > 0:
+                     Ll1 = l1_loss(image[:,occ_mask], gt_image[:,occ_mask])
+@@ -414,7 +502,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             progress_bar.close()
+ 
+             with torch.no_grad():
+-                occ_mask = get_occlusion_mask(viewpoint_cam=pre_viewpoint_cam1, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
++                occ_mask = get_occlusion_mask(viewpoint_cam=ref_viewpoint_cam, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
+                 densify_mask = occ_mask.view(-1) == 0
+                 if densify_mask.sum() > 0:
+                     depth_ref =viewpoint_cam.depth_map.cuda()
 diff --git a/utils/pose_utils.py b/utils/pose_utils.py
-index acec092..9099251 100644
+index acec092..272284f 100644
 --- a/utils/pose_utils.py
 +++ b/utils/pose_utils.py
 @@ -19,6 +19,48 @@ from utils.loss_utils import l1_loss, ssim, depth_loss
@@ -444,3 +459,11 @@ index acec092..9099251 100644
  def save_transforms(cameras, path):
      json_cams = []
      viewpoint_stack = cameras
+@@ -99,6 +141,7 @@ def update_pose(camera, converged_threshold=1e-4):
+ 
+     new_R = new_w2c[0:3, 0:3].t()
+     new_T = new_w2c[0:3, 3]
++    new_R = project_to_so3(new_R)
+ 
+     converged = tau.norm() < converged_threshold
+     camera.update_RT(new_R, new_T)

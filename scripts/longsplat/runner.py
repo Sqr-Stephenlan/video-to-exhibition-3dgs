@@ -367,6 +367,27 @@ def build_train_command(
             cmd.append(flag)
             cmd.append(str(value))
 
+    # Forward quality gate parameters to the training backend.
+    if config.quality_gates is not None:
+        qg = config.quality_gates
+        if qg.pose.mode != "off":
+            for attr_name in [
+                "min_match_count", "min_inlier_count", "min_inlier_ratio",
+                "max_reprojection_rmse_px", "min_grid_coverage",
+                "min_positive_depth_ratio", "max_rotation_step_deg",
+                "max_translation_step_ratio", "reference_lookback",
+            ]:
+                cmd.extend([f"--{attr_name}", str(getattr(qg.pose, attr_name))])
+        if qg.vda.mode != "off":
+            vda_cli_map = {
+                "min_correlation": "min_correlation",
+                "min_inlier_ratio": "min_vda_inlier_ratio",
+                "max_normalized_rmse": "max_normalized_rmse",
+                "min_aligned_fraction": "min_aligned_fraction",
+            }
+            for attr_name, cli_name in vda_cli_map.items():
+                cmd.extend([f"--{cli_name}", str(getattr(qg.vda, attr_name))])
+
     return cmd
 
 
