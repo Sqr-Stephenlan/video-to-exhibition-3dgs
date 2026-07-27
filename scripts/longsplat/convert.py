@@ -297,6 +297,11 @@ def _validate_converted_ply(ply_path: Path) -> dict[str, Any]:
     sh_attrs = [a for a in attr_names if a.startswith("f_rest_")]
     sh_order = len(sh_attrs)
 
+    # --- Quality analysis (read-only; does not modify file) ---
+    from scripts.longsplat.quality_metrics import analyze_ply_quality
+
+    quality = analyze_ply_quality(ply_path)
+
     return {
         "path": str(ply_path),
         "vertex_count": int(vertex.count),
@@ -304,6 +309,7 @@ def _validate_converted_ply(ply_path: Path) -> dict[str, Any]:
         "sha256": sha,
         "file_size": file_size,
         "sh_rest_count": sh_order,
+        "quality": quality,
     }
 
 
