@@ -41,7 +41,7 @@ raw video
   -> normalized video
   -> video segments
   -> selected reconstruction frames
-  -> preprocess_manifest.json
+  -> frames_manifest.json
 ```
 
 Do not implement LongSplat, MASt3R, DUSt3R, Depth Anything, COLMAP, gsplat,
@@ -98,7 +98,7 @@ data/frames/<video_id>/
       frame_000001_t0003.200.jpg
 
 data/manifests/<video_id>/
-  preprocess_manifest.json
+  frames_manifest.json
 ```
 
 Generated files under `data/` should not be committed. The `.gitkeep` files that
@@ -159,6 +159,8 @@ Recommended options:
 --overexposed-ratio <float>
 --underexposed-ratio <float>
 --duplicate-hash-threshold <int>
+--duplicate-time-window-sec <float>
+--max-selected-gap-sec <float>
 --save-rejected
 --force
 ```
@@ -188,12 +190,14 @@ low resolution first, around 10 fps, then scale up only after the route works.
    - Source video must exist.
    - `ffmpeg` and `ffprobe` must be available, or the CLI should fail with a
      clear setup message.
+   - Source videos, configs, and output roots must be inside the repository so
+     manifests never contain machine-specific absolute paths.
    - Existing output directories should not be overwritten unless `--force` is
-     provided.
+     provided; forced runs publish a staged result only after processing succeeds.
 
 2. Probe metadata.
    - Use `ffprobe` to collect duration, width, height, fps, codec, stream info,
-     and file size.
+     rotation, VFR detection, and file size/checksum.
 
 3. Normalize video.
    - Write `data/segments/<video_id>/normalized.mp4`.
@@ -221,8 +225,10 @@ low resolution first, around 10 fps, then scale up only after the route works.
      errors, and near duplicates; keep borderline frames for downstream systems.
 
 6. Write manifest.
-   - Write `data/manifests/<video_id>/preprocess_manifest.json`.
-   - Use deterministic ordering and stable relative paths.
+   - Write `data/manifests/<video_id>/frames_manifest.json`.
+   - Use deterministic ordering and strict repository-relative paths.
+   - Record source/config/code/tool provenance, the complete command, a Run ID,
+     and artifact checksums.
 
 ## Manifest Shape
 
@@ -230,7 +236,7 @@ The manifest should include:
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "video_id": "sample",
   "source": {
     "path": "data/raw_videos/sample.mp4",
@@ -247,22 +253,23 @@ The manifest should include:
   "settings": {},
   "segments": [],
   "frames": [],
-  "summary": {}
+  "summary": {},
+  "run": {}
 }
 ```
 
 Each segment entry should include:
 
 ```text
-id, path, index, start_sec, end_sec, duration_sec, reason
+id, path, index, start_sec, end_sec, duration_sec, reason, width, height, sha256
 ```
 
 Each frame entry should include:
 
 ```text
-id, segment_id, path, timestamp_sec, frame_index, selected,
-blur_score, overexposed_ratio, underexposed_ratio, duplicate_score,
-reject_reasons
+id, segment_id, path, timestamp_sec, frame_index, width, height, selected,
+blur_score, overexposed_ratio, underexposed_ratio, motion_score,
+duplicate_score, matched_frame_id, sha256, reject_reasons
 ```
 
 The summary should include counts by segment and counts by reject reason.
@@ -279,7 +286,7 @@ Use tests that can run without committing large media:
 Recommended commands:
 
 ```bash
-./dev.sh pytest
+./dev.sh pytest tests/unit tests/integration
 ./dev.sh python scripts/preprocess_video.py data/raw_videos/<video>.mp4 --video-id <id> --preset baseline
 ./dev.sh python scripts/preprocess_video.py data/raw_videos/<video>.mp4 --video-id <id> --preset longsplat
 ```

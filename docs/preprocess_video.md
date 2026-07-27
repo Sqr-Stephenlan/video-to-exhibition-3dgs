@@ -11,7 +11,7 @@ raw video
   -> normalized video
   -> video segments
   -> selected reconstruction frames
-  -> preprocess_manifest.json
+  -> frames_manifest.json
 ```
 
 It does not run reconstruction, depth estimation, COLMAP, LongSplat, MASt3R,
@@ -25,7 +25,7 @@ instead of re-scanning directories or guessing preprocessing settings.
 
 ```bash
 ./dev.sh python ...
-./dev.sh pytest
+./dev.sh pytest tests/unit tests/integration
 ./dev.sh pip ...
 ```
 
@@ -92,10 +92,12 @@ The single entrypoint is:
 | `--overexposed-ratio` | `0.6` | Reject frames above this near-white pixel ratio. |
 | `--underexposed-ratio` | `0.6` | Reject frames above this near-black pixel ratio. |
 | `--duplicate-hash-threshold` | `4` | Reject near duplicates when average-hash distance is less than or equal to this value. |
+| `--duplicate-time-window-sec` | `2.0` | Compare aHash values only with selected frames in this recent time window. |
+| `--max-selected-gap-sec` | `2.0` | Preserve temporal coverage by allowing a duplicate after this gap; blur/exposure rejection still applies. |
 | `--save-rejected` / `--no-save-rejected` | `false` | Control whether rejected frame images are written. Manifest rows are always written. |
 | `--frame-format` | `jpg` | Frame image format: `jpg` or `png`. |
 | `--frame-source` | `segment` | Sample frames from generated segment MP4s or directly from the source video. |
-| `--force` | `false` | Delete and replace generated outputs for the same `video_id`. |
+| `--force` | `false` | Transactionally replace generated outputs for the same `video_id` after a new run succeeds. |
 
 Presets:
 
@@ -145,7 +147,7 @@ data/frames/sample/
   rejected/segment_0001/*.jpg or *.png
 
 data/manifests/sample/
-  preprocess_manifest.json
+  frames_manifest.json
 ```
 
 Rejected images are written only with `--save-rejected`. Rejected frame manifest
@@ -158,13 +160,18 @@ second-generation H.264 segment files and avoid JPEG compression for final
 reconstruction frame assets. The normalized and segment videos remain H.264 MP4s
 for tool compatibility.
 
+Normalization intentionally maps the first video stream and uses `-an`; audio
+is not part of the preprocessing contract. The source manifest records the
+original video metadata, including rotation and whether the input appears
+variable-frame-rate (VFR).
+
 Generated videos, frames, manifests, logs, model files, and temporary outputs
 should stay out of Git. Commit source code, tests, docs, and reusable tuning
 configs only.
 
 ## Manifest Contract
 
-The manifest schema version is `1.0` and includes:
+The manifest schema version is `2.0` and includes:
 
 - `video_id`
 - `source`
@@ -173,6 +180,7 @@ The manifest schema version is `1.0` and includes:
 - `segments`
 - `frames`
 - `summary`
+- `run`
 
 `source` and `normalized` include stable relative paths, file/video metadata,
 dimensions, fps, duration, codec, and source size where available.
@@ -180,19 +188,22 @@ dimensions, fps, duration, codec, and source size where available.
 Each segment includes:
 
 ```text
-id, path, index, start_sec, end_sec, duration_sec, reason
+id, path, index, start_sec, end_sec, duration_sec, reason, width, height, sha256
 ```
 
 Each frame includes:
 
 ```text
-id, segment_id, path, timestamp_sec, frame_index, selected,
-blur_score, overexposed_ratio, underexposed_ratio, duplicate_score,
-reject_reasons
+id, segment_id, path, timestamp_sec, frame_index, width, height, selected,
+blur_score, overexposed_ratio, underexposed_ratio, motion_score,
+duplicate_score, matched_frame_id, sha256, reject_reasons
 ```
 
 `summary` includes total segment/frame counts, selected and rejected frame
-counts, per-segment frame counts, and reject counts by reason. Downstream stages
+counts, per-segment frame counts, reject counts by reason, and observed selected
+frame gaps per segment. `coverage_by_segment[].exceeds_target` flags when the
+observed gap exceeds `coverage_target_max_selected_gap_sec`; it is an audit
+signal because blur or exposure rejection is never overridden. Downstream stages
 should use:
 
 - `frames` filtered by `selected == true` for reconstruction images.
@@ -200,12 +211,23 @@ should use:
 - `segments` for segment windows and generated segment MP4 paths.
 - `settings` to record exactly how the frame set was produced.
 
-Paths are stable relative paths when outputs are under the repository root.
+Every stored path is repository-relative. Source videos, configs, and output
+roots outside the repository are rejected instead of being serialized as
+machine-specific absolute paths.
+
+The `run` object records a deterministic Run ID, source checksum, settings
+fingerprint, config path/checksum, Git commit and dirty state, Python/OpenCV/
+FFmpeg/ffprobe versions, and the complete repository-relative command. Source,
+normalized video, segment, and saved-frame records include SHA-256 checksums.
+
+Runs are written under `.preprocess-staging/` and published only after all
+artifacts and the manifest are valid. With `--force`, previous outputs are moved
+to a temporary backup during publication and restored if publication fails.
 
 ## Consumer Contract
 
 Preprocess video is a **producer** of normalized MP4 segments, selected frame
-assets, and `preprocess_manifest.json`. It does **not** rename frames for a
+assets, and `frames_manifest.json`. It does **not** rename frames for a
 specific reconstruction backend, generate COLMAP files, run LongSplat, or create
 depth / pose / camera-intrinsic records. Each downstream branch owns the adapter
 from this manifest into its own input tree.
@@ -214,7 +236,7 @@ from this manifest into its own input tree.
 
 | Field or artifact | Meaning for consumers |
 |---|---|
-| `schema_version` | Manifest schema version. Current value is `1.0`. |
+| `schema_version` | Manifest schema version. Current value is `2.0`. |
 | `video_id` | Stable run identifier used in `data/segments/<video_id>`, `data/frames/<video_id>`, and `data/manifests/<video_id>`. |
 | `source.path` | Repository-relative raw video path used for this run. |
 | `normalized.path` | Repository-relative H.264 MP4 normalized video path. |
@@ -226,6 +248,10 @@ from this manifest into its own input tree.
 | `frames[].path` | Repository-relative selected/rejected image path, or `null` when a rejected image was not saved. |
 | `frames[].timestamp_sec` | Timestamp in the segment/source timeline used by preprocessing. |
 | `frames[].frame_index` | Source or segment frame index, depending on `settings.frame_source`. |
+| `frames[].width`, `frames[].height` | Decoded dimensions of the saved or evaluated frame. |
+| `frames[].sha256` | SHA-256 of a saved selected/rejected image, or `null` when a rejected image was not saved. |
+| `frames[].motion_score` | Normalized pixel-change diagnostic against the previous sampled frame; it is recorded but not currently a rejection threshold. |
+| `frames[].matched_frame_id` | Selected frame matched by duplicate rejection, otherwise `null`. |
 | `frames[].selected` | `true` only for frames intended as reconstruction candidates. |
 | `frames[].reject_reasons` | Reasons a frame was rejected: `blur`, `overexposed`, `underexposed`, and/or `duplicate`. |
 | `summary` | Counts for quick validation and handoff reporting. |
@@ -233,7 +259,7 @@ from this manifest into its own input tree.
 ### What downstream consumers must do
 
 LongSplat, COLMAP, gsplat, official 3DGS, depth-prior, and evaluation branches
-must read `preprocess_manifest.json` and materialize their own backend-specific
+must read `frames_manifest.json` and materialize their own backend-specific
 input layout. A reliable bridge must:
 
 1. Treat the manifest `frames[]` array order as the authoritative preprocess
@@ -289,6 +315,9 @@ bad frames while keeping enough coverage for downstream reconstruction.
 - `duplicate_hash_threshold` is easy to misread: rejection happens when
   `duplicate_score <= duplicate_hash_threshold`. Lower values are less strict;
   higher values reject more near duplicates.
+- Duplicate comparisons are limited by `duplicate_time_window_sec`; a frame at
+  or beyond `max_selected_gap_sec` from the last selected frame is retained for
+  coverage unless blur or exposure checks reject it.
 - Reducing `target_fps` lowers disk use and review volume, but may remove useful
   reconstruction coverage.
 - Reducing `segment_overlap_sec` lowers duplicated output, but can make segment
@@ -309,7 +338,7 @@ Suggested real-video loop:
 
 Then inspect:
 
-- `data/manifests/<video_id>/preprocess_manifest.json`
+- `data/manifests/<video_id>/frames_manifest.json`
 - `summary.selected_frames` and `summary.rejected_frames`
 - `summary.reject_reasons`
 - selected frame quality under `data/frames/<video_id>/selected/`
@@ -326,6 +355,8 @@ threshold depending on the failure mode.
 |---|---|---|
 | `ffmpeg` or `ffprobe` setup error | FFmpeg is not on `PATH`. | Install FFmpeg and reopen the shell so PATH updates are visible. |
 | `Output already exists` | The same `video_id` was already generated. | Use a new `--video-id` or rerun with `--force`. |
+| `--frame-source source` rejects a video | The source is detected as VFR. | Use `--frame-source segment` so sampling occurs on the normalized CFR video. |
+| Source rotation is present | The source carries rotation metadata. | Source-frame sampling disables OpenCV auto-orientation and applies the recorded rotation; inspect `source.rotation_degrees` in the manifest. |
 | `--video-id` validation error | The id contains spaces or unsafe characters. | Use names like `ios_test_blur200_fps5`. |
 | Config fails before writing outputs | Unknown field, wrong type, or invalid choice. | Fix the JSON key/value; config validation is intentionally strict. |
 | Manifest has rejected rows with `path: null` | Rejected images were not saved. | Rerun with `--save-rejected` for visual review. |
@@ -335,10 +366,11 @@ threshold depending on the failure mode.
 
 ## Verification
 
-Run focused tests:
+Run the preprocess test scope (the repository-wide command can collect local
+third-party tests that are outside this feature):
 
 ```bash
-./dev.sh pytest
+./dev.sh pytest tests/unit tests/integration
 ```
 
 When FFmpeg is available, smoke test both presets on a local sample:

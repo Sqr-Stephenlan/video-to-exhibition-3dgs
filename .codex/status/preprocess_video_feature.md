@@ -1,20 +1,21 @@
 # Preprocess Video Feature Status
 
-Last updated: 2026-07-21
+Last updated: 2026-07-22
 
 ## Current Phase
 
-Stage 2 - Minimal preprocess MVP implemented, review feedback addressed, and
-aligned with the main-branch test and API conventions. Fidelity frame
-extraction is implemented on branch `codex/preprocess-fidelity-frames`.
+Stage 2 - Review follow-up implemented for the formal manifest contract,
+strict path portability, provenance, coverage-aware duplicate filtering, and
+transactional output publication. Fidelity frame extraction remains part of
+the same preprocess entrypoint.
 
 The feature now has a single CLI entrypoint, focused tests, and user-facing
 documentation. FFmpeg and ffprobe are now installed on PATH, the FFmpeg smoke
-test passes, and the remaining Ready for review checklist items are now in
-progress through the PR body update. The feature documentation has also been
-expanded into a handoff-oriented README for usage, configuration, tuning,
-manifest consumption, downstream consumer contracts, troubleshooting, and
-generated-asset boundaries.
+test passes. The formal handoff artifact is now `frames_manifest.json`, with
+schema `2.0`; generated output is staged and published only after a successful
+run. The feature documentation covers usage, configuration, tuning, manifest
+consumption, downstream consumer contracts, troubleshooting, and generated-
+asset boundaries.
 
 ## Completed
 
@@ -70,6 +71,24 @@ generated-asset boundaries.
   - `source` + `png` avoids second-generation segment-video sampling and JPEG
     compression for final reconstruction frames while keeping H.264 MP4
     normalized/segment outputs for downstream tool compatibility.
+- Addressed the review contract and reproducibility gaps:
+  - renamed the formal manifest to `frames_manifest.json` and upgraded the
+    schema to `2.0`;
+  - added frame/segment dimensions, SHA-256 values, motion diagnostics, and
+    duplicate match IDs;
+  - rejected source/config/output paths outside the repository instead of
+    serializing absolute paths;
+  - recorded source/config/code/tool provenance, resolved settings fingerprint,
+    complete command, and deterministic Run ID;
+  - staged generated files under a temporary run directory and published them
+    with rollback protection, so failed runs do not delete a prior result;
+  - bounded average-hash comparisons by a time window and added a maximum
+    selected-frame gap coverage guard;
+  - detected VFR input and fail-closed for unsafe source-frame seeking, while
+    applying rotation metadata explicitly for source-frame extraction.
+- Added regression coverage for the new manifest contract, strict paths,
+  staged overwrite behavior, VFR rejection, rotation handling, duplicate
+  coverage, provenance, and artifact dimensions/checksums.
 - Added config-driven parameter tuning:
   - `--config <path>` loads preprocessing settings from a dependency-free JSON
     file.
@@ -278,16 +297,37 @@ generated-asset boundaries.
 - Documentation-only consumer contract reviewed against
   `scripts/preprocess_video.py` manifest fields and the current preprocess
   feature contract. No code or test behavior was changed.
+- Re-ran the focused preprocess suite after the review follow-up: `34 passed`.
+- Added and passed FFmpeg-generated compatibility fixtures for VFR detection,
+  display rotation metadata, and a real two-scene cut.
+- Re-ran the supplied 53.10-second `easy2.mp4` source
+  (`129157254a897cfae1132001e026e98993767c755d9c3117ee0d3a337d71dd64`)
+  with time segmentation, source PNG frames, the baseline config, and the new
+  duplicate coverage settings. The run produced 366 candidates, 191 selected,
+  and 175 rejected (`blur: 93`, `duplicate: 84`), retaining seven more frames
+  than the reviewed 184-selected baseline while preserving the same blur count.
+  All saved frame, segment, and normalized-video checksums matched the manifest.
+  Three segment coverage audits exceeded the 2.0-second target, caused by blur
+  rejection rather than duplicate filtering; they are recorded, not silently
+  overridden with low-quality frames.
+- Ran `compileall` successfully with the existing `.venv` interpreter. The
+  repository-required `./dev.sh pytest` command could not be launched from the
+  current PowerShell session because Bash is unavailable; the direct venv run
+  used the same project interpreter and passed the focused suite.
 
 ## Next Step
 
-Update the PR body to reflect the current HEAD `a8fff7c`, complete the Ready
-for review checklist, and request reviewer approval before switching the PR
-out of Draft.
+Update the PR body to reflect the current HEAD after this follow-up, retain
+Draft status until the new manifest contract and real-video evidence are
+reviewed, and request reviewer approval before switching the PR out of Draft.
 
 For `restricted_test`, review the `blur=60` and `blur=80` outputs before
 deciding whether the baseline should move from `55` to `60`, or whether the
 quality-first setting should remain an explicit per-video override.
+
+Review `data/manifests/easy2_contract_window/frames_manifest.json` together
+with its selected/rejected PNGs to decide whether the 2.0-second coverage target
+should remain an audit threshold or become a stricter quality/coverage policy.
 
 For the easy samples, review `easy1_b7p5_d3_fps5_o10` and
 `easy2_b85_d4_fps5_o10`. The current evidence supports per-video overrides:
@@ -352,9 +392,10 @@ For the easy samples, review `easy1_b7p5_d3_fps5_o10` and
   resizing mathematically lossless; downscaling still resamples pixels. It is a
   project-compatible way to avoid extra H.264 and JPEG generation loss for
   downstream reconstruction inputs.
-- Source-based frame sampling currently uses OpenCV FPS/frame-index seeking.
-  The synthetic CFR smoke test passes, but representative phone/AR footage,
-  especially variable-frame-rate input, still needs timing-alignment validation.
+- Source-based frame sampling uses OpenCV frame-index seeking only for detected
+  CFR inputs; VFR source-frame runs now fail closed and instruct callers to use
+  normalized segment sampling. Representative phone/AR footage still needs
+  timing and visual acceptance, including a real rotated fixture.
 
 ## Current Non-Goals
 

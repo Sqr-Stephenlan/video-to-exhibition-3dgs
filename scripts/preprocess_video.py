@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
 import subprocess
 import sys
+import uuid
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable
@@ -19,7 +21,8 @@ import cv2
 import numpy as np
 
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"
+MANIFEST_FILENAME = "frames_manifest.json"
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 PRESETS = {
@@ -45,6 +48,8 @@ DEFAULT_SETTINGS = {
     "overexposed_ratio": 0.6,
     "underexposed_ratio": 0.6,
     "duplicate_hash_threshold": 4,
+    "duplicate_time_window_sec": 2.0,
+    "max_selected_gap_sec": 2.0,
     "save_rejected": False,
     "frame_format": "jpg",
     "frame_source": "segment",
@@ -62,6 +67,8 @@ CONFIG_SETTING_KEYS = frozenset(
         "overexposed_ratio",
         "underexposed_ratio",
         "duplicate_hash_threshold",
+        "duplicate_time_window_sec",
+        "max_selected_gap_sec",
         "save_rejected",
         "frame_format",
         "frame_source",
@@ -76,6 +83,8 @@ FLOAT_CONFIG_SETTINGS = frozenset(
         "blur_threshold",
         "overexposed_ratio",
         "underexposed_ratio",
+        "duplicate_time_window_sec",
+        "max_selected_gap_sec",
     }
 )
 INT_CONFIG_SETTINGS = frozenset({"max_long_edge", "duplicate_hash_threshold"})
@@ -101,6 +110,9 @@ class VideoMetadata:
     codec: str
     size_bytes: int
     streams: list[dict[str, Any]]
+    sha256: str | None = None
+    rotation_degrees: int = 0
+    is_vfr: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +123,7 @@ class SegmentWindow:
     end_sec: float
     reason: str
     path: Path | None = None
+    sha256: str | None = None
 
     @property
     def duration_sec(self) -> float:
@@ -124,6 +137,7 @@ class SegmentWindow:
             end_sec=self.end_sec,
             reason=self.reason,
             path=path,
+            sha256=sha256_file(path) if path.exists() else None,
         )
 
 
@@ -140,6 +154,11 @@ class FrameRecord:
     underexposed_ratio: float
     duplicate_score: int | None
     reject_reasons: list[str]
+    width: int = 0
+    height: int = 0
+    sha256: str | None = None
+    motion_score: float | None = None
+    matched_frame_id: str | None = None
 
 
 def parse_fraction(value: str | None) -> float:
@@ -161,7 +180,81 @@ def relative_path(path: Path, base: Path | None = None) -> str:
     try:
         return resolved.relative_to(base).as_posix()
     except ValueError:
-        return resolved.as_posix()
+        raise PreprocessError(f"Path is outside the repository and cannot be written to a manifest: {resolved}")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise PreprocessError(f"Could not hash artifact {path}: {exc}") from exc
+    return digest.hexdigest()
+
+
+def stable_hash(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def tool_version(name: str) -> str:
+    try:
+        result = subprocess.run([name, "-version"], check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    first_line = (result.stdout or result.stderr).splitlines()
+    return first_line[0].strip() if first_line else "unknown"
+
+
+def repository_state(repo_root: Path) -> tuple[str, bool]:
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        return revision, dirty
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown", True
+
+
+def manifest_command_args(arguments: list[str], repo_root: Path, source_path: Path) -> list[str]:
+    normalized = list(arguments)
+    path_options = {"--config", "--output-root"}
+    expect_path = False
+    for index, value in enumerate(normalized):
+        if expect_path:
+            normalized[index] = relative_path(Path(value), repo_root)
+            expect_path = False
+            continue
+        if value in path_options:
+            expect_path = True
+            continue
+        for option in path_options:
+            prefix = f"{option}="
+            if value.startswith(prefix):
+                normalized[index] = prefix + relative_path(Path(value[len(prefix) :]), repo_root)
+                break
+        else:
+            try:
+                if not value.startswith("-") and Path(value).resolve() == source_path.resolve():
+                    normalized[index] = relative_path(source_path, repo_root)
+            except OSError:
+                pass
+    return ["./dev.sh", "python", "scripts/preprocess_video.py", *normalized]
 
 
 def require_tool(name: str) -> str:
@@ -216,11 +309,24 @@ def probe_video(source: Path) -> VideoMetadata:
         duration = float(duration_raw)
     except (TypeError, ValueError):
         duration = 0.0
-    fps = parse_fraction(stream.get("avg_frame_rate")) or parse_fraction(stream.get("r_frame_rate"))
+    average_fps = parse_fraction(stream.get("avg_frame_rate"))
+    nominal_fps = parse_fraction(stream.get("r_frame_rate"))
+    fps = average_fps or nominal_fps
     width = int(stream.get("width") or 0)
     height = int(stream.get("height") or 0)
     if duration <= 0 or fps <= 0 or width <= 0 or height <= 0:
         raise PreprocessError(f"Incomplete video metadata for {source}.")
+
+    rotation_degrees = 0
+    rotation_value = stream.get("tags", {}).get("rotate")
+    for side_data in stream.get("side_data_list", []):
+        if "rotation" in side_data:
+            rotation_value = side_data["rotation"]
+            break
+    try:
+        rotation_degrees = int(round(float(rotation_value or 0))) % 360
+    except (TypeError, ValueError):
+        rotation_degrees = 0
 
     return VideoMetadata(
         path=source,
@@ -231,6 +337,13 @@ def probe_video(source: Path) -> VideoMetadata:
         codec=str(stream.get("codec_name") or ""),
         size_bytes=source.stat().st_size,
         streams=video_streams,
+        sha256=sha256_file(source),
+        rotation_degrees=rotation_degrees,
+        is_vfr=bool(
+            average_fps
+            and nominal_fps
+            and abs(average_fps - nominal_fps) > max(0.1, nominal_fps * 0.01)
+        ),
     )
 
 
@@ -252,7 +365,10 @@ def scaled_dimensions(width: int, height: int, max_long_edge: int) -> tuple[int,
 def normalize_video(source: Path, destination: Path, metadata: VideoMetadata, max_long_edge: int) -> VideoMetadata:
     require_tool("ffmpeg")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    width, height = scaled_dimensions(metadata.width, metadata.height, max_long_edge)
+    display_width, display_height = metadata.width, metadata.height
+    if metadata.rotation_degrees in {90, 270}:
+        display_width, display_height = display_height, display_width
+    width, height = scaled_dimensions(display_width, display_height, max_long_edge)
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -516,6 +632,27 @@ def resize_frame(frame: np.ndarray, dimensions: tuple[int, int] | None) -> np.nd
     return cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
 
 
+def rotate_frame(frame: np.ndarray, rotation_degrees: int) -> np.ndarray:
+    rotation = rotation_degrees % 360
+    if rotation == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
+def motion_difference(previous: np.ndarray | None, current: np.ndarray) -> float | None:
+    if previous is None:
+        return None
+    previous_gray = cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY)
+    current_gray = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
+    if previous_gray.shape != current_gray.shape:
+        previous_gray = cv2.resize(previous_gray, (current_gray.shape[1], current_gray.shape[0]))
+    return float(np.mean(cv2.absdiff(previous_gray, current_gray))) / 255.0
+
+
 def sample_segment_frames(
     segment: SegmentWindow,
     selected_root: Path,
@@ -531,6 +668,11 @@ def sample_segment_frames(
     frame_source: str = "segment",
     source_video: Path | None = None,
     resize_to: tuple[int, int] | None = None,
+    source_rotation_degrees: int = 0,
+    duplicate_time_window_sec: float = 2.0,
+    max_selected_gap_sec: float = 2.0,
+    manifest_selected_root: Path | None = None,
+    manifest_rejected_root: Path | None = None,
 ) -> list[FrameRecord]:
     if segment.path is None:
         raise ValueError("segment.path is required for frame sampling")
@@ -548,6 +690,8 @@ def sample_segment_frames(
     try:
         if not cap.isOpened():
             raise PreprocessError(f"OpenCV could not open video for frame sampling: {sampling_path}.")
+        if frame_source == "source" and hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+            cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
 
         segment_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         sample_every = 1 if segment_fps <= 0 else max(1, int(round(segment_fps / target_fps)))
@@ -558,7 +702,7 @@ def sample_segment_frames(
             end_frame_index = max(start_frame_index, int(round(segment.end_sec * segment_fps)))
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_index)
 
-        selected_hashes: list[np.ndarray] = []
+        selected_hashes: list[tuple[float, str, np.ndarray]] = []
         records: list[FrameRecord] = []
         selected_dir = selected_root / segment.id
         rejected_dir = rejected_root / segment.id
@@ -569,6 +713,8 @@ def sample_segment_frames(
         frame_number = 0
         source_frame_index = start_frame_index
         sample_index = 0
+        previous_sampled_frame: np.ndarray | None = None
+        last_selected_timestamp: float | None = None
         while True:
             if end_frame_index is not None and source_frame_index >= end_frame_index:
                 break
@@ -581,6 +727,8 @@ def sample_segment_frames(
             if (frame_number - 1) % sample_every != 0:
                 continue
 
+            if frame_source == "source":
+                frame = rotate_frame(frame, source_rotation_degrees)
             frame = resize_frame(frame, resize_to if frame_source == "source" else None)
             sample_index += 1
             local_timestamp = 0.0 if segment_fps <= 0 else (frame_number - 1) / segment_fps
@@ -588,7 +736,18 @@ def sample_segment_frames(
             blur = blur_score(frame)
             over, under = exposure_ratios(frame)
             current_hash = average_hash(frame)
-            duplicate = min((hash_distance(current_hash, item) for item in selected_hashes), default=None)
+            current_frame_id = f"{segment.id}_frame_{sample_index:06d}"
+            recent_hashes = [
+                item for item in selected_hashes if timestamp - item[0] <= duplicate_time_window_sec
+            ]
+            duplicate_match = min(
+                ((hash_distance(current_hash, item_hash), frame_id) for _, frame_id, item_hash in recent_hashes),
+                default=None,
+            )
+            duplicate = duplicate_match[0] if duplicate_match else None
+            matched_frame_id = duplicate_match[1] if duplicate_match else None
+            motion = motion_difference(previous_sampled_frame, frame)
+            previous_sampled_frame = frame.copy()
 
             reject_reasons = []
             if blur < blur_threshold:
@@ -597,7 +756,11 @@ def sample_segment_frames(
                 reject_reasons.append("overexposed")
             if under > underexposed_ratio:
                 reject_reasons.append("underexposed")
-            if duplicate is not None and duplicate <= duplicate_hash_threshold:
+            coverage_due = (
+                last_selected_timestamp is not None
+                and timestamp - last_selected_timestamp >= max_selected_gap_sec
+            )
+            if duplicate is not None and duplicate <= duplicate_hash_threshold and not coverage_due:
                 reject_reasons.append("duplicate")
 
             selected = not reject_reasons
@@ -605,7 +768,8 @@ def sample_segment_frames(
             output_path: Path | None
             if selected:
                 output_path = selected_dir / filename
-                selected_hashes.append(current_hash)
+                selected_hashes.append((timestamp, current_frame_id, current_hash))
+                last_selected_timestamp = timestamp
                 write_image(output_path, frame, frame_format)
             elif save_rejected:
                 output_path = rejected_dir / filename
@@ -613,11 +777,17 @@ def sample_segment_frames(
             else:
                 output_path = None
 
+            logical_output_path = output_path
+            if output_path is not None and selected and manifest_selected_root is not None:
+                logical_output_path = manifest_selected_root / segment.id / filename
+            elif output_path is not None and not selected and manifest_rejected_root is not None:
+                logical_output_path = manifest_rejected_root / segment.id / filename
+
             records.append(
                 FrameRecord(
-                    id=f"{segment.id}_frame_{sample_index:06d}",
+                    id=current_frame_id,
                     segment_id=segment.id,
-                    path=relative_path(output_path, repo_root) if output_path else None,
+                    path=relative_path(logical_output_path, repo_root) if logical_output_path else None,
                     timestamp_sec=timestamp,
                     frame_index=absolute_frame_index if frame_source == "source" else frame_number,
                     selected=selected,
@@ -626,6 +796,11 @@ def sample_segment_frames(
                     underexposed_ratio=round(float(under), 6),
                     duplicate_score=duplicate,
                     reject_reasons=reject_reasons,
+                    width=int(frame.shape[1]),
+                    height=int(frame.shape[0]),
+                    sha256=sha256_file(output_path) if output_path else None,
+                    motion_score=round(float(motion), 6) if motion is not None else None,
+                    matched_frame_id=matched_frame_id if "duplicate" in reject_reasons else None,
                 )
             )
     finally:
@@ -633,10 +808,15 @@ def sample_segment_frames(
     return records
 
 
-def summarize_frames(segments: Iterable[SegmentWindow], frames: Iterable[FrameRecord]) -> dict[str, Any]:
+def summarize_frames(
+    segments: Iterable[SegmentWindow],
+    frames: Iterable[FrameRecord],
+    max_selected_gap_sec: float | None = None,
+) -> dict[str, Any]:
     segment_counts: dict[str, dict[str, int]] = {
         segment.id: {"total": 0, "selected": 0, "rejected": 0} for segment in segments
     }
+    selected_timestamps: dict[str, list[float]] = {segment_id: [] for segment_id in segment_counts}
     reject_counts: Counter[str] = Counter()
     total = selected = rejected = 0
     for frame in frames:
@@ -646,10 +826,21 @@ def summarize_frames(segments: Iterable[SegmentWindow], frames: Iterable[FrameRe
         if frame.selected:
             selected += 1
             segment_counts[frame.segment_id]["selected"] += 1
+            selected_timestamps.setdefault(frame.segment_id, []).append(frame.timestamp_sec)
         else:
             rejected += 1
             segment_counts[frame.segment_id]["rejected"] += 1
             reject_counts.update(frame.reject_reasons)
+
+    coverage_by_segment: dict[str, dict[str, Any]] = {}
+    for segment_id, timestamps in selected_timestamps.items():
+        ordered = sorted(timestamps)
+        gaps = [right - left for left, right in zip(ordered, ordered[1:])]
+        observed_gap = round_sec(max(gaps, default=0.0))
+        coverage_by_segment[segment_id] = {
+            "max_selected_gap_sec": observed_gap,
+            "exceeds_target": max_selected_gap_sec is not None and observed_gap > max_selected_gap_sec,
+        }
 
     return {
         "total_segments": len(segment_counts),
@@ -658,10 +849,17 @@ def summarize_frames(segments: Iterable[SegmentWindow], frames: Iterable[FrameRe
         "rejected_frames": rejected,
         "frames_by_segment": segment_counts,
         "reject_reasons": dict(sorted(reject_counts.items())),
+        "coverage_target_max_selected_gap_sec": max_selected_gap_sec,
+        "coverage_by_segment": coverage_by_segment,
     }
 
 
-def segment_to_manifest(segment: SegmentWindow, repo_root: Path) -> dict[str, Any]:
+def segment_to_manifest(
+    segment: SegmentWindow,
+    repo_root: Path,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
     if segment.path is None:
         raise ValueError("segment.path is required for manifest output")
     return {
@@ -672,6 +870,9 @@ def segment_to_manifest(segment: SegmentWindow, repo_root: Path) -> dict[str, An
         "end_sec": round_sec(segment.end_sec),
         "duration_sec": round_sec(segment.duration_sec),
         "reason": segment.reason,
+        "width": width,
+        "height": height,
+        "sha256": segment.sha256,
     }
 
 
@@ -683,7 +884,11 @@ def build_manifest(
     segments: list[SegmentWindow],
     frames: list[FrameRecord],
     repo_root: Path,
+    run: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    invalid_frames = [frame.id for frame in frames if frame.width <= 0 or frame.height <= 0]
+    if invalid_frames:
+        raise PreprocessError(f"Frame records must include positive dimensions: {', '.join(invalid_frames[:3])}")
     return {
         "schema_version": SCHEMA_VERSION,
         "video_id": video_id,
@@ -695,6 +900,9 @@ def build_manifest(
             "width": source_metadata.width,
             "height": source_metadata.height,
             "codec": source_metadata.codec,
+            "sha256": source_metadata.sha256,
+            "rotation_degrees": source_metadata.rotation_degrees,
+            "is_vfr": source_metadata.is_vfr,
         },
         "normalized": {
             "path": relative_path(normalized_metadata.path, repo_root),
@@ -703,11 +911,18 @@ def build_manifest(
             "width": normalized_metadata.width,
             "height": normalized_metadata.height,
             "codec": normalized_metadata.codec,
+            "sha256": normalized_metadata.sha256,
+            "rotation_degrees": normalized_metadata.rotation_degrees,
+            "is_vfr": normalized_metadata.is_vfr,
         },
         "settings": settings,
-        "segments": [segment_to_manifest(segment, repo_root) for segment in segments],
+        "segments": [
+            segment_to_manifest(segment, repo_root, normalized_metadata.width, normalized_metadata.height)
+            for segment in segments
+        ],
         "frames": [asdict(frame) for frame in frames],
-        "summary": summarize_frames(segments, frames),
+        "summary": summarize_frames(segments, frames, settings.get("max_selected_gap_sec")),
+        "run": run or {},
     }
 
 
@@ -724,36 +939,93 @@ def is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
-def prepare_output_dirs(output_root: Path, video_id: str, force: bool) -> tuple[Path, Path, Path, Path, Path]:
+def ensure_repo_path(path: Path, repo_root: Path, label: str) -> Path:
+    resolved = path.resolve()
+    if not is_relative_to(resolved, repo_root):
+        raise PreprocessError(f"{label} must be inside the repository: {resolved}")
+    return resolved
+
+
+def prepare_output_dirs(
+    output_root: Path,
+    video_id: str,
+    force: bool,
+) -> tuple[Path, Path, Path, Path, Path, Path]:
     output_root = output_root.resolve()
-    segments_parent = output_root / "segments"
-    frames_parent = output_root / "frames"
-    manifests_parent = output_root / "manifests"
-    segments_dir = output_root / "segments" / video_id
-    frames_dir = output_root / "frames" / video_id
+    staging_root = output_root / ".preprocess-staging" / f"{video_id}-{uuid.uuid4().hex}"
+    segments_dir = staging_root / "segments" / video_id
+    frames_dir = staging_root / "frames" / video_id
     selected_dir = frames_dir / "selected"
     rejected_dir = frames_dir / "rejected"
-    manifests_dir = output_root / "manifests" / video_id
-    managed_dirs = [segments_dir, frames_dir, manifests_dir]
-    expected_parents = [segments_parent, frames_parent, manifests_parent]
+    manifests_dir = staging_root / "manifests" / video_id
+    final_dirs = [
+        output_root / "segments" / video_id,
+        output_root / "frames" / video_id,
+        output_root / "manifests" / video_id,
+    ]
 
-    for path, parent in zip(managed_dirs, expected_parents):
-        if not is_relative_to(path, parent) or path.resolve() == parent.resolve():
-            raise PreprocessError(f"Unsafe output path for video_id '{video_id}': {path}")
-
-    existing = [path for path in managed_dirs if path.exists()]
+    existing = [path for path in final_dirs if path.exists()]
     if existing and not force:
         joined = ", ".join(str(path) for path in existing)
         raise PreprocessError(f"Output already exists for video_id '{video_id}': {joined}. Use --force to overwrite.")
 
-    if force:
-        for path in existing:
-            shutil.rmtree(path)
-
     segments_dir.mkdir(parents=True, exist_ok=True)
     selected_dir.mkdir(parents=True, exist_ok=True)
     manifests_dir.mkdir(parents=True, exist_ok=True)
-    return segments_dir, selected_dir, rejected_dir, manifests_dir, frames_dir
+    return segments_dir, selected_dir, rejected_dir, manifests_dir, frames_dir, staging_root
+
+
+def publish_output_dirs(
+    output_root: Path,
+    video_id: str,
+    staging_root: Path,
+    force: bool,
+) -> None:
+    final_dirs = [
+        output_root / "segments" / video_id,
+        output_root / "frames" / video_id,
+        output_root / "manifests" / video_id,
+    ]
+    staged_dirs = [
+        staging_root / "segments" / video_id,
+        staging_root / "frames" / video_id,
+        staging_root / "manifests" / video_id,
+    ]
+    backup_root = output_root / ".preprocess-backups" / f"{video_id}-{uuid.uuid4().hex}"
+    backups: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        if force:
+            for final_dir in final_dirs:
+                if final_dir.exists():
+                    backup_dir = backup_root / final_dir.parent.name / video_id
+                    backup_dir.parent.mkdir(parents=True, exist_ok=True)
+                    final_dir.replace(backup_dir)
+                    backups.append((final_dir, backup_dir))
+        for staged_dir, final_dir in zip(staged_dirs, final_dirs):
+            final_dir.parent.mkdir(parents=True, exist_ok=True)
+            staged_dir.replace(final_dir)
+            published.append(final_dir)
+    except OSError as exc:
+        for final_dir in published:
+            if final_dir.exists():
+                shutil.rmtree(final_dir)
+        for final_dir, backup_dir in reversed(backups):
+            if backup_dir.exists():
+                backup_dir.replace(final_dir)
+        raise PreprocessError(f"Could not publish preprocessing outputs atomically: {exc}") from exc
+    finally:
+        if backup_root.exists():
+            shutil.rmtree(backup_root, ignore_errors=True)
+        cleanup_staging_root(staging_root)
+
+
+def cleanup_staging_root(staging_root: Path) -> None:
+    staging_parent = staging_root.parent
+    if staging_root.exists():
+        shutil.rmtree(staging_root, ignore_errors=True)
+    if staging_parent.exists() and not any(staging_parent.iterdir()):
+        staging_parent.rmdir()
 
 
 def load_settings_config(path: Path) -> dict[str, Any]:
@@ -834,6 +1106,9 @@ def resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
             raise PreprocessError(f"--{name.replace('_', '-')} must be between 0 and 1.")
     if settings["duplicate_hash_threshold"] < 0:
         raise PreprocessError("--duplicate-hash-threshold cannot be negative.")
+    for name in ("duplicate_time_window_sec", "max_selected_gap_sec"):
+        if settings[name] <= 0:
+            raise PreprocessError(f"--{name.replace('_', '-')} must be greater than zero.")
     return settings
 
 
@@ -844,79 +1119,125 @@ def validate_video_id(video_id: str) -> None:
         raise PreprocessError("--video-id cannot be '.' or '..'.")
 
 
-def preprocess(args: argparse.Namespace) -> Path:
-    repo_root = Path.cwd()
-    source = args.source_video.resolve()
-    output_root = args.output_root
+def preprocess(args: argparse.Namespace, command_args: list[str] | None = None) -> Path:
+    repo_root = Path.cwd().resolve()
+    source = ensure_repo_path(args.source_video, repo_root, "Source video")
+    output_root = ensure_repo_path(args.output_root, repo_root, "Output root")
     validate_video_id(args.video_id)
     if not source.exists() or not source.is_file():
         raise PreprocessError(f"Source video does not exist: {source}")
+    if args.config is not None:
+        args.config = ensure_repo_path(args.config, repo_root, "Config file")
 
     require_tool("ffmpeg")
     require_tool("ffprobe")
     settings = resolve_settings(args)
-    segments_dir, selected_dir, rejected_dir, manifests_dir, _frames_dir = prepare_output_dirs(
-        output_root, args.video_id, args.force
-    )
-
     source_metadata = probe_video(source)
-    normalized_path = segments_dir / "normalized.mp4"
-    normalized_metadata = normalize_video(source, normalized_path, source_metadata, settings["max_long_edge"])
-    source_frame_dimensions = scaled_dimensions(
-        source_metadata.width,
-        source_metadata.height,
-        settings["max_long_edge"],
-    )
-
-    planned_segments = build_segment_windows(
-        duration_sec=normalized_metadata.duration_sec,
-        segment_method=settings["segment_method"],
-        segment_length_sec=settings["segment_length_sec"],
-        segment_overlap_sec=settings["segment_overlap_sec"],
-        min_segment_sec=settings["min_segment_sec"],
-        normalized_path=normalized_path,
-    )
-    if not planned_segments:
-        raise PreprocessError("No segments were produced from the normalized video.")
-
-    written_segments = [
-        write_segment(normalized_path, segment, segments_dir / f"{segment.id}.mp4")
-        for segment in planned_segments
-    ]
-
-    frames: list[FrameRecord] = []
-    for segment in written_segments:
-        frames.extend(
-            sample_segment_frames(
-                segment=segment,
-                selected_root=selected_dir,
-                rejected_root=rejected_dir,
-                target_fps=settings["target_fps"],
-                blur_threshold=settings["blur_threshold"],
-                overexposed_ratio=settings["overexposed_ratio"],
-                underexposed_ratio=settings["underexposed_ratio"],
-                duplicate_hash_threshold=settings["duplicate_hash_threshold"],
-                save_rejected=settings["save_rejected"],
-                repo_root=repo_root,
-                frame_format=settings["frame_format"],
-                frame_source=settings["frame_source"],
-                source_video=source if settings["frame_source"] == "source" else None,
-                resize_to=source_frame_dimensions if settings["frame_source"] == "source" else None,
-            )
+    if settings["frame_source"] == "source" and source_metadata.is_vfr:
+        raise PreprocessError(
+            "--frame-source source is not timestamp-safe for variable-frame-rate input. "
+            "Use --frame-source segment so frames are sampled from the normalized CFR video."
         )
 
-    manifest = build_manifest(
-        video_id=args.video_id,
-        source_metadata=source_metadata,
-        normalized_metadata=normalized_metadata,
-        settings=settings,
-        segments=written_segments,
-        frames=frames,
-        repo_root=repo_root,
+    segments_dir, selected_dir, rejected_dir, manifests_dir, _frames_dir, staging_root = prepare_output_dirs(
+        output_root, args.video_id, args.force
     )
-    manifest_path = manifests_dir / "preprocess_manifest.json"
-    write_manifest(manifest, manifest_path)
-    return manifest_path
+    final_segments_dir = output_root / "segments" / args.video_id
+    final_frames_dir = output_root / "frames" / args.video_id
+    final_manifests_dir = output_root / "manifests" / args.video_id
+    normalized_path = segments_dir / "normalized.mp4"
+    try:
+        staged_normalized_metadata = normalize_video(
+            source, normalized_path, source_metadata, settings["max_long_edge"]
+        )
+        normalized_metadata = replace(staged_normalized_metadata, path=final_segments_dir / "normalized.mp4")
+        source_width, source_height = source_metadata.width, source_metadata.height
+        if source_metadata.rotation_degrees in {90, 270}:
+            source_width, source_height = source_height, source_width
+        source_frame_dimensions = scaled_dimensions(source_width, source_height, settings["max_long_edge"])
+
+        planned_segments = build_segment_windows(
+            duration_sec=staged_normalized_metadata.duration_sec,
+            segment_method=settings["segment_method"],
+            segment_length_sec=settings["segment_length_sec"],
+            segment_overlap_sec=settings["segment_overlap_sec"],
+            min_segment_sec=settings["min_segment_sec"],
+            normalized_path=normalized_path,
+        )
+        if not planned_segments:
+            raise PreprocessError("No segments were produced from the normalized video.")
+
+        staged_segments = [
+            write_segment(normalized_path, segment, segments_dir / f"{segment.id}.mp4")
+            for segment in planned_segments
+        ]
+        final_segments = [
+            replace(segment, path=final_segments_dir / f"{segment.id}.mp4")
+            for segment in staged_segments
+        ]
+
+        frames: list[FrameRecord] = []
+        for segment in staged_segments:
+            frames.extend(
+                sample_segment_frames(
+                    segment=segment,
+                    selected_root=selected_dir,
+                    rejected_root=rejected_dir,
+                    target_fps=settings["target_fps"],
+                    blur_threshold=settings["blur_threshold"],
+                    overexposed_ratio=settings["overexposed_ratio"],
+                    underexposed_ratio=settings["underexposed_ratio"],
+                    duplicate_hash_threshold=settings["duplicate_hash_threshold"],
+                    save_rejected=settings["save_rejected"],
+                    repo_root=repo_root,
+                    frame_format=settings["frame_format"],
+                    frame_source=settings["frame_source"],
+                    source_video=source if settings["frame_source"] == "source" else None,
+                    resize_to=source_frame_dimensions if settings["frame_source"] == "source" else None,
+                    source_rotation_degrees=source_metadata.rotation_degrees,
+                    duplicate_time_window_sec=settings["duplicate_time_window_sec"],
+                    max_selected_gap_sec=settings["max_selected_gap_sec"],
+                    manifest_selected_root=final_frames_dir / "selected",
+                    manifest_rejected_root=final_frames_dir / "rejected",
+                )
+            )
+
+        settings_fingerprint = stable_hash(settings)
+        revision, dirty = repository_state(repo_root)
+        raw_command_args = command_args or [str(args.source_video), "--video-id", args.video_id]
+        run = {
+            "id": f"{args.video_id}-{(source_metadata.sha256 or 'unknown')[:12]}-{settings_fingerprint[:12]}",
+            "source_sha256": source_metadata.sha256,
+            "settings_fingerprint": settings_fingerprint,
+            "config": {
+                "path": relative_path(args.config, repo_root) if args.config is not None else None,
+                "sha256": sha256_file(args.config) if args.config is not None else None,
+            },
+            "code": {"commit": revision, "working_tree_dirty": dirty},
+            "tools": {
+                "python": sys.version.split()[0],
+                "opencv": cv2.__version__,
+                "ffmpeg": tool_version("ffmpeg"),
+                "ffprobe": tool_version("ffprobe"),
+            },
+            "command": manifest_command_args(raw_command_args, repo_root, source),
+        }
+        manifest = build_manifest(
+            video_id=args.video_id,
+            source_metadata=source_metadata,
+            normalized_metadata=normalized_metadata,
+            settings=settings,
+            segments=final_segments,
+            frames=frames,
+            repo_root=repo_root,
+            run=run,
+        )
+        write_manifest(manifest, manifests_dir / MANIFEST_FILENAME)
+        publish_output_dirs(output_root, args.video_id, staging_root, args.force)
+        return final_manifests_dir / MANIFEST_FILENAME
+    except Exception:
+        cleanup_staging_root(staging_root)
+        raise
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -941,6 +1262,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overexposed-ratio", type=float, default=None, help="Reject frames above this white-pixel ratio.")
     parser.add_argument("--underexposed-ratio", type=float, default=None, help="Reject frames above this black-pixel ratio.")
     parser.add_argument("--duplicate-hash-threshold", type=int, default=None, help="Reject near-duplicate average hashes.")
+    parser.add_argument(
+        "--duplicate-time-window-sec",
+        type=float,
+        default=None,
+        help="Compare duplicate hashes only within this recent time window.",
+    )
+    parser.add_argument(
+        "--max-selected-gap-sec",
+        type=float,
+        default=None,
+        help="Preserve coverage by allowing a duplicate after this selected-frame gap.",
+    )
     parser.add_argument(
         "--save-rejected",
         action=argparse.BooleanOptionalAction,
@@ -967,7 +1300,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     try:
-        manifest_path = preprocess(args)
+        command_args = list(argv) if argv is not None else sys.argv[1:]
+        manifest_path = preprocess(args, command_args=command_args)
     except (PreprocessError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
