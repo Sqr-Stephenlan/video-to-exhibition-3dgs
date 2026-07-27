@@ -16,7 +16,9 @@
     "pose_iteration": 100,
     "local_iter": 100,
     "global_iter": 100,
-    "post_iter": 50
+    "post_iter": 50,
+    "anisotropy_reg_weight": 0.001,
+    "anisotropy_soft_limit": 30.0
   },
   "convert_iteration": 100,
   "convert_prune_ratio": 0.6,

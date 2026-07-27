@@ -441,15 +441,24 @@ def run_pipeline(
                 audit_kwargs["expected_native_checkpoint_iteration"] = (
                     config.expected_native_checkpoint_iteration
                 )
+            # Use config gate thresholds when available
+            if config.quality_gates is not None:
+                pg = config.quality_gates.pose
+                audit_kwargs.update({
+                    "max_orthogonality_error": pg.max_orthogonality_error,
+                    "max_determinant_error": pg.max_determinant_error,
+                    "max_rotation_step_deg": pg.max_rotation_step_deg,
+                    "max_translation_step_ratio": pg.max_translation_step_ratio,
+                })
             audit_result = audit_pose_quality(
                 cameras_json, pose_telemetry, **audit_kwargs
             )
             record.setdefault("quality_gates", {})["pose"] = {
                 "thresholds": {
-                    "max_orthogonality_error": 1e-4,
-                    "max_determinant_error": 1e-4,
-                    "max_rotation_step_deg": 25.0,
-                    "max_translation_step_ratio": 6.0,
+                    "max_orthogonality_error": audit_kwargs.get("max_orthogonality_error", 1e-4),
+                    "max_determinant_error": audit_kwargs.get("max_determinant_error", 1e-4),
+                    "max_rotation_step_deg": audit_kwargs.get("max_rotation_step_deg", 25.0),
+                    "max_translation_step_ratio": audit_kwargs.get("max_translation_step_ratio", 6.0),
                 },
                 "passed": audit_result["passed"],
                 "reasons": audit_result["reasons"],
@@ -523,16 +532,20 @@ def run_pipeline(
                     f"(train {train_camera_count} + test {test_camera_count})"
                 )
 
+            vda_min_aligned = 0.98
+            if config.quality_gates is not None:
+                vda_min_aligned = config.quality_gates.vda.min_aligned_fraction
+
             aligned_ratio = aligned / train_camera_count if train_camera_count > 0 else 0.0
-            if aligned_ratio < 0.98:
+            if aligned_ratio < vda_min_aligned:
                 vda_reasons.append(
-                    f"VDA aligned ratio {aligned_ratio:.4f} < 0.98 "
+                    f"VDA aligned ratio {aligned_ratio:.4f} < {vda_min_aligned} "
                     f"(aligned={aligned}, rejected={rejected}, missing={missing})"
                 )
 
             record.setdefault("quality_gates", {})["vda"] = {
                 "thresholds": {
-                    "min_aligned_ratio": 0.98,
+                    "min_aligned_ratio": vda_min_aligned,
                     "max_missing": 0,
                 },
                 "passed": len(vda_reasons) == 0,

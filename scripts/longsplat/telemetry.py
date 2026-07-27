@@ -67,16 +67,27 @@ def summarize_pose_telemetry(stdout: str) -> dict[str, Any]:
     metrics suitable for post-training pose audit gating.
     """
     records = parse_json_markers(stdout, "POSE_TELEMETRY")
-    successes = sum(record.get("success") is True for record in records)
 
-    # Per-camera acceptance: unique frames with at least one successful attempt.
+    def _is_accepted(record: dict[str, Any]) -> bool:
+        if "accepted" in record:
+            return record["accepted"] is True
+        if "success" in record:
+            return record["success"] is True
+        reasons = record.get("rejection_reasons")
+        if isinstance(reasons, list):
+            return len(reasons) == 0
+        return False
+
+    successes = sum(_is_accepted(r) for r in records)
+
+    # Per-camera acceptance: unique frames with at least one accepted attempt.
     accepted_frames: list[str] = []
     seen: set[str] = set()
     for record in records:
         frame = record.get("frame")
         if isinstance(frame, str) and frame not in seen:
             seen.add(frame)
-            if record.get("success") is True:
+            if _is_accepted(record):
                 accepted_frames.append(frame)
 
     inlier_ratios = _finite_values(records, "inlier_ratio")

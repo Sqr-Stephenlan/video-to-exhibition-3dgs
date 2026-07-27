@@ -53,6 +53,8 @@ class PoseGateConfig:
     max_rotation_step_deg: float = 25.0
     max_translation_step_ratio: float = 6.0
     reference_lookback: int = 3
+    max_orthogonality_error: float = 1e-4
+    max_determinant_error: float = 1e-4
 
     def __post_init__(self) -> None:
         _check_mode(self.mode)
@@ -68,6 +70,8 @@ class PoseGateConfig:
         _check_float_nonnegative(self.max_translation_step_ratio, "max_translation_step_ratio")
         if self.reference_lookback < 0:
             raise ValueError(f"reference_lookback must be >= 0, got {self.reference_lookback}")
+        _check_float_nonnegative(self.max_orthogonality_error, "max_orthogonality_error")
+        _check_float_nonnegative(self.max_determinant_error, "max_determinant_error")
 
 
 @dataclass(frozen=True)
@@ -141,6 +145,8 @@ class QualityGateConfig:
                 "max_rotation_step_deg": self.pose.max_rotation_step_deg,
                 "max_translation_step_ratio": self.pose.max_translation_step_ratio,
                 "reference_lookback": self.pose.reference_lookback,
+                "max_orthogonality_error": self.pose.max_orthogonality_error,
+                "max_determinant_error": self.pose.max_determinant_error,
             },
             "vda": {
                 "mode": self.vda.mode,
@@ -163,6 +169,7 @@ class QualityGateConfig:
 # ---------------------------------------------------------------------------
 
 _CHKPNT_RE = re.compile(r"chkpnt(\d+)\.pth$")
+_ITER_DIR_RE = re.compile(r"iteration_(\d+)$")
 
 
 def audit_pose_quality(
@@ -263,11 +270,21 @@ def audit_pose_quality(
         mp = Path(model_path)
         found_iter: int | None = None
         if mp.is_dir():
+            # Look for chkpnt*.pth files (used in tests)
             for child in mp.iterdir():
                 m = _CHKPNT_RE.match(child.name)
                 if m:
                     found_iter = int(m.group(1))
                     break
+            # Also look for point_cloud/iteration_*/ convention (real backend)
+            if found_iter is None:
+                pc_dir = mp / "point_cloud"
+                if pc_dir.is_dir():
+                    for child in pc_dir.iterdir():
+                        m = _ITER_DIR_RE.match(child.name)
+                        if m:
+                            found_iter = int(m.group(1))
+                            break
         if found_iter is None:
             reasons.append(
                 f"native checkpoint not found in {mp} "
