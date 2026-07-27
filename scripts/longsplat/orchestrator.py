@@ -45,6 +45,7 @@ from .run_record import (
 )
 from .telemetry import (
     summarize_conversion_telemetry,
+    summarize_loss_telemetry,
     summarize_pose_telemetry,
     summarize_vda_telemetry,
 )
@@ -565,6 +566,34 @@ def run_pipeline(
                 )
                 return 1
             _echo("VDA audit passed.")
+
+        # --- 8e. Post-training non-finite loss gate ---
+        loss_telemetry = summarize_loss_telemetry(train_result.stdout)
+        record.setdefault("quality_gates", {})["loss"] = {
+            "passed": not loss_telemetry["has_nonfinite"],
+            "has_nonfinite": loss_telemetry["has_nonfinite"],
+            "record_count": loss_telemetry["record_count"],
+        }
+        write_run_record(record, run_dir)
+
+        if loss_telemetry["has_nonfinite"]:
+            transition_status(
+                record,
+                run_dir,
+                RunStatus.FAILED,
+                stage="loss_finite_gate",
+                details={
+                    "status": "failed",
+                    "reason": "non-finite loss detected in training telemetry",
+                    "telemetry": loss_telemetry,
+                },
+            )
+            _echo(
+                "Loss audit FAILED: non-finite loss detected in LOSS_TELEMETRY",
+                file=sys.stderr,
+            )
+            return 1
+        _echo("Loss audit passed.")
 
         # --- 9. Run conversion ---
         _echo("Running conversion ...")

@@ -139,3 +139,19 @@ def summarize_conversion_telemetry(stdout: str) -> dict[str, Any]:
         and all(_all_record_scales_finite(record) for record in records),
         "records": records,
     }
+
+
+def summarize_loss_telemetry(stdout: str) -> dict[str, Any]:
+    """Summarize LOSS_TELEMETRY and detect non-finite episodes."""
+    records = parse_json_markers(stdout, "LOSS_TELEMETRY")
+    has_nonfinite = any(
+        record.get("finite") is False for record in records
+    )
+    totals = _finite_values(records, "total")
+    return {
+        "has_nonfinite": has_nonfinite,
+        "record_count": len(records),
+        "max_total": max(totals) if totals else None,
+        "min_total": min(totals) if totals else None,
+        "records": records,
+    }
