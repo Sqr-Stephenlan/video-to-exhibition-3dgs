@@ -61,18 +61,43 @@ def _finite_values(records: list[dict[str, Any]], key: str) -> list[float]:
 
 
 def summarize_pose_telemetry(stdout: str) -> dict[str, Any]:
-    """Summarize incremental PnP attempts while retaining per-frame records."""
+    """Summarize incremental PnP attempts while retaining per-frame records.
+
+    Returns a schema with per-camera acceptance tracking and quality
+    metrics suitable for post-training pose audit gating.
+    """
     records = parse_json_markers(stdout, "POSE_TELEMETRY")
     successes = sum(record.get("success") is True for record in records)
+
+    # Per-camera acceptance: unique frames with at least one successful attempt.
+    accepted_frames: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        frame = record.get("frame")
+        if isinstance(frame, str) and frame not in seen:
+            seen.add(frame)
+            if record.get("success") is True:
+                accepted_frames.append(frame)
+
     inlier_ratios = _finite_values(records, "inlier_ratio")
     reprojection_errors = _finite_values(records, "reprojection_rmse_px")
+    grid_coverages = _finite_values(records, "grid_coverage")
+    rotation_steps = _finite_values(records, "rotation_step_deg")
+    translation_steps = _finite_values(records, "translation_step")
+
     return {
-        "pnp_attempts": len(records),
-        "pnp_successes": successes,
-        "pnp_failures": len(records) - successes,
+        "attempt_count": len(records),
+        "accepted_camera_count": len(accepted_frames),
+        "rejected_attempt_count": len(records) - successes,
+        "accepted_frames": sorted(accepted_frames),
         "min_inlier_ratio": min(inlier_ratios) if inlier_ratios else None,
         "max_reprojection_rmse_px": (
             max(reprojection_errors) if reprojection_errors else None
+        ),
+        "min_grid_coverage": min(grid_coverages) if grid_coverages else None,
+        "max_rotation_step_deg": max(rotation_steps) if rotation_steps else None,
+        "max_translation_step_ratio": (
+            max(translation_steps) if translation_steps else None
         ),
         "records": records,
     }

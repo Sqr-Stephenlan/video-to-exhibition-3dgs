@@ -2,14 +2,20 @@
 
 Defines :class:`PoseGateConfig`, :class:`VdaGateConfig`,
 :class:`PlyGateConfig`, and the top-level :class:`QualityGateConfig` that
-aggregates them.
+aggregates them.  Also provides :func:`audit_pose_quality` for post-training
+pose verification before conversion.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
+
+import numpy as np
 
 GateMode = Literal["off", "observe", "enforce"]
 _VALID_MODES = frozenset({"off", "observe", "enforce"})
@@ -150,3 +156,135 @@ class QualityGateConfig:
                 "min_unit_quaternion_fraction": self.ply.min_unit_quaternion_fraction,
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# Post-training pose audit
+# ---------------------------------------------------------------------------
+
+_CHKPNT_RE = re.compile(r"chkpnt(\d+)\.pth$")
+
+
+def audit_pose_quality(
+    cameras_path: Path,
+    pose_telemetry: dict[str, Any],
+    *,
+    model_path: Path | None = None,
+    expected_native_checkpoint_iteration: int | None = None,
+    max_orthogonality_error: float = 1e-4,
+    max_determinant_error: float = 1e-4,
+    max_rotation_step_deg: float = 25.0,
+    max_translation_step_ratio: float = 6.0,
+) -> dict[str, Any]:
+    """Audit camera poses post-training, before conversion.
+
+    Hard gates verified:
+    - All R/T finite
+    - max orthogonality error ≤ threshold
+    - max |det(R)-1| ≤ threshold
+    - max rotation step ≤ threshold
+    - max translation step / median step ≤ threshold
+    - accepted terminal frame count equals train camera count
+    - native checkpoint exists at expected iteration (when configured)
+
+    Returns a dict with ``passed``, ``reasons`` (failure reasons),
+    ``trajectory``, and ``telemetry``.
+    """
+    from .quality_metrics import analyze_camera_trajectory
+
+    reasons: list[str] = []
+    cameras_path = Path(cameras_path)
+
+    # --- 1. Trajectory audit ---
+    trajectory = analyze_camera_trajectory(cameras_path)
+
+    if not trajectory.get("all_rotations_finite", False):
+        reasons.append("non-finite rotation matrix detected")
+    if not trajectory.get("all_positions_finite", False):
+        reasons.append("non-finite position vector detected")
+
+    max_ortho = trajectory.get("max_orthogonality_error")
+    if max_ortho is not None and max_ortho > max_orthogonality_error:
+        reasons.append(
+            f"max orthogonality error {max_ortho:.2e} > {max_orthogonality_error:.1e}"
+        )
+
+    max_det = trajectory.get("max_determinant_error")
+    if max_det is not None and max_det > max_determinant_error:
+        reasons.append(
+            f"max determinant error {max_det:.2e} > {max_determinant_error:.1e}"
+        )
+
+    max_rot = trajectory.get("max_rotation_step_deg", 0.0) or 0.0
+    if max_rot > max_rotation_step_deg:
+        reasons.append(
+            f"max rotation step {max_rot:.2f}° > {max_rotation_step_deg}°"
+        )
+
+    # Translation step ratio: max consecutive step / median step
+    max_trans = trajectory.get("max_translation_step", 0.0) or 0.0
+    if max_trans > 0:
+        cam_count = trajectory.get("camera_count", 0)
+        if cam_count >= 2:
+            # Compute per-pair steps for median reference
+            with open(cameras_path, encoding="utf-8") as fh:
+                cameras = json.load(fh)
+            positions = []
+            for cam in cameras:
+                t = np.array(
+                    cam.get("T", cam.get("position")), dtype=np.float64
+                )
+                if np.all(np.isfinite(t)):
+                    positions.append(t)
+            if len(positions) >= 2:
+                steps = [
+                    float(np.linalg.norm(positions[i] - positions[i - 1]))
+                    for i in range(1, len(positions))
+                ]
+                median_step = float(np.median(steps)) if steps else 1.0
+                if median_step > 1e-12:
+                    ratio = max_trans / median_step
+                    if ratio > max_translation_step_ratio:
+                        reasons.append(
+                            f"max translation step ratio {ratio:.2f} "
+                            f"> {max_translation_step_ratio}"
+                        )
+
+    # --- 2. Camera acceptance check ---
+    accepted_count = pose_telemetry.get("accepted_camera_count", 0)
+    camera_count = trajectory.get("camera_count", 0)
+    if accepted_count != camera_count:
+        reasons.append(
+            f"accepted cameras {accepted_count} != train cameras {camera_count}"
+        )
+
+    # --- 3. Native checkpoint check ---
+    if expected_native_checkpoint_iteration is not None and model_path is not None:
+        mp = Path(model_path)
+        found_iter: int | None = None
+        if mp.is_dir():
+            for child in mp.iterdir():
+                m = _CHKPNT_RE.match(child.name)
+                if m:
+                    found_iter = int(m.group(1))
+                    break
+        if found_iter is None:
+            reasons.append(
+                f"native checkpoint not found in {mp} "
+                f"(expected iteration {expected_native_checkpoint_iteration})"
+            )
+        elif found_iter != expected_native_checkpoint_iteration:
+            reasons.append(
+                f"native checkpoint iteration {found_iter} "
+                f"!= expected {expected_native_checkpoint_iteration}"
+            )
+
+    return {
+        "passed": len(reasons) == 0,
+        "reasons": reasons,
+        "trajectory": trajectory,
+        "telemetry": {
+            "accepted_camera_count": accepted_count,
+            "camera_count": camera_count,
+        },
+    }

@@ -58,7 +58,7 @@ def _make_fake_backend(tmp_path: Path) -> Path:
         import json, sys, os
         with open("orchestrator_test_sentinel.json", "w") as fh:
             json.dump({"script": "train", "cwd": os.getcwd(), "argv": sys.argv}, fh)
-        # Write a dummy cameras file that the pipeline copies for convert
+        # Write a valid cameras file and checkpoint so the pose audit gate passes.
         model_path = None
         for i, a in enumerate(sys.argv):
             if a == "--model_path" and i + 1 < len(sys.argv):
@@ -66,20 +66,33 @@ def _make_fake_backend(tmp_path: Path) -> Path:
                 break
         if model_path:
             os.makedirs(model_path, exist_ok=True)
+            # Single valid SO(3) camera matching the telemetry below
+            cameras = [{
+                "R": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                "T": [0.0, 0.0, 1.0],
+            }]
             with open(os.path.join(model_path, "cameras_all_train.json"), "w") as f:
-                json.dump([], f)
+                json.dump(cameras, f)
+            # Write a dummy native checkpoint so the iteration check can pass
+            # when expected_native_checkpoint_iteration matches.
+            chkpnt_iter = os.environ.get("FAKE_CHKPNT_ITERATION", "")
+            if chkpnt_iter:
+                chkpnt_path = os.path.join(model_path, f"chkpnt{chkpnt_iter}.pth")
+                with open(chkpnt_path, "w") as f:
+                    f.write("dummy")
+        # Emit POSE_TELEMETRY matching the camera count
+        print('POSE_TELEMETRY {"frame":"frame_000000","inlier_count":8,'
+              '"inlier_ratio":0.8,"match_count":10,"method":"pnp_ransac",'
+              '"reprojection_rmse_px":1.25,"stage":"incremental",'
+              '"success":true}')
         # Emit VDA_USAGE markers so integration tests can assert real stdout
         depth_source = None
         for i, a in enumerate(sys.argv):
             if a == "--depth_source" and i + 1 < len(sys.argv):
                 depth_source = sys.argv[i + 1]
                 break
-        print('POSE_TELEMETRY {"frame":"frame_000002","inlier_count":8,'
-              '"inlier_ratio":0.8,"match_count":10,"method":"pnp_ransac",'
-              '"reprojection_rmse_px":1.25,"stage":"incremental",'
-              '"success":true}')
         if depth_source == "vda":
-            print('VDA_TELEMETRY {"correlation":0.91,"frame":"frame_000002",'
+            print('VDA_TELEMETRY {"correlation":0.91,"frame":"frame_000000",'
                   '"inlier_ratio":0.88,"result":"aligned",'
                   '"stage":"incremental"}')
             print("VDA_USAGE result=aligned stage=scene_init frame=frame_000000")
@@ -514,8 +527,8 @@ def test_orchestrator_fake_backend_train_fails(tmp_path):
     assert len(run_dirs) == 1
     record = json.loads((run_dirs[0] / "reconstruction_run.json").read_text())
     assert record["status"] == "failed"
-    assert record["telemetry"]["pose"]["pnp_attempts"] == 1
-    assert record["telemetry"]["pose"]["pnp_successes"] == 1
+    assert record["telemetry"]["pose"]["attempt_count"] == 1
+    assert record["telemetry"]["pose"]["accepted_camera_count"] == 1
 
 
 def test_orchestrator_rejects_non_git_backend(tmp_path):
@@ -2111,8 +2124,8 @@ def test_vda_usage_markers_captured_in_run_record(tmp_path):
         record = json.loads((run_dirs[0] / "reconstruction_run.json").read_text())
         assert record["status"] == "complete"
         assert record["depth"]["usage"] == {"aligned": 3, "missing": 0, "rejected": 0}
-        assert record["telemetry"]["pose"]["pnp_attempts"] == 1
-        assert record["telemetry"]["pose"]["pnp_successes"] == 1
+        assert record["telemetry"]["pose"]["attempt_count"] == 1
+        assert record["telemetry"]["pose"]["accepted_camera_count"] == 1
         assert record["telemetry"]["vda"]["aligned"] == 1
         assert record["telemetry"]["vda"]["min_correlation"] == 0.91
         assert record["telemetry"]["conversion"]["all_scales_finite"] is True
@@ -2121,6 +2134,399 @@ def test_vda_usage_markers_captured_in_run_record(tmp_path):
         # The fake train.py writes to cwd which is the backend repo root.
         sentinel = json.loads((backend / "orchestrator_test_sentinel.json").read_text())
         assert sentinel["script"] == "train"
+    finally:
+        _runner.LONGSPLAT_COMMIT = orig_commit
+        _runner._LONGSPLAT_SUBMODULE_LINKS.clear()
+        _runner._LONGSPLAT_SUBMODULE_LINKS.update(orig_links)
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Post-training pose audit — unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_camera_entry(R=None, T=None):
+    """Build a single camera dict with rotation and position."""
+    import numpy as np
+
+    if R is None:
+        R = np.eye(3, dtype=np.float64)
+    if T is None:
+        T = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    return {
+        "R": R.tolist() if isinstance(R, np.ndarray) else R,
+        "T": T.tolist() if isinstance(T, np.ndarray) else T,
+    }
+
+
+def _write_cameras_json(path, cameras):
+    """Write a list of camera dicts as JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cameras, indent=2), encoding="utf-8")
+
+
+def test_audit_pose_quality_all_legal(tmp_path):
+    """Scenario 6: all cameras valid → passes."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    cameras = [
+        _make_camera_entry(T=[0.0, 0.0, 1.0]),
+        _make_camera_entry(T=[0.1, 0.0, 1.0]),
+        _make_camera_entry(T=[0.2, 0.0, 1.0]),
+    ]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    telemetry = {
+        "accepted_camera_count": 3,
+        "accepted_frames": ["frame_000000", "frame_000001", "frame_000002"],
+        "attempt_count": 3,
+        "rejected_attempt_count": 0,
+        "records": [
+            {"frame": "frame_000000", "success": True},
+            {"frame": "frame_000001", "success": True},
+            {"frame": "frame_000002", "success": True},
+        ],
+    }
+
+    result = audit_pose_quality(cams_path, telemetry)
+    assert result["passed"] is True, f"unexpected reasons: {result['reasons']}"
+    assert result["reasons"] == []
+
+
+def test_audit_pose_quality_missing_pose_marker(tmp_path):
+    """Scenario 1: no accepted cameras in telemetry → fails."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    cameras = [
+        _make_camera_entry(T=[0.0, 0.0, 1.0]),
+        _make_camera_entry(T=[0.1, 0.0, 1.0]),
+    ]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    telemetry = {
+        "accepted_camera_count": 0,
+        "accepted_frames": [],
+        "attempt_count": 0,
+        "rejected_attempt_count": 0,
+        "records": [],
+    }
+
+    result = audit_pose_quality(cams_path, telemetry)
+    assert result["passed"] is False
+    assert any("accepted cameras 0 != train cameras 2" in r for r in result["reasons"])
+
+
+def test_audit_pose_quality_camera_not_accepted(tmp_path):
+    """Scenario 2: one camera without accepted terminal state → fails."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    cameras = [
+        _make_camera_entry(T=[0.0, 0.0, 1.0]),
+        _make_camera_entry(T=[0.1, 0.0, 1.0]),
+        _make_camera_entry(T=[0.2, 0.0, 1.0]),
+    ]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    telemetry = {
+        "accepted_camera_count": 2,
+        "accepted_frames": ["frame_000000", "frame_000001"],
+        "attempt_count": 3,
+        "rejected_attempt_count": 1,
+        "records": [
+            {"frame": "frame_000000", "success": True},
+            {"frame": "frame_000001", "success": True},
+            {"frame": "frame_000002", "success": False},
+        ],
+    }
+
+    result = audit_pose_quality(cams_path, telemetry)
+    assert result["passed"] is False
+    assert any("accepted cameras 2 != train cameras 3" in r for r in result["reasons"])
+
+
+def test_audit_pose_quality_det_error(tmp_path):
+    """Scenario 3: camera with det 0.96 → fails SO(3) check."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    # Create a rotation matrix scaled to have det ≈ 0.96
+    R_bad = np.eye(3, dtype=np.float64) * 0.986  # det ≈ 0.96
+    cameras = [
+        _make_camera_entry(R=np.eye(3), T=[0.0, 0.0, 1.0]),
+        _make_camera_entry(R=R_bad, T=[0.1, 0.0, 1.0]),
+    ]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    telemetry = {
+        "accepted_camera_count": 2,
+        "accepted_frames": ["frame_000000", "frame_000001"],
+        "attempt_count": 2,
+        "rejected_attempt_count": 0,
+        "records": [
+            {"frame": "frame_000000", "success": True},
+            {"frame": "frame_000001", "success": True},
+        ],
+    }
+
+    result = audit_pose_quality(cams_path, telemetry)
+    assert result["passed"] is False
+    assert any("determinant error" in r for r in result["reasons"])
+
+
+def test_audit_pose_quality_large_rotation_step(tmp_path):
+    """Scenario 4: 142° rotation step → fails continuity check."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    # Build two cameras with a ~142° relative rotation around Z
+    theta = np.deg2rad(142.0)
+    R0 = np.eye(3)
+    R1 = np.array([
+        [np.cos(theta), -np.sin(theta), 0],
+        [np.sin(theta), np.cos(theta), 0],
+        [0, 0, 1],
+    ])
+    cameras = [
+        _make_camera_entry(R=R0, T=[0.0, 0.0, 1.0]),
+        _make_camera_entry(R=R1, T=[0.01, 0.0, 1.0]),
+    ]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    telemetry = {
+        "accepted_camera_count": 2,
+        "accepted_frames": ["frame_000000", "frame_000001"],
+        "attempt_count": 2,
+        "rejected_attempt_count": 0,
+        "records": [
+            {"frame": "frame_000000", "success": True},
+            {"frame": "frame_000001", "success": True},
+        ],
+    }
+
+    result = audit_pose_quality(cams_path, telemetry)
+    assert result["passed"] is False
+    assert any("rotation step" in r for r in result["reasons"])
+
+
+def test_audit_pose_quality_large_translation_step(tmp_path):
+    """Scenario 5: translation step 10x median → fails continuity check."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    # 3 cameras: small steps, then a giant jump
+    cameras = [
+        _make_camera_entry(T=[0.0, 0.0, 1.0]),
+        _make_camera_entry(T=[0.1, 0.0, 1.0]),
+        _make_camera_entry(T=[0.2, 0.0, 1.0]),
+        _make_camera_entry(T=[5.0, 0.0, 1.0]),  # ~48x median step of ~0.1
+    ]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    telemetry = {
+        "accepted_camera_count": 4,
+        "accepted_frames": [
+            "frame_000000", "frame_000001", "frame_000002", "frame_000003",
+        ],
+        "attempt_count": 4,
+        "rejected_attempt_count": 0,
+        "records": [
+            {"frame": f"frame_{i:06d}", "success": True} for i in range(4)
+        ],
+    }
+
+    result = audit_pose_quality(cams_path, telemetry)
+    assert result["passed"] is False
+    assert any("translation step ratio" in r for r in result["reasons"])
+
+
+def test_audit_pose_quality_nonfinite_rotation(tmp_path):
+    """Camera with NaN in rotation matrix → fails."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    R_bad = np.eye(3, dtype=np.float64)
+    R_bad[0, 0] = np.nan
+    cameras = [
+        _make_camera_entry(R=np.eye(3), T=[0.0, 0.0, 1.0]),
+        _make_camera_entry(R=R_bad, T=[0.1, 0.0, 1.0]),
+    ]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    telemetry = {
+        "accepted_camera_count": 2,
+        "accepted_frames": ["frame_000000", "frame_000001"],
+        "attempt_count": 2,
+        "rejected_attempt_count": 0,
+        "records": [
+            {"frame": "frame_000000", "success": True},
+            {"frame": "frame_000001", "success": True},
+        ],
+    }
+
+    result = audit_pose_quality(cams_path, telemetry)
+    assert result["passed"] is False
+    assert any("non-finite" in r for r in result["reasons"])
+
+
+def test_audit_pose_quality_native_checkpoint_missing(tmp_path):
+    """Expected checkpoint not found → fails."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    cameras = [_make_camera_entry(T=[0.0, 0.0, 1.0])]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+
+    telemetry = {
+        "accepted_camera_count": 1,
+        "accepted_frames": ["frame_000000"],
+        "attempt_count": 1,
+        "rejected_attempt_count": 0,
+        "records": [{"frame": "frame_000000", "success": True}],
+    }
+
+    result = audit_pose_quality(
+        cams_path,
+        telemetry,
+        model_path=model_path,
+        expected_native_checkpoint_iteration=30050,
+    )
+    assert result["passed"] is False
+    assert any("checkpoint not found" in r for r in result["reasons"])
+
+
+def test_audit_pose_quality_native_checkpoint_wrong_iteration(tmp_path):
+    """Checkpoint exists at wrong iteration → fails."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    cameras = [_make_camera_entry(T=[0.0, 0.0, 1.0])]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    (model_path / "chkpnt100.pth").write_text("dummy")
+
+    telemetry = {
+        "accepted_camera_count": 1,
+        "accepted_frames": ["frame_000000"],
+        "attempt_count": 1,
+        "rejected_attempt_count": 0,
+        "records": [{"frame": "frame_000000", "success": True}],
+    }
+
+    result = audit_pose_quality(
+        cams_path,
+        telemetry,
+        model_path=model_path,
+        expected_native_checkpoint_iteration=30050,
+    )
+    assert result["passed"] is False
+    assert any("100 != expected 30050" in r for r in result["reasons"])
+
+
+def test_audit_pose_quality_native_checkpoint_matches(tmp_path):
+    """Checkpoint at expected iteration → passes (combined with legal poses)."""
+    from scripts.longsplat.quality_gates import audit_pose_quality
+
+    cameras = [_make_camera_entry(T=[0.0, 0.0, 1.0])]
+    cams_path = tmp_path / "cameras_all_train.json"
+    _write_cameras_json(cams_path, cameras)
+
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    (model_path / "chkpnt30050.pth").write_text("dummy")
+
+    telemetry = {
+        "accepted_camera_count": 1,
+        "accepted_frames": ["frame_000000"],
+        "attempt_count": 1,
+        "rejected_attempt_count": 0,
+        "records": [{"frame": "frame_000000", "success": True}],
+    }
+
+    result = audit_pose_quality(
+        cams_path,
+        telemetry,
+        model_path=model_path,
+        expected_native_checkpoint_iteration=30050,
+    )
+    assert result["passed"] is True, f"unexpected reasons: {result['reasons']}"
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Orchestrator integration — pose audit gate
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_pose_audit_gate_blocks_conversion_on_bad_poses(tmp_path):
+    """Orchestrator fails at pose_quality_gate when poses are bad (det error)."""
+    import subprocess as sp
+
+    backend = _make_fake_backend(tmp_path)
+    manifest = _make_producer_manifest(tmp_path)
+    output_dir = tmp_path / "outputs"
+
+    import scripts.longsplat.runner as _runner
+    from unittest import mock
+
+    fake_commit = sp.run(
+        ["git", "-C", str(backend), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    orig_commit = _runner.LONGSPLAT_COMMIT
+    orig_links = dict(_runner._LONGSPLAT_SUBMODULE_LINKS)
+    _runner.LONGSPLAT_COMMIT = fake_commit
+    for sub_key in list(_runner._LONGSPLAT_SUBMODULE_LINKS.keys()):
+        sp_path = backend / sub_key
+        r = sp.run(
+            ["git", "-C", str(sp_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        _runner._LONGSPLAT_SUBMODULE_LINKS[sub_key] = r.stdout.strip()
+
+    try:
+        with mock.patch(
+            "scripts.longsplat.orchestrator.audit_pose_quality",
+            return_value={
+                "passed": False,
+                "reasons": ["max determinant error 4.00e-02 > 1.0e-04"],
+                "trajectory": {"camera_count": 3},
+                "telemetry": {"accepted_camera_count": 3, "camera_count": 3},
+            },
+        ):
+            exit_code = run_pipeline(
+                manifest_path=manifest,
+                segment_id="seg_01",
+                config=LongSplatConfig(
+                    source_path="",
+                    model_path="",
+                    iterations=100,
+                    seed=0,
+                    backend_mode="research_local",
+                ),
+                repo_root=backend,
+                output_dir=output_dir,
+                project_root=tmp_path,
+                python_exe=sys.executable,
+            )
+
+        assert exit_code == 1, f"pose audit gate must reject bad poses, got {exit_code}"
+
+        run_dirs = list(output_dir.iterdir())
+        assert len(run_dirs) == 1
+        record = json.loads((run_dirs[0] / "reconstruction_run.json").read_text())
+        assert record["status"] == "failed"
+        assert "pose_quality_gate" in record["stages"]
+        assert "determinant error" in str(record["stages"]["pose_quality_gate"])
     finally:
         _runner.LONGSPLAT_COMMIT = orig_commit
         _runner._LONGSPLAT_SUBMODULE_LINKS.clear()

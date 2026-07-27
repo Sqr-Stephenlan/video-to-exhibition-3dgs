@@ -35,6 +35,7 @@ from .depth_bridge import (
 from .manifest_adapter import adapt_manifest
 from .prepare_input import prepare_input
 from .provenance import sha256_file
+from .quality_gates import audit_pose_quality
 from .run_record import (
     RunStatus,
     add_artifact,
@@ -426,6 +427,56 @@ def run_pipeline(
                 raise PipelineError(
                     "VDA was requested but no frame reported aligned depth"
                 )
+
+        # --- 8c. Post-training pose audit ---
+        cameras_json = Path(config.model_path) / "cameras_all_train.json"
+        if cameras_json.is_file():
+            _echo("Auditing camera poses ...")
+            pose_telemetry = telemetry.get("pose", {})
+            audit_kwargs: dict[str, Any] = {}
+            if config.expected_native_checkpoint_iteration is not None:
+                audit_kwargs["model_path"] = Path(config.model_path)
+                audit_kwargs["expected_native_checkpoint_iteration"] = (
+                    config.expected_native_checkpoint_iteration
+                )
+            audit_result = audit_pose_quality(
+                cameras_json, pose_telemetry, **audit_kwargs
+            )
+            record.setdefault("quality_gates", {})["pose"] = {
+                "thresholds": {
+                    "max_orthogonality_error": 1e-4,
+                    "max_determinant_error": 1e-4,
+                    "max_rotation_step_deg": 25.0,
+                    "max_translation_step_ratio": 6.0,
+                },
+                "passed": audit_result["passed"],
+                "reasons": audit_result["reasons"],
+                "trajectory": audit_result["trajectory"],
+                "telemetry": audit_result["telemetry"],
+            }
+            write_run_record(record, run_dir)
+
+            if not audit_result["passed"]:
+                transition_status(
+                    record,
+                    run_dir,
+                    RunStatus.FAILED,
+                    stage="pose_quality_gate",
+                    details={
+                        "status": "failed",
+                        "reasons": audit_result["reasons"],
+                        "trajectory": audit_result["trajectory"],
+                        "telemetry": audit_result["telemetry"],
+                    },
+                )
+                _echo(
+                    f"Pose audit FAILED: {'; '.join(audit_result['reasons'])}",
+                    file=sys.stderr,
+                )
+                return 1
+            _echo("Pose audit passed.")
+        else:
+            _echo("No cameras_all_train.json found, skipping pose audit.")
 
         # --- 9. Run conversion ---
         _echo("Running conversion ...")

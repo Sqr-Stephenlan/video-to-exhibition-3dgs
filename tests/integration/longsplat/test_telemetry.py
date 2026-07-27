@@ -20,9 +20,10 @@ def test_summarize_pose_telemetry_keeps_frame_metrics():
 
     summary = summarize_pose_telemetry(stdout)
 
-    assert summary["pnp_attempts"] == 1
-    assert summary["pnp_successes"] == 1
-    assert summary["pnp_failures"] == 0
+    assert summary["attempt_count"] == 1
+    assert summary["accepted_camera_count"] == 1
+    assert summary["rejected_attempt_count"] == 0
+    assert summary["accepted_frames"] == ["f4"]
     assert summary["min_inlier_ratio"] == 0.8
     assert summary["max_reprojection_rmse_px"] == 1.25
     assert summary["records"][0]["frame"] == "f4"
@@ -101,9 +102,10 @@ def test_numeric_summaries_ignore_booleans_strings_and_missing_values():
 
     summary = summarize_pose_telemetry(stdout)
 
-    assert summary["pnp_attempts"] == 2
-    assert summary["pnp_successes"] == 1
-    assert summary["pnp_failures"] == 1
+    assert summary["attempt_count"] == 2
+    assert summary["accepted_camera_count"] == 0
+    assert summary["rejected_attempt_count"] == 1
+    assert summary["accepted_frames"] == []  # no records have a string frame field
     assert summary["min_inlier_ratio"] is None
     assert summary["max_reprojection_rmse_px"] is None
 
