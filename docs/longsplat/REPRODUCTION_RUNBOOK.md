@@ -165,6 +165,34 @@ for historical exports.
 Replace `smoke.json` / `smoke_vda.json` with `full.json` / `full_vda.json`.
 Adjust `iterations` in config as needed (default 30000).
 
+## Isolated checkpoint reconversion
+
+Re-convert an existing LongSplat checkpoint without touching the original
+model directory.  Useful for diagnosing conversion-only issues.
+
+```powershell
+# Dry-run first
+./dev.sh python -m scripts.longsplat.reconvert_existing `
+  --source-model outputs/wall_test/<existing_run> `
+  --destination-model outputs/wall_test/<new_run> `
+  --source-path data/frames/wall_test `
+  --repo-root third_party/LongSplat `
+  --backend-python D:/video-to-exhibition-3dgs/venv/Scripts/python.exe `
+  --backend-mode research_local `
+  --checkpoint-iteration 50000 `
+  --conversion-iterations 100 `
+  --prune-ratio 0.6 `
+  --output-record outputs/wall_test/<new_run>/reconversion_record.json `
+  --dry-run
+
+# Real execution (omit --dry-run)
+```
+
+The snapshot copies only cfg_args, camera JSON files, and the specified
+checkpoint iteration (PLY + 3 MLP files).  ``cameras_all_train.json`` is
+duplicated as ``cameras_all.json`` for the Eval loader.  The original model
+is never modified (SHA verified before and after).
+
 ## Output structure
 
 ```
