@@ -67,6 +67,25 @@ but sample PNG frames directly from the source video:
 Use `--force` only when replacing generated outputs for the same `video_id` is
 intended. Without `--force`, existing output directories are protected.
 
+For the opt-in coverage-aware selector, use the checked-in profile. The default
+remains `legacy` for reproducibility. For a single-variable A/B, run the same
+source once with `coverage_v1_legacy_control.json` and once with
+`coverage_v1.json`; those files differ only by `keyframe_policy`:
+
+```bash
+./dev.sh python scripts/preprocess_video.py data/raw_videos/sample.mp4 \
+  --video-id sample_coverage \
+  --config configs/preprocess/coverage_v1.json \
+  --force
+```
+
+`coverage_v1` performs a first pass at fixed analysis resolutions, calibrates
+the blur floor per segment, and uses adjacent-frame optical-flow/affine
+measurements as a 2D trackability and shake proxy. These measurements are not
+camera pose or 3D geometry. A failed quality gate returns exit code `2` and
+keeps the manifest/report for diagnosis; it never silently falls back to
+legacy selection.
+
 ## CLI Options
 
 The single entrypoint is:
@@ -97,6 +116,11 @@ The single entrypoint is:
 | `--save-rejected` / `--no-save-rejected` | `false` | Control whether rejected frame images are written. Manifest rows are always written. |
 | `--frame-format` | `jpg` | Frame image format: `jpg` or `png`. |
 | `--frame-source` | `segment` | Sample frames from generated segment MP4s or directly from the source video. |
+| `--keyframe-policy` | `legacy` | `legacy` or explicit `coverage_v1` selector. |
+| `--quality-analysis-long-edge` | `512` | Fixed long edge used for calibrated blur analysis. |
+| `--flow-analysis-long-edge` | `320` | Fixed long edge used for adjacent-frame motion analysis. |
+| `--selection-min-gap-sec`, `--selection-target-gap-sec`, `--selection-max-gap-sec` | `0.1`, `0.2`, `0.3` | Coverage cadence and hard maximum gap for `coverage_v1`. |
+| `--audit-manifest PATH` | none | Validate selected paths, decodability, ordering, and quality status; returns `0` or `2`. |
 | `--force` | `false` | Transactionally replace generated outputs for the same `video_id` after a new run succeeds. |
 
 Presets:
@@ -150,6 +174,8 @@ data/manifests/sample/
   frames_manifest.json
 ```
 
+Coverage-aware runs add `keyframe_quality_report.json` beside the manifest.
+
 Rejected images are written only with `--save-rejected`. Rejected frame manifest
 entries still exist when rejected images are not saved, with `path` set to
 `null`.
@@ -198,6 +224,13 @@ id, segment_id, path, timestamp_sec, frame_index, width, height, selected,
 blur_score, overexposed_ratio, underexposed_ratio, motion_score,
 duplicate_score, matched_frame_id, sha256, reject_reasons
 ```
+
+When `keyframe_policy` is `coverage_v1`, rows also carry
+`calibrated_blur_score` and a `keyframe` object containing the policy decision,
+reference frame, adaptive threshold, quality score, bridge flag, and 2D motion
+diagnostics. `summary.keyframe_quality` reports status, maximum selected gap,
+component count, bridge count, thresholds, and failed segments. Consumers must
+use only coverage manifests whose quality `status` is `"passed"`.
 
 `summary` includes total segment/frame counts, selected and rejected frame
 counts, per-segment frame counts, reject counts by reason, and observed selected
@@ -326,6 +359,13 @@ bad frames while keeping enough coverage for downstream reconstruction.
   it off for production-style runs when disk pressure matters.
 - Prefer `--frame-source source --frame-format png` for final reconstruction
   frame sets when storage allows it.
+- For `coverage_v1`, inspect `keyframe_quality_report.json` and audit the
+  manifest before handing frames to a downstream reconstruction adapter:
+
+```bash
+./dev.sh python scripts/preprocess_video.py \
+  --audit-manifest data/manifests/<video_id>/frames_manifest.json
+```
 
 Suggested real-video loop:
 

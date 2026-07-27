@@ -41,6 +41,22 @@ def test_resolve_settings_keeps_existing_defaults_without_config() -> None:
         "save_rejected": False,
         "frame_format": "jpg",
         "frame_source": "segment",
+        "keyframe_policy": "legacy",
+        "quality_analysis_long_edge": 512,
+        "flow_analysis_long_edge": 320,
+        "adaptive_blur_percentile": 15.0,
+        "selection_min_gap_sec": 0.1,
+        "selection_target_gap_sec": 0.2,
+        "selection_max_gap_sec": 0.3,
+        "duplicate_window_sec": 2.0,
+        "min_tracked_points": 64,
+        "min_motion_inlier_ratio": 0.65,
+        "min_motion_grid_coverage": 0.375,
+        "max_motion_residual_diag_ratio": 0.015,
+        "max_median_displacement_diag_ratio": 0.25,
+        "max_affine_rotation_deg": 12.0,
+        "min_affine_scale": 0.8,
+        "max_affine_scale": 1.25,
     }
 
 
@@ -637,6 +653,50 @@ def test_preprocess_smoke_with_source_png_frames(tmp_path: Path, monkeypatch: py
     for relative_path in selected_paths:
         output_path = tmp_path / relative_path
         assert output_path.exists()
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required for preprocess smoke tests",
+)
+def test_preprocess_coverage_v1_writes_quality_report_and_audits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = Path("synthetic.mp4")
+    output_root = Path("data")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=2",
+            "-pix_fmt", "yuv420p", str(source),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = pv.main(
+        [
+            str(source), "--video-id", "coverage", "--output-root", str(output_root),
+            "--segment-method", "time", "--segment-length-sec", "1.5",
+            "--segment-overlap-sec", "0", "--target-fps", "2",
+            "--blur-threshold", "0", "--keyframe-policy", "coverage_v1",
+            "--selection-target-gap-sec", "0.5", "--selection-max-gap-sec", "0.6",
+            "--force",
+        ]
+    )
+
+    manifest_path = output_root / "manifests" / "coverage" / "frames_manifest.json"
+    report_path = output_root / "manifests" / "coverage" / "keyframe_quality_report.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert result in {0, 2}
+    assert report_path.exists()
+    assert manifest["summary"]["keyframe_quality"]["policy"] == "coverage_v1"
+    assert all("keyframe" in frame for frame in manifest["frames"])
+    assert pv.main(["--audit-manifest", str(manifest_path)]) == (
+        0 if manifest["summary"]["keyframe_quality"]["status"] == "passed" else 2
+    )
 
 
 def test_preprocess_rejects_vfr_source_frame_sampling(

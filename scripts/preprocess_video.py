@@ -20,6 +20,8 @@ from typing import Any, Iterable
 import cv2
 import numpy as np
 
+import preprocess_keyframes as pk
+
 
 SCHEMA_VERSION = "2.0"
 MANIFEST_FILENAME = "frames_manifest.json"
@@ -53,6 +55,7 @@ DEFAULT_SETTINGS = {
     "save_rejected": False,
     "frame_format": "jpg",
     "frame_source": "segment",
+    **pk.KEYFRAME_DEFAULT_SETTINGS,
 }
 CONFIG_SETTING_KEYS = frozenset(
     {
@@ -72,6 +75,7 @@ CONFIG_SETTING_KEYS = frozenset(
         "save_rejected",
         "frame_format",
         "frame_source",
+        *pk.KEYFRAME_DEFAULT_SETTINGS,
     }
 )
 FLOAT_CONFIG_SETTINGS = frozenset(
@@ -85,14 +89,47 @@ FLOAT_CONFIG_SETTINGS = frozenset(
         "underexposed_ratio",
         "duplicate_time_window_sec",
         "max_selected_gap_sec",
+        "adaptive_blur_percentile",
+        "selection_min_gap_sec",
+        "selection_target_gap_sec",
+        "selection_max_gap_sec",
+        "duplicate_window_sec",
+        "min_motion_inlier_ratio",
+        "min_motion_grid_coverage",
+        "max_motion_residual_diag_ratio",
+        "max_median_displacement_diag_ratio",
+        "max_affine_rotation_deg",
+        "min_affine_scale",
+        "max_affine_scale",
+        "adaptive_blur_percentile",
+        "selection_min_gap_sec",
+        "selection_target_gap_sec",
+        "selection_max_gap_sec",
+        "duplicate_window_sec",
+        "min_motion_inlier_ratio",
+        "min_motion_grid_coverage",
+        "max_motion_residual_diag_ratio",
+        "max_median_displacement_diag_ratio",
+        "max_affine_rotation_deg",
+        "min_affine_scale",
+        "max_affine_scale",
     }
 )
-INT_CONFIG_SETTINGS = frozenset({"max_long_edge", "duplicate_hash_threshold"})
+INT_CONFIG_SETTINGS = frozenset(
+    {
+        "max_long_edge",
+        "duplicate_hash_threshold",
+        "quality_analysis_long_edge",
+        "flow_analysis_long_edge",
+        "min_tracked_points",
+    }
+)
 CHOICE_CONFIG_SETTINGS = {
     "preset": frozenset(PRESETS),
     "segment_method": frozenset({"scene", "time", "scene,time"}),
     "frame_format": frozenset({"jpg", "png"}),
     "frame_source": frozenset({"segment", "source"}),
+    "keyframe_policy": frozenset({"legacy", "coverage_v1"}),
 }
 
 
@@ -159,6 +196,8 @@ class FrameRecord:
     sha256: str | None = None
     motion_score: float | None = None
     matched_frame_id: str | None = None
+    calibrated_blur_score: float | None = None
+    keyframe: dict[str, Any] | None = None
 
 
 def parse_fraction(value: str | None) -> float:
@@ -808,6 +847,218 @@ def sample_segment_frames(
     return records
 
 
+def _sampling_parameters(
+    segment: SegmentWindow,
+    target_fps: float,
+    frame_source: str,
+    source_video: Path | None,
+) -> tuple[cv2.VideoCapture, float, int, int, int | None]:
+    if segment.path is None:
+        raise ValueError("segment.path is required for frame sampling")
+    sampling_path = source_video if frame_source == "source" else segment.path
+    cap = cv2.VideoCapture(str(sampling_path))
+    if not cap.isOpened():
+        cap.release()
+        raise PreprocessError(f"OpenCV could not open video for frame sampling: {sampling_path}.")
+    if frame_source == "source" and hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+        cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+    segment_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    sample_every = 1 if segment_fps <= 0 else max(1, int(round(segment_fps / target_fps)))
+    start_frame_index = 0
+    end_frame_index: int | None = None
+    if frame_source == "source" and segment_fps > 0:
+        start_frame_index = max(0, int(round(segment.start_sec * segment_fps)))
+        end_frame_index = max(start_frame_index, int(round(segment.end_sec * segment_fps)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_index)
+    return cap, segment_fps, sample_every, start_frame_index, end_frame_index
+
+
+def _iter_sampled_frames(
+    segment: SegmentWindow,
+    target_fps: float,
+    frame_source: str,
+    source_video: Path | None,
+    source_rotation_degrees: int,
+    resize_to: tuple[int, int] | None,
+) -> Iterable[tuple[int, float, int, np.ndarray]]:
+    cap, segment_fps, sample_every, start_frame_index, end_frame_index = _sampling_parameters(
+        segment, target_fps, frame_source, source_video
+    )
+    try:
+        frame_number = 0
+        source_frame_index = start_frame_index
+        sample_index = 0
+        while True:
+            if end_frame_index is not None and source_frame_index >= end_frame_index:
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_number += 1
+            absolute_frame_index = source_frame_index + 1
+            source_frame_index += 1
+            if (frame_number - 1) % sample_every != 0:
+                continue
+            if frame_source == "source":
+                frame = rotate_frame(frame, source_rotation_degrees)
+            frame = resize_frame(frame, resize_to if frame_source == "source" else None)
+            sample_index += 1
+            local_timestamp = 0.0 if segment_fps <= 0 else (frame_number - 1) / segment_fps
+            yield (
+                sample_index,
+                round_sec(segment.start_sec + local_timestamp),
+                absolute_frame_index if frame_source == "source" else frame_number,
+                frame,
+            )
+    finally:
+        cap.release()
+
+
+def _coverage_segment_quality(
+    segment: SegmentWindow,
+    scanned: list[pk.ScannedFrame],
+    decisions: list[pk.KeyframeDecision],
+    policy: pk.KeyframePolicy,
+) -> dict[str, Any]:
+    selected = [frame for frame, decision in zip(scanned, decisions) if decision.selected]
+    timestamps = [frame.timestamp_sec for frame in selected]
+    gaps = [right - left for left, right in zip(timestamps, timestamps[1:])]
+    if timestamps:
+        gaps.extend([timestamps[0] - segment.start_sec, segment.end_sec - timestamps[-1]])
+    max_gap = round_sec(max(gaps, default=0.0))
+    failed_reasons: list[str] = []
+    if not selected:
+        failed_reasons.append("no_selected_frames")
+    if max_gap > policy.max_gap_sec:
+        failed_reasons.append("max_selected_gap_sec")
+    bridge_count = sum(decision.bridge for decision in decisions if decision.selected)
+    return {
+        "segment_id": segment.id,
+        "total_frames": len(scanned),
+        "selected_frames": len(selected),
+        "rejected_frames": len(scanned) - len(selected),
+        "component_count": 1 if selected else 0,
+        "max_selected_gap_sec": max_gap,
+        "bridge_frames": bridge_count,
+        "failed_reasons": failed_reasons,
+    }
+
+
+def sample_segment_frames_coverage(
+    segment: SegmentWindow,
+    selected_root: Path,
+    rejected_root: Path,
+    target_fps: float,
+    save_rejected: bool,
+    repo_root: Path,
+    policy: pk.KeyframePolicy,
+    frame_format: str = "jpg",
+    frame_source: str = "segment",
+    source_video: Path | None = None,
+    resize_to: tuple[int, int] | None = None,
+    source_rotation_degrees: int = 0,
+    manifest_selected_root: Path | None = None,
+    manifest_rejected_root: Path | None = None,
+) -> tuple[list[FrameRecord], dict[str, Any]]:
+    scanned: list[pk.ScannedFrame] = []
+    for sample_index, timestamp, frame_index, frame in _iter_sampled_frames(
+        segment, target_fps, frame_source, source_video, source_rotation_degrees, resize_to
+    ):
+        scanned.append(
+            pk.ScannedFrame(
+                id=f"{segment.id}_frame_{sample_index:06d}",
+                segment_id=segment.id,
+                sample_index=sample_index,
+                timestamp_sec=timestamp,
+                frame_index=frame_index,
+                blur_score=blur_score(frame),
+                calibrated_blur_score=pk.calibrated_blur_score(frame, policy.quality_analysis_long_edge),
+                overexposed_ratio=exposure_ratios(frame)[0],
+                underexposed_ratio=exposure_ratios(frame)[1],
+                average_hash_bits=average_hash(frame),
+                flow_gray=pk.make_analysis_gray(frame, policy.flow_analysis_long_edge),
+                width=int(frame.shape[1]),
+                height=int(frame.shape[0]),
+            )
+        )
+    decisions = pk.select_coverage_frames(scanned, policy)
+    selected_dir = selected_root / segment.id
+    rejected_dir = rejected_root / segment.id
+    selected_dir.mkdir(parents=True, exist_ok=True)
+    if save_rejected:
+        rejected_dir.mkdir(parents=True, exist_ok=True)
+    records: list[FrameRecord] = []
+    second_pass = iter(
+        _iter_sampled_frames(segment, target_fps, frame_source, source_video, source_rotation_degrees, resize_to)
+    )
+    for scanned_frame, decision in zip(scanned, decisions):
+        try:
+            sample_index, timestamp, frame_index, frame = next(second_pass)
+        except StopIteration as exc:
+            raise PreprocessError(
+                f"Second-pass frame count mismatch for {segment.id}: expected {len(scanned)}"
+            ) from exc
+        if sample_index != scanned_frame.sample_index or abs(timestamp - scanned_frame.timestamp_sec) > 0.001:
+            raise PreprocessError(
+                f"Second-pass frame mismatch for {scanned_frame.id}: "
+                f"expected sample {scanned_frame.sample_index} at {scanned_frame.timestamp_sec}, "
+                f"got sample {sample_index} at {timestamp}"
+            )
+        filename = frame_filename(sample_index, timestamp, frame_format)
+        output_path: Path | None = None
+        if decision.selected:
+            output_path = selected_dir / filename
+            write_image(output_path, frame, frame_format)
+        elif save_rejected:
+            output_path = rejected_dir / filename
+            write_image(output_path, frame, frame_format)
+        logical_output_path = output_path
+        if output_path is not None and decision.selected and manifest_selected_root is not None:
+            logical_output_path = manifest_selected_root / segment.id / filename
+        elif output_path is not None and not decision.selected and manifest_rejected_root is not None:
+            logical_output_path = manifest_rejected_root / segment.id / filename
+        keyframe = {
+            "policy": policy.name,
+            "component_id": decision.component_id,
+            "selected_by_policy": decision.selected,
+            "bridge": decision.bridge,
+            "reference_frame_id": decision.reference_frame_id,
+            "adaptive_blur_threshold": round(decision.adaptive_blur_threshold, 6),
+            "quality_score": round(decision.quality_score, 6),
+            "motion": None if decision.motion is None else decision.motion.to_manifest(),
+        }
+        records.append(
+            FrameRecord(
+                id=scanned_frame.id,
+                segment_id=segment.id,
+                path=relative_path(logical_output_path, repo_root) if logical_output_path else None,
+                timestamp_sec=timestamp,
+                frame_index=frame_index,
+                selected=decision.selected,
+                blur_score=round(scanned_frame.blur_score, 3),
+                overexposed_ratio=round(scanned_frame.overexposed_ratio, 6),
+                underexposed_ratio=round(scanned_frame.underexposed_ratio, 6),
+                duplicate_score=decision.duplicate_score,
+                reject_reasons=list(decision.reject_reasons),
+                width=scanned_frame.width,
+                height=scanned_frame.height,
+                sha256=sha256_file(output_path) if output_path else None,
+                calibrated_blur_score=round(scanned_frame.calibrated_blur_score, 6),
+                keyframe=keyframe,
+                matched_frame_id=decision.matched_frame_id if "duplicate" in decision.reject_reasons else None,
+            )
+        )
+    try:
+        next(second_pass)
+    except StopIteration:
+        pass
+    else:
+        raise PreprocessError(
+            f"Second-pass frame count mismatch for {segment.id}: more frames than first pass"
+        )
+    return records, _coverage_segment_quality(segment, scanned, decisions, policy)
+
+
 def summarize_frames(
     segments: Iterable[SegmentWindow],
     frames: Iterable[FrameRecord],
@@ -885,10 +1136,14 @@ def build_manifest(
     frames: list[FrameRecord],
     repo_root: Path,
     run: dict[str, Any] | None = None,
+    keyframe_quality: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     invalid_frames = [frame.id for frame in frames if frame.width <= 0 or frame.height <= 0]
     if invalid_frames:
         raise PreprocessError(f"Frame records must include positive dimensions: {', '.join(invalid_frames[:3])}")
+    summary = summarize_frames(segments, frames, settings.get("max_selected_gap_sec"))
+    if keyframe_quality is not None:
+        summary["keyframe_quality"] = keyframe_quality
     return {
         "schema_version": SCHEMA_VERSION,
         "video_id": video_id,
@@ -920,10 +1175,20 @@ def build_manifest(
             segment_to_manifest(segment, repo_root, normalized_metadata.width, normalized_metadata.height)
             for segment in segments
         ],
-        "frames": [asdict(frame) for frame in frames],
-        "summary": summarize_frames(segments, frames, settings.get("max_selected_gap_sec")),
+        "frames": [frame_to_manifest(frame) for frame in frames],
+        "summary": summary,
         "run": run or {},
     }
+
+
+def frame_to_manifest(frame: FrameRecord) -> dict[str, Any]:
+    """Keep the legacy schema stable while serializing coverage diagnostics additively."""
+    payload = asdict(frame)
+    if frame.calibrated_blur_score is None:
+        payload.pop("calibrated_blur_score", None)
+    if frame.keyframe is None:
+        payload.pop("keyframe", None)
+    return payload
 
 
 def write_manifest(manifest: dict[str, Any], destination: Path) -> None:
@@ -1074,6 +1339,26 @@ def load_settings_config(path: Path) -> dict[str, Any]:
             allowed = ", ".join(sorted(choices))
             raise PreprocessError(f"Config setting '{name}' must be one of: {allowed}.")
 
+    for name in pk.KEYFRAME_DEFAULT_SETTINGS:
+        if (
+            name in settings
+            and name not in FLOAT_CONFIG_SETTINGS
+            and name not in INT_CONFIG_SETTINGS
+            and name not in CHOICE_CONFIG_SETTINGS
+        ):
+            value = settings[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise PreprocessError(f"Config setting '{name}' must be a number.")
+
+    preset_name = str(settings.get("preset", DEFAULT_PRESET))
+    candidate = dict(DEFAULT_SETTINGS)
+    candidate.update(PRESETS[preset_name])
+    candidate.update(settings)
+    try:
+        pk.validate_keyframe_settings(candidate)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PreprocessError(str(exc)) from exc
+
     return settings
 
 
@@ -1109,6 +1394,10 @@ def resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
     for name in ("duplicate_time_window_sec", "max_selected_gap_sec"):
         if settings[name] <= 0:
             raise PreprocessError(f"--{name.replace('_', '-')} must be greater than zero.")
+    try:
+        pk.validate_keyframe_settings(settings)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PreprocessError(str(exc)) from exc
     return settings
 
 
@@ -1117,6 +1406,57 @@ def validate_video_id(video_id: str) -> None:
         raise PreprocessError("--video-id may only contain letters, numbers, underscore, dash, and dot.")
     if video_id in {".", ".."}:
         raise PreprocessError("--video-id cannot be '.' or '..'.")
+
+
+def read_keyframe_status(manifest_path: Path) -> tuple[str, str]:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "unknown", "failed"
+    quality = manifest.get("summary", {}).get("keyframe_quality")
+    if not quality:
+        return "legacy", "not_applicable"
+    return str(quality.get("policy", "unknown")), str(quality.get("status", "failed"))
+
+
+def audit_preprocess_manifest(manifest_path: Path, repo_root: Path | None = None) -> dict[str, Any]:
+    repo_root = (repo_root or Path.cwd()).resolve()
+    errors: list[str] = []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"status": "failed", "errors": [f"manifest does not exist: {manifest_path}"], "summary": {}}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"status": "failed", "errors": [f"could not read manifest: {exc}"], "summary": {}}
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        errors.append(f"schema_version must be {SCHEMA_VERSION}")
+    frame_ids: set[str] = set()
+    timestamps: dict[str, list[float]] = {}
+    for frame in manifest.get("frames", []):
+        frame_id = frame.get("id")
+        if not isinstance(frame_id, str) or frame_id in frame_ids:
+            errors.append(f"frame ids must be globally unique: {frame_id}")
+        frame_ids.add(str(frame_id))
+        timestamps.setdefault(str(frame.get("segment_id")), []).append(float(frame.get("timestamp_sec", -1)))
+        if frame.get("selected"):
+            path_value = frame.get("path")
+            if not isinstance(path_value, str):
+                errors.append(f"selected frame {frame_id} has no path")
+                continue
+            candidate = (repo_root / Path(path_value)).resolve()
+            if not is_relative_to(candidate, repo_root):
+                errors.append(f"selected frame {frame_id} path is outside the repository")
+            elif not candidate.is_file():
+                errors.append(f"selected frame {frame_id} path is missing: {path_value}")
+            elif cv2.imdecode(np.frombuffer(candidate.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR) is None:
+                errors.append(f"selected frame {frame_id} cannot be decoded")
+    for segment_id, values in timestamps.items():
+        if values != sorted(values) or len(values) != len(set(values)):
+            errors.append(f"timestamps are not strictly increasing in {segment_id}")
+    quality = manifest.get("summary", {}).get("keyframe_quality")
+    if quality and quality.get("status") != "passed":
+        errors.append("keyframe quality status is not passed")
+    return {"status": "passed" if not errors else "failed", "errors": errors, "summary": manifest.get("summary", {})}
 
 
 def preprocess(args: argparse.Namespace, command_args: list[str] | None = None) -> Path:
@@ -1177,9 +1517,29 @@ def preprocess(args: argparse.Namespace, command_args: list[str] | None = None) 
         ]
 
         frames: list[FrameRecord] = []
+        segment_quality: list[dict[str, Any]] = []
+        policy = pk.KeyframePolicy.from_settings(settings)
         for segment in staged_segments:
-            frames.extend(
-                sample_segment_frames(
+            if settings["keyframe_policy"] == "coverage_v1":
+                segment_frames, quality = sample_segment_frames_coverage(
+                    segment=segment,
+                    selected_root=selected_dir,
+                    rejected_root=rejected_dir,
+                    target_fps=settings["target_fps"],
+                    save_rejected=settings["save_rejected"],
+                    repo_root=repo_root,
+                    policy=policy,
+                    frame_format=settings["frame_format"],
+                    frame_source=settings["frame_source"],
+                    source_video=source if settings["frame_source"] == "source" else None,
+                    resize_to=source_frame_dimensions if settings["frame_source"] == "source" else None,
+                    source_rotation_degrees=source_metadata.rotation_degrees,
+                    manifest_selected_root=final_frames_dir / "selected",
+                    manifest_rejected_root=final_frames_dir / "rejected",
+                )
+                segment_quality.append(quality)
+            else:
+                segment_frames = sample_segment_frames(
                     segment=segment,
                     selected_root=selected_dir,
                     rejected_root=rejected_dir,
@@ -1200,7 +1560,30 @@ def preprocess(args: argparse.Namespace, command_args: list[str] | None = None) 
                     manifest_selected_root=final_frames_dir / "selected",
                     manifest_rejected_root=final_frames_dir / "rejected",
                 )
-            )
+            frames.extend(segment_frames)
+
+        keyframe_quality: dict[str, Any] | None = None
+        if settings["keyframe_policy"] == "coverage_v1":
+            failed_segments = [item for item in segment_quality if item["failed_reasons"]]
+            keyframe_quality = {
+                "policy": "coverage_v1",
+                "status": "failed" if failed_segments else "passed",
+                "selected_frames": sum(item["selected_frames"] for item in segment_quality),
+                "bridge_frames": sum(item["bridge_frames"] for item in segment_quality),
+                "component_count": max((item["component_count"] for item in segment_quality), default=0),
+                "max_selected_gap_sec": round_sec(max((item["max_selected_gap_sec"] for item in segment_quality), default=0.0)),
+                "min_motion_inlier_ratio": policy.min_motion_inlier_ratio,
+                "min_motion_grid_coverage": policy.min_motion_grid_coverage,
+                "failed_segments": [item["segment_id"] for item in failed_segments],
+            }
+            report = {
+                "schema_version": SCHEMA_VERSION,
+                "video_id": args.video_id,
+                "policy": "coverage_v1",
+                "status": keyframe_quality["status"],
+                "segments": segment_quality,
+            }
+            write_manifest(report, manifests_dir / "keyframe_quality_report.json")
 
         settings_fingerprint = stable_hash(settings)
         revision, dirty = repository_state(repo_root)
@@ -1231,6 +1614,7 @@ def preprocess(args: argparse.Namespace, command_args: list[str] | None = None) 
             frames=frames,
             repo_root=repo_root,
             run=run,
+            keyframe_quality=keyframe_quality,
         )
         write_manifest(manifest, manifests_dir / MANIFEST_FILENAME)
         publish_output_dirs(output_root, args.video_id, staging_root, args.force)
@@ -1242,9 +1626,10 @@ def preprocess(args: argparse.Namespace, command_args: list[str] | None = None) 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Preprocess exhibition video for downstream 3DGS stages.")
-    parser.add_argument("source_video", type=Path, help="Path to the raw source video.")
+    parser.add_argument("source_video", type=Path, nargs="?", help="Path to the raw source video.")
     parser.add_argument("--output-root", type=Path, default=Path("data"), help="Root output directory.")
-    parser.add_argument("--video-id", required=True, help="Stable video identifier used in output paths.")
+    parser.add_argument("--video-id", help="Stable video identifier used in output paths.")
+    parser.add_argument("--audit-manifest", type=Path, help="Audit an existing frames_manifest.json and print JSON.")
     parser.add_argument("--config", type=Path, help="JSON file containing preprocess tuning settings.")
     parser.add_argument("--preset", choices=sorted(PRESETS), default=None, help="Preprocess preset.")
     parser.add_argument("--target-fps", type=float, default=None, help="Frame sampling rate per segment.")
@@ -1292,6 +1677,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Read sampled frames from generated segments or directly from the source video.",
     )
+    parser.add_argument("--keyframe-policy", choices=["legacy", "coverage_v1"], default=None,
+                        help="Keyframe selector; legacy preserves the original filtering behavior.")
+    parser.add_argument("--quality-analysis-long-edge", type=int, default=None)
+    parser.add_argument("--flow-analysis-long-edge", type=int, default=None)
+    parser.add_argument("--adaptive-blur-percentile", type=float, default=None)
+    parser.add_argument("--selection-min-gap-sec", type=float, default=None)
+    parser.add_argument("--selection-target-gap-sec", type=float, default=None)
+    parser.add_argument("--selection-max-gap-sec", type=float, default=None)
+    parser.add_argument("--duplicate-window-sec", type=float, default=None)
+    parser.add_argument("--min-tracked-points", type=int, default=None)
+    parser.add_argument("--min-motion-inlier-ratio", type=float, default=None)
+    parser.add_argument("--min-motion-grid-coverage", type=float, default=None)
+    parser.add_argument("--max-motion-residual-diag-ratio", type=float, default=None)
+    parser.add_argument("--max-median-displacement-diag-ratio", type=float, default=None)
+    parser.add_argument("--max-affine-rotation-deg", type=float, default=None)
+    parser.add_argument("--min-affine-scale", type=float, default=None)
+    parser.add_argument("--max-affine-scale", type=float, default=None)
     parser.add_argument("--force", action="store_true", help="Overwrite existing output directories for this video id.")
     return parser
 
@@ -1299,6 +1701,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.audit_manifest is not None:
+        preprocess_values = [
+            args.source_video, args.video_id, args.config, args.preset, args.target_fps,
+            args.max_long_edge, args.segment_method, args.segment_length_sec,
+            args.segment_overlap_sec, args.min_segment_sec, args.blur_threshold,
+            args.overexposed_ratio, args.underexposed_ratio, args.duplicate_hash_threshold,
+            args.duplicate_time_window_sec, args.max_selected_gap_sec, args.save_rejected,
+            args.frame_format, args.frame_source, args.keyframe_policy, args.force,
+            args.quality_analysis_long_edge, args.flow_analysis_long_edge,
+            args.adaptive_blur_percentile, args.selection_min_gap_sec,
+            args.selection_target_gap_sec, args.selection_max_gap_sec,
+            args.duplicate_window_sec, args.min_tracked_points,
+            args.min_motion_inlier_ratio, args.min_motion_grid_coverage,
+            args.max_motion_residual_diag_ratio,
+            args.max_median_displacement_diag_ratio, args.max_affine_rotation_deg,
+            args.min_affine_scale, args.max_affine_scale,
+        ]
+        if any(value is not None and value is not False for value in preprocess_values):
+            parser.error("--audit-manifest cannot be combined with preprocess options")
+        result = audit_preprocess_manifest(args.audit_manifest)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["status"] == "passed" else 2
+    if args.source_video is None or args.video_id is None:
+        parser.error("source_video and --video-id are required unless --audit-manifest is used")
     try:
         command_args = list(argv) if argv is not None else sys.argv[1:]
         manifest_path = preprocess(args, command_args=command_args)
@@ -1306,7 +1732,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    policy, status = read_keyframe_status(manifest_path)
     print(f"Wrote manifest: {relative_path(manifest_path)}")
+    if policy == "coverage_v1" and status != "passed":
+        print(f"Keyframe quality gate failed: {status}", file=sys.stderr)
+        return 2
     return 0
 
 

@@ -1,13 +1,12 @@
 # Preprocess Video Feature Status
 
-Last updated: 2026-07-22
+Last updated: 2026-07-27
 
 ## Current Phase
 
-Stage 2 - Review follow-up implemented for the formal manifest contract,
-strict path portability, provenance, coverage-aware duplicate filtering, and
-transactional output publication. Fidelity frame extraction remains part of
-the same preprocess entrypoint.
+Stage 3 - The opt-in `coverage_v1` keyframe policy is implemented on top of the
+formal schema 2.0 manifest contract. The default remains `legacy`; fidelity
+frame extraction remains part of the same preprocess entrypoint.
 
 The feature now has a single CLI entrypoint, focused tests, and user-facing
 documentation. FFmpeg and ffprobe are now installed on PATH, the FFmpeg smoke
@@ -18,6 +17,25 @@ consumption, downstream consumer contracts, troubleshooting, and generated-
 asset boundaries.
 
 ## Completed
+
+- Implemented the 2026-07-24 coverage-aware keyframe review without reverting
+  the current `frames_manifest.json` schema 2.0 contract:
+  - added `scripts/preprocess_keyframes.py` with fixed-scale calibrated blur,
+    LK optical flow, RANSAC affine diagnostics, hard motion gates, bounded
+    bridge rules, and a pure coverage selector;
+  - added strict `legacy|coverage_v1` configuration and kept legacy as the
+    default behavior;
+  - added two-pass candidate scan/materialization with frame-count and timestamp
+    consistency checks;
+  - added additive per-frame keyframe diagnostics,
+    `summary.keyframe_quality`, and `keyframe_quality_report.json`;
+  - added `--audit-manifest`, fail-closed quality exit code `2`, and no silent
+    fallback to legacy;
+  - added `configs/preprocess/coverage_v1.json` and documentation for controlled
+    policy A/B runs.
+- Added focused synthetic tests for fixed-resolution blur, 2D motion metrics,
+  configuration validation, manifest additivity, coverage smoke processing,
+  quality reports, and auditing.
 
 - Read and followed `.codex/prompts/preprocess_video_feature.md`.
 - Added `requirements.txt` with the minimal preprocess dependency set:
@@ -128,6 +146,16 @@ asset boundaries.
   joint testing scope.
 
 ## Verification
+
+- Ran through Git Bash and the required project entrypoint on 2026-07-27:
+  `./dev.sh pytest tests/unit/test_preprocess_keyframes.py
+  tests/unit/test_preprocess_video.py -q --basetemp=.tmp/pytest-all-2`; result:
+  `46 passed`. Pytest emitted one cache warning because the managed sandbox
+  denied writes to `.pytest_cache`; test temporary data used the repository
+  `.tmp/` directory.
+- Ran `./dev.sh python -m compileall -q scripts tests/unit`; result: exit 0.
+- Ran `./dev.sh python scripts/preprocess_video.py --help`; result: exit 0 and
+  the coverage/audit options are listed.
 
 - Ran through the project Python entrypoint with Git Bash:
   `./dev.sh pytest`
