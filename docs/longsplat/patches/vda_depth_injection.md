@@ -15,6 +15,7 @@ git apply ../../docs/longsplat/patches/longsplat_stability_fixes.patch
 git apply ../../docs/longsplat/patches/longsplat_training_improvements.patch
 git apply ../../docs/longsplat/patches/vda_depth_injection.patch
 git apply ../../docs/longsplat/patches/longsplat_conversion_telemetry.patch
+git apply ../../docs/longsplat/patches/longsplat_pose_quality_gates.patch
 git -C submodules/mast3r apply ../../../../docs/longsplat/patches/mast3r_low_memory_load.patch
 ```
 
@@ -84,7 +85,45 @@ This ordered patch must be applied after `vda_depth_injection.patch`. It:
   keeping `align_vda_depth()` backward-compatible;
 - emits conversion, pose, and VDA diagnostics as strict JSON stdout markers.
 
-## Patch 4 — MASt3R low-host-memory checkpoint loading
+## Patch 4 — Pose quality gates with reference lookback and SO(3)
+
+**File:** `docs/longsplat/patches/longsplat_pose_quality_gates.patch`
+
+This ordered patch must be applied after `longsplat_conversion_telemetry.patch`. It:
+
+- Adds 14 gate parameters to `ModelParams`:
+  `min_match_count`, `min_inlier_count`, `min_inlier_ratio`,
+  `max_reprojection_rmse_px`, `min_grid_coverage`, `min_positive_depth_ratio`,
+  `max_rotation_step_deg`, `max_translation_step_ratio`, `reference_lookback`,
+  `min_correlation`, `min_vda_inlier_ratio`, `max_normalized_rmse`,
+  `min_aligned_fraction`
+- Adds `project_to_so3()`, `keypoint_grid_coverage()`, and `rotation_step_deg()`
+  helpers to `utils/pose_utils.py`; `project_to_so3()` projects a 3x3 matrix
+  to the closest SO(3) element via SVD with determinant correction
+- Hardens `Camera.update_RT()` to validate shape `(3,3)`/`(3,)`, finiteness,
+  orthogonality error <= 1e-3, and determinant in SO(3)
+- Calls `project_to_so3()` at three sites: MASt3R global align init cameras,
+  PnP/least-squares candidates before `update_RT`, and SE(3) delta synthesis
+- Replaces the old `end_view_id -= 1` PnP retry loop with a quality-gated
+  reference lookback: tries up to `reference_lookback` most recent accepted
+  cameras, evaluates each candidate against all hard acceptance criteria,
+  emits `POSE_TELEMETRY` with `allow_nan=False` for every attempt, and raises
+  `RuntimeError("POSE_GATE_REJECTED")` if all references fail
+- Emits `POSE_TELEMETRY` for global align init cameras (stage=scene_init,
+  accepted=true) with `allow_nan=False`
+
+Hard acceptance criteria for incremental registration:
+- OpenCV `solvePnPRansac` success
+- match_count >= 128
+- inlier_count >= 64
+- inlier_ratio >= 0.80
+- refined reprojection RMSE <= 2.0 px
+- 4x4 grid coverage >= 6/16 cells
+- positive depth ratio >= 0.95 in PnP native camera coordinates
+- rotation step relative to last accepted camera <= 25 deg
+- translation step <= 6x the median of up to 8 recent steps (after >= 3 steps)
+
+## Patch 5 — MASt3R low-host-memory checkpoint loading
 
 **File:** `docs/longsplat/patches/mast3r_low_memory_load.patch`
 
@@ -99,7 +138,9 @@ changing model weights, precision, inference, or LongSplat optimization.
 Structured marker lines use one JSON object after the prefix:
 
 ```text
-POSE_TELEMETRY {"frame":"...","success":true,"match_count":100,"inlier_count":80,"inlier_ratio":0.8,"reprojection_rmse_px":1.25,...}
+POSE_TELEMETRY {"stage":"scene_init","frame":"...","accepted":true,"method":"mast3r_global_align"}
+POSE_TELEMETRY {"stage":"incremental","frame":"...","reference":"...","method":"pnp_ransac_refined","accepted":true,"match_count":412,"inlier_count":190,...}
+POSE_TELEMETRY {"stage":"incremental","frame":"...","reference":"...","method":"pnp_ransac_refined","accepted":false,"rejection_reasons":["inlier_ratio","grid_coverage"],...}
 VDA_TELEMETRY {"frame":"...","result":"aligned","correlation":0.91,"inlier_ratio":0.88,"slope":0.5,"offset":0.1,...}
 CONVERSION_TELEMETRY {"point_count":40000,"nonpositive_distance_count":1200,"finite_scale_count":40000,...}
 ```
@@ -135,6 +176,7 @@ Depth files are read from: `<source_path>/depths/<image_stem>_depth.npy`
 ```powershell
 git -C third_party/LongSplat rev-parse HEAD
 git -C third_party/LongSplat diff --check
+git -C third_party/LongSplat apply --check --reverse ../../docs/longsplat/patches/longsplat_pose_quality_gates.patch
 git -C third_party/LongSplat apply --check --reverse ../../docs/longsplat/patches/longsplat_conversion_telemetry.patch
 git -C third_party/LongSplat/submodules/mast3r apply --check --reverse ../../../../docs/longsplat/patches/mast3r_low_memory_load.patch
 git -C third_party/LongSplat ls-files --others --exclude-standard -- "*.py" "*.cu" "*.cpp"

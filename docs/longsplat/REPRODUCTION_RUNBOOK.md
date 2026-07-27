@@ -14,6 +14,7 @@
   git apply ../../docs/longsplat/patches/longsplat_training_improvements.patch
   git apply ../../docs/longsplat/patches/vda_depth_injection.patch
   git apply ../../docs/longsplat/patches/longsplat_conversion_telemetry.patch
+  git apply ../../docs/longsplat/patches/longsplat_pose_quality_gates.patch
   git -C submodules/mast3r apply ../../../../docs/longsplat/patches/mast3r_low_memory_load.patch
   ```
 - Input frames manifest from preprocess pipeline
@@ -55,6 +56,7 @@ git -C $base apply (Resolve-Path docs/longsplat/patches/longsplat_stability_fixe
 git -C $base apply (Resolve-Path docs/longsplat/patches/longsplat_training_improvements.patch)
 git -C $base apply (Resolve-Path docs/longsplat/patches/vda_depth_injection.patch)
 git -C $base apply (Resolve-Path docs/longsplat/patches/longsplat_conversion_telemetry.patch)
+git -C $base apply (Resolve-Path docs/longsplat/patches/longsplat_pose_quality_gates.patch)
 git -C $base submodule update --init submodules/mast3r
 git -C "$base/submodules/mast3r" apply (Resolve-Path docs/longsplat/patches/mast3r_low_memory_load.patch)
 git -C $base diff --check
@@ -65,17 +67,19 @@ git -C $base ls-files --others --exclude-standard -- "*.py" "*.cu" "*.cpp"
 All should exit 0.
 
 Then verify the reconstructed files match the current backend exactly
-(only the 7 files touched by the four LongSplat patches):
+(the 10 files touched by the five LongSplat patches):
 
 ```powershell
 $files = @(
   "arguments/__init__.py",
   "scene/__init__.py",
+  "scene/cameras.py",
   "scene/dataset_readers.py",
   "scene/gaussian_model.py",
   "train.py",
   "utils/graphics_utils.py",
-  "utils/loss_utils.py"
+  "utils/loss_utils.py",
+  "utils/pose_utils.py"
 )
 
 foreach ($file in $files) {
@@ -86,9 +90,9 @@ foreach ($file in $files) {
 }
 ```
 
-All 7 files must be identical. The four-patch order must remain
+All 9 files must be identical. The five-patch order must remain
 *stability → training-improvements → vda-depth-injection →
-finite-conversion-telemetry*. Only
+finite-conversion-telemetry → pose-quality-gates*. Only
 report patch parity as PASS when every file compares equal.
 
 ## Verify CLI
