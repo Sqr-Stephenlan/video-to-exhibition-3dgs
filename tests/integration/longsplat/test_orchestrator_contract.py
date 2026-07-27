@@ -2088,8 +2088,8 @@ def test_vda_usage_markers_captured_in_run_record(tmp_path):
     from scripts.longsplat.depth_bridge import DepthMaterializationResult
 
     fake_mat_result = DepthMaterializationResult(
-        expected_count=3,
-        materialized_count=3,
+        expected_count=1,
+        materialized_count=1,
         depth_manifest_sha256="abcd1234",
         frames=[],
     )
@@ -2123,6 +2123,8 @@ def test_vda_usage_markers_captured_in_run_record(tmp_path):
         assert len(run_dirs) == 1
         record = json.loads((run_dirs[0] / "reconstruction_run.json").read_text())
         assert record["status"] == "complete"
+        # The fake backend writes 1 camera and emits 3 VDA_USAGE markers.
+        # The gate only checks aligned/train_ratio >= 0.98.
         assert record["depth"]["usage"] == {"aligned": 3, "missing": 0, "rejected": 0}
         assert record["telemetry"]["pose"]["attempt_count"] == 1
         assert record["telemetry"]["pose"]["accepted_camera_count"] == 1

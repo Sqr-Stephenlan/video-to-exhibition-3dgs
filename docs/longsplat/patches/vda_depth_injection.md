@@ -16,6 +16,7 @@ git apply ../../docs/longsplat/patches/longsplat_training_improvements.patch
 git apply ../../docs/longsplat/patches/vda_depth_injection.patch
 git apply ../../docs/longsplat/patches/longsplat_conversion_telemetry.patch
 git apply ../../docs/longsplat/patches/longsplat_pose_quality_gates.patch
+git apply ../../docs/longsplat/patches/longsplat_depth_quality.patch
 git -C submodules/mast3r apply ../../../../docs/longsplat/patches/mast3r_low_memory_load.patch
 ```
 
@@ -133,6 +134,53 @@ checkpoint and releases the checkpoint object before moving the initialized
 network to CUDA. This reduces the transient Windows host-memory peak without
 changing model weights, precision, inference, or LongSplat optimization.
 
+## Patch 6 — VDA depth quality gate
+
+**File:** `docs/longsplat/patches/longsplat_depth_quality.patch`
+
+This ordered patch must be applied after `longsplat_pose_quality_gates.patch`. It adds quality gates to VDA depth alignment, rejecting weak fits that previously passed silently. Changes across 3 files:
+
+### `utils/graphics_utils.py` — quality gates in `align_vda_depth_with_stats()`
+
+Adds two new parameters and rejection criteria:
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `min_inlier_ratio` | `0.0` | Minimum fraction of inliers after outlier rejection |
+| `max_normalized_rmse` | `None` | Maximum normalized RMSE `residual_rmse / median(|1/D_ref|)` |
+
+Rejection reasons emitted via `stats["reason"]`:
+- `low_inlier_ratio` — inlier fraction below `min_inlier_ratio`
+- `high_normalized_rmse` — normalized RMSE above `max_normalized_rmse`
+
+Also adds `normalized_rmse` field to stats dictionary for telemetry.
+
+### `scene/__init__.py` — scene init injection updated
+
+Reads quality thresholds from args and passes them to `align_vda_depth_with_stats()`:
+
+```python
+min_correlation = getattr(args, 'min_correlation', 0.90)
+min_vda_inlier_ratio = getattr(args, 'min_vda_inlier_ratio', 0.95)
+max_normalized_rmse_vda = getattr(args, 'max_normalized_rmse', 0.10)
+```
+
+Old `corr_threshold` usage replaced with `min_correlation` (0.90 instead of 0.3).
+
+### `train.py` — incremental injection updated
+
+Same threshold reads and parameter passing as `scene/__init__.py`.
+
+### Post-training gate (Python side)
+
+The orchestrator (`scripts/longsplat/orchestrator.py`) enforces after training but before conversion:
+- `record_count == train_camera_count` (every train frame got a VDA_TELEMETRY record)
+- `missing == 0` (no missing depth files)
+- `materialized_count == train + test` (all frames materialized)
+- `aligned / train_camera_count >= 0.98` (at least 98% aligned)
+
+Failure emits `vda_quality_gate` stage with detailed rejection reasons and returns exit code 1.
+
 ## Telemetry markers
 
 Structured marker lines use one JSON object after the prefix:
@@ -176,6 +224,7 @@ Depth files are read from: `<source_path>/depths/<image_stem>_depth.npy`
 ```powershell
 git -C third_party/LongSplat rev-parse HEAD
 git -C third_party/LongSplat diff --check
+git -C third_party/LongSplat apply --check --reverse ../../docs/longsplat/patches/longsplat_depth_quality.patch
 git -C third_party/LongSplat apply --check --reverse ../../docs/longsplat/patches/longsplat_pose_quality_gates.patch
 git -C third_party/LongSplat apply --check --reverse ../../docs/longsplat/patches/longsplat_conversion_telemetry.patch
 git -C third_party/LongSplat/submodules/mast3r apply --check --reverse ../../../../docs/longsplat/patches/mast3r_low_memory_load.patch
@@ -184,5 +233,5 @@ git -C third_party/LongSplat ls-files --others --exclude-standard -- "*.py" "*.c
 
 All should return 0; the last command should produce no output. Earlier
 patches overlap files changed by the final patch, so verify their parity by
-forward-applying all four LongSplat patches and the independent nested MASt3R
+forward-applying all five LongSplat patches and the independent nested MASt3R
 patch to their locked bases as documented in `docs/longsplat/REPRODUCTION_RUNBOOK.md`.

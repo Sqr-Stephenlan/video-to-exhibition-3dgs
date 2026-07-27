@@ -478,6 +478,94 @@ def run_pipeline(
         else:
             _echo("No cameras_all_train.json found, skipping pose audit.")
 
+        # --- 8d. Post-training VDA quality gate ---
+        if depth_source != "mast3r":
+            _echo("Auditing VDA depth quality ...")
+            vda_telemetry = telemetry.get("vda", {})
+            cameras_json = Path(config.model_path) / "cameras_all_train.json"
+            train_camera_count = 0
+            if cameras_json.is_file():
+                with open(cameras_json, encoding="utf-8") as fh:
+                    train_camera_count = len(json.load(fh))
+            test_cameras_json = Path(config.model_path) / "cameras_all_test.json"
+            test_camera_count = 0
+            if test_cameras_json.is_file():
+                with open(test_cameras_json, encoding="utf-8") as fh:
+                    test_camera_count = len(json.load(fh))
+
+            materialized_count = (
+                record.get("depth", {})
+                .get("materialization", {})
+                .get("materialized_count", 0)
+            )
+
+            vda_reasons: list[str] = []
+            record_count = len(vda_telemetry.get("records", []))
+            missing = vda_telemetry.get("missing", 0)
+            aligned = vda_telemetry.get("aligned", 0)
+            rejected = vda_telemetry.get("rejected", 0)
+
+            if train_camera_count > 0 and record_count != train_camera_count:
+                vda_reasons.append(
+                    f"VDA record count {record_count} != train cameras {train_camera_count}"
+                )
+
+            if missing > 0:
+                vda_reasons.append(f"VDA missing {missing} frames")
+
+            total_expected = train_camera_count + test_camera_count
+            if total_expected > 0 and materialized_count != total_expected:
+                vda_reasons.append(
+                    f"materialized depth count {materialized_count} "
+                    f"!= expected {total_expected} "
+                    f"(train {train_camera_count} + test {test_camera_count})"
+                )
+
+            aligned_ratio = aligned / train_camera_count if train_camera_count > 0 else 0.0
+            if aligned_ratio < 0.98:
+                vda_reasons.append(
+                    f"VDA aligned ratio {aligned_ratio:.4f} < 0.98 "
+                    f"(aligned={aligned}, rejected={rejected}, missing={missing})"
+                )
+
+            record.setdefault("quality_gates", {})["vda"] = {
+                "thresholds": {
+                    "min_aligned_ratio": 0.98,
+                    "max_missing": 0,
+                },
+                "passed": len(vda_reasons) == 0,
+                "reasons": vda_reasons,
+                "telemetry": {
+                    "record_count": record_count,
+                    "aligned": aligned,
+                    "rejected": rejected,
+                    "missing": missing,
+                    "train_camera_count": train_camera_count,
+                    "test_camera_count": test_camera_count,
+                    "materialized_count": materialized_count,
+                },
+            }
+            write_run_record(record, run_dir)
+
+            if vda_reasons:
+                transition_status(
+                    record,
+                    run_dir,
+                    RunStatus.FAILED,
+                    stage="vda_quality_gate",
+                    details={
+                        "status": "failed",
+                        "reasons": vda_reasons,
+                        "telemetry": record["quality_gates"]["vda"]["telemetry"],
+                    },
+                )
+                _echo(
+                    f"VDA audit FAILED: {'; '.join(vda_reasons)}",
+                    file=sys.stderr,
+                )
+                return 1
+            _echo("VDA audit passed.")
+
         # --- 9. Run conversion ---
         _echo("Running conversion ...")
         cameras_src = Path(config.model_path) / "cameras_all_train.json"

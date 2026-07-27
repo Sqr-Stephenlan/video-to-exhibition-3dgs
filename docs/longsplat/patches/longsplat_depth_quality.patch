@@ -1,0 +1,849 @@
+diff --git a/scene/__init__.py b/scene/__init__.py
+index d5c57ce..05206ff 100755
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -7,7 +7,9 @@
+ # license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+ 
++import json
+ import os
++import numpy as np
+ from utils.system_utils import searchForMaxIteration
+ from scene.dataset_readers import sceneLoadTypeCallbacks
+ from scene.gaussian_model import GaussianModel
+@@ -17,6 +19,7 @@ import torch
+ from utils.mast3r_utils import Mast3rMatcher
+ from scene.gaussian_model import BasicPointCloud
+ from torch.nn import functional as F
++from utils.graphics_utils import align_vda_depth_with_stats
+ 
+ class Scene:
+ 
+@@ -111,11 +114,28 @@ class Scene:
+                 for cam in self.getAllCameras():
+                     cam.update_focal(focal_length)
+ 
++            from utils.pose_utils import project_to_so3
++
+             for i, Rt in enumerate(world2cam):
+                 R = Rt[:3, :3].t()
+                 T = Rt[:3, 3]
++                R = project_to_so3(R)
+                 cur_viewpoint_cam = self.getTrainCameras()[i]
+                 cur_viewpoint_cam.update_RT(R, T)
++                print(
++                    "POSE_TELEMETRY "
++                    + json.dumps(
++                        {
++                            "stage": "scene_init",
++                            "frame": cur_viewpoint_cam.image_name,
++                            "accepted": True,
++                            "method": "mast3r_global_align",
++                        },
++                        sort_keys=True,
++                        allow_nan=False,
++                    ),
++                    flush=True,
++                )
+                 if i == 0:
+                     next_viewpoint_cam = self.getTrainCameras()[i + 1]
+                     intrinsic_np = cur_viewpoint_cam.intrinsic.detach().cpu().numpy()
+@@ -148,7 +168,68 @@ class Scene:
+                                                                 mode='bilinear', 
+                                                                 align_corners=False).squeeze(0).squeeze(0)
+                 cur_viewpoint_cam.is_registered = True
+-            
++
++            # Optionally override depth maps with external sources (e.g., Video-Depth-Anything)
++            if hasattr(args, 'depth_source') and args.depth_source != "mast3r":
++                depth_dir = os.path.join(args.source_path, "depths")
++                corr_threshold = getattr(args, 'vda_corr_threshold', 0.3)
++                outlier_sigma = getattr(args, 'vda_outlier_sigma', 2.5)
++                min_correlation = getattr(args, 'min_correlation', 0.90)
++                min_vda_inlier_ratio = getattr(args, 'min_vda_inlier_ratio', 0.95)
++                max_normalized_rmse_vda = getattr(args, 'max_normalized_rmse', 0.10)
++                for cam in self.getTrainCameras():
++                    if cam.depth_map is None:
++                        continue
++                    depth_file = os.path.join(depth_dir, os.path.splitext(cam.image_name)[0] + "_depth.npy")
++                    if os.path.exists(depth_file):
++                        ext_depth = torch.from_numpy(np.load(depth_file)).float().cuda()
++                        ext_depth = F.interpolate(
++                            ext_depth.unsqueeze(0).unsqueeze(0),
++                            size=(cam.image_height, cam.image_width),
++                            mode='bilinear',
++                            align_corners=False
++                        ).squeeze(0).squeeze(0)
++                        D_vda, vda_stats = align_vda_depth_with_stats(
++                            ext_depth,
++                            cam.depth_map,
++                            corr_threshold=min_correlation,
++                            outlier_sigma=outlier_sigma,
++                            min_inlier_ratio=min_vda_inlier_ratio,
++                            max_normalized_rmse=max_normalized_rmse_vda,
++                        )
++                        vda_stats.update({
++                            "stage": "scene_init",
++                            "frame": cam.image_name,
++                        })
++                        print(
++                            "VDA_TELEMETRY "
++                            + json.dumps(
++                                vda_stats, sort_keys=True, allow_nan=False
++                            ),
++                            flush=True,
++                        )
++                        if D_vda is not None:
++                            cam.depth_map = D_vda
++                            print(f"VDA_USAGE result=aligned stage=scene_init frame={cam.image_name}", flush=True)
++                        else:
++                            print(f"VDA_USAGE result=rejected stage=scene_init frame={cam.image_name}", flush=True)
++                    else:
++                        print(
++                            "VDA_TELEMETRY "
++                            + json.dumps(
++                                {
++                                    "result": "missing",
++                                    "reason": "missing_file",
++                                    "stage": "scene_init",
++                                    "frame": cam.image_name,
++                                },
++                                sort_keys=True,
++                                allow_nan=False,
++                            ),
++                            flush=True,
++                        )
++                        print(f"VDA_USAGE result=missing stage=scene_init frame={cam.image_name}", flush=True)
++
+             self.cameras_extent = 10.0
+             print(f'self.cameras_extent: {self.cameras_extent}')
+             self.gaussians.create_from_pcd(BasicPointCloud(points=pts3d, colors=None, normals=None), self.cameras_extent)
+@@ -166,4 +247,4 @@ class Scene:
+         return self.test_cameras[scale]
+     
+     def getAllCameras(self, scale=1.0):
+-        return self.getTrainCameras(scale) + self.getTestCameras(scale)
+\ No newline at end of file
++        return self.getTrainCameras(scale) + self.getTestCameras(scale)
+diff --git a/train.py b/train.py
+index 59f3e3c..c83c907 100755
+--- a/train.py
++++ b/train.py
+@@ -7,6 +7,7 @@
+ # license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+ 
++import json
+ import os
+ import numpy as np
+ 
+@@ -19,8 +20,9 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
+ 
+ 
+ import torch
++import torch.nn.functional as F
+ from random import randint
+-from utils.loss_utils import l1_loss, ssim, depth_loss
++from utils.loss_utils import l1_loss, ssim, depth_loss, ssi_loss, gradient_loss
+ from gaussian_renderer import render, network_gui
+ import sys
+ from scene import Scene, GaussianModel
+@@ -30,8 +32,11 @@ from tqdm import tqdm
+ from utils.image_utils import psnr
+ from argparse import ArgumentParser, Namespace
+ from arguments import ModelParams, PipelineParams, OptimizationParams
+-from utils.pose_utils import save_transforms, update_pose
+-from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute_scale
++from utils.pose_utils import (
++    save_transforms, update_pose, project_to_so3,
++    keypoint_grid_coverage, rotation_step_deg, reprojection_error,
++)
++from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute_scale, align_vda_depth_with_stats
+ from utils.mast3r_utils import Mast3rMatcher
+ import cv2
+ from scipy.optimize import least_squares
+@@ -75,7 +80,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+     start_view_id = 0
+     end_view_id = 1
+ 
+-    init_iteraion = opt.init_iteraion
++    init_iteration = opt.init_iteration
+     pose_iteration = opt.pose_iteration
+     local_iter = opt.local_iter
+     global_iter = opt.global_iter
+@@ -84,8 +89,8 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+ 
+     ## initialize ##
+     end_view_id = scene.init_frame_num
+-    opt.iterations = init_iteraion
+-    opt.update_until = init_iteraion
++    opt.iterations = init_iteration
++    opt.update_until = init_iteration
+     gaussians.training_setup(opt)
+     gaussians.training_pose_setup(scene.getTrainCameras()[0:end_view_id], opt)
+ 
+@@ -133,6 +138,12 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             midas_depth = viewpoint_cam.depth_map.detach().cuda()
+             Ldepth = depth_loss(midas_depth, rendered_depth)
+             loss += Ldepth * opt.depth_loss_weight
++            if opt.ssi_loss_weight > 0:
++                Lssi = ssi_loss(midas_depth, rendered_depth)
++                loss += Lssi * opt.ssi_loss_weight
++            if opt.grad_loss_weight > 0:
++                Lgrad = gradient_loss(midas_depth, rendered_depth)
++                loss += Lgrad * opt.grad_loss_weight
+ 
+         # 2D correspondence loss
+         if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid > 0:
+@@ -146,7 +157,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+             loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+             loss += loss_2d * opt.loss_2d_correspondence_weight
+-        
++
+         if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid < end_view_id - 2:
+             view1 = viewpoint_cam
+             view2 = scene.getTrainCameras()[viewpoint_cam.uid + 1]
+@@ -159,7 +170,8 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+             loss += loss_2d_2 * opt.loss_2d_correspondence_weight
+ 
+-        loss.backward()
++        if not torch.isnan(loss) and not torch.isinf(loss):
++            loss.backward()
+ 
+         with torch.no_grad():
+             # Progress bar
+@@ -193,9 +205,14 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+ 
+     end_view_id += 1
+ 
+-    # PnP retry limit to avoid infinite loop
+-    pnp_retry_count = {}
+-    max_pnp_retries = 10
++    # Build list of already-accepted camera indices for reference lookback
++    accepted_camera_indices = list(range(0, end_view_id - 1))
++    accepted_rotation_history = []
++    accepted_translation_history = []
++    for accepted_idx in accepted_camera_indices:
++        accepted_cam = scene.getTrainCameras()[accepted_idx]
++        accepted_rotation_history.append(accepted_cam.R.detach().cpu().numpy())
++        accepted_translation_history.append(accepted_cam.T.detach().cpu().numpy())
+ 
+     while start_view_id < num_views:
+         ## pose estimation ##
+@@ -206,68 +223,243 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+ 
+         viewpoint_stack = None
+         ema_loss_for_log = 0.0
+-        
++
+         if scene.getTrainCameras()[end_view_id-1].is_registered == False:
+             with torch.no_grad():
+-                pre_viewpoint_cam1 = scene.getTrainCameras()[end_view_id-2]
+-                viewpoint_cam = scene.getTrainCameras()[end_view_id-1]
+-
+-                pre_render_pkg = render(pre_viewpoint_cam1, gaussians, pipe, background, retain_grad=False)
+-                pre_rendered_depth = pre_render_pkg["depth"][0]
+-
++                viewpoint_cam = scene.getTrainCameras()[end_view_id - 1]
+                 intrinsic_np = viewpoint_cam.intrinsic.detach().cpu().numpy()
+-                viewpoint_cam.kp0, viewpoint_cam.kp1, _, _, _, _, _, _, viewpoint_cam.pre_depth_map, viewpoint_cam.depth_map = matcher._forward(pre_viewpoint_cam1.original_image, viewpoint_cam.original_image, intrinsic_np)
+-                viewpoint_cam.conf = torch.ones(viewpoint_cam.kp0.shape[0], device=viewpoint_cam.kp0.device)
+-                viewpoint_cam.kp0 = viewpoint_cam.kp0.cuda()
+-                viewpoint_cam.kp1 = viewpoint_cam.kp1.cuda()
+-                viewpoint_cam.depth_map = viewpoint_cam.depth_map.cuda()
+-                viewpoint_cam.pre_depth_map = viewpoint_cam.pre_depth_map.cuda()
+-
+-                pre_pts = unporject(pre_rendered_depth, pre_viewpoint_cam1.view_world_transform, pre_viewpoint_cam1.intrinsic, viewpoint_cam.kp0)
+-                
+-                kp1 = viewpoint_cam.kp1 / 2 + .5
+-                kp1[:, 0] *= viewpoint_cam.original_image.shape[2]
+-                kp1[:, 1] *= viewpoint_cam.original_image.shape[1]
+-                pre_pts_np = pre_pts.detach().cpu().numpy()
+-                kp1_np = kp1.detach().cpu().numpy()
+-
+-                success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(pre_pts_np, kp1_np, intrinsic_np, None, iterationsCount=200,reprojectionError=5.0,confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
+-
+-                if success and len(inliers) >= 4:
+-                    pre_pts_inliers = pre_pts_np[inliers].reshape(-1, 3)
+-                    kp1_inliers = kp1_np[inliers].reshape(-1, 2)
+-
+-                    initial_params = np.hstack((rotation_vector.flatten(), translation_vector.flatten()))
+-                    result = least_squares(reprojection_error, initial_params, 
+-                                        args=(pre_pts_inliers, kp1_inliers, intrinsic_np),
+-                                        verbose=0,  # Verbose mode to print loss
+-                                        ftol=1e-8, xtol=1e-8)
+-                    rotation_vector = result.x[:3]
+-                    translation_vector = result.x[3:]
+-                    viewpoint_cam.is_registered = True
+-                else:
+-                    print("Failed to solve PnP")
+-                    viewpoint_cam.is_registered = False
+-                    
+-                    frame_id = end_view_id - 1
+-                    pnp_retry_count[frame_id] = pnp_retry_count.get(frame_id, 0) + 1
+-                    
+-                    if pnp_retry_count[frame_id] >= max_pnp_retries:
+-                        print(f"Frame {frame_id} failed PnP after {max_pnp_retries} retries, skipping...")
++
++                # Reference lookback: try up to reference_lookback recent accepted cameras
++                reference_lookback = getattr(dataset, 'reference_lookback', 3)
++                reference_indices = accepted_camera_indices[-reference_lookback:]
++                accepted = False
++
++                for retry_index, reference_index in enumerate(reversed(reference_indices)):
++                    ref_viewpoint_cam = scene.getTrainCameras()[reference_index]
++
++                    pre_render_pkg = render(ref_viewpoint_cam, gaussians, pipe, background, retain_grad=False)
++                    pre_rendered_depth = pre_render_pkg["depth"][0]
++
++                    viewpoint_cam.kp0, viewpoint_cam.kp1, _, _, _, _, _, _, viewpoint_cam.pre_depth_map, viewpoint_cam.depth_map = matcher._forward(ref_viewpoint_cam.original_image, viewpoint_cam.original_image, intrinsic_np)
++                    viewpoint_cam.conf = torch.ones(viewpoint_cam.kp0.shape[0], device=viewpoint_cam.kp0.device)
++                    viewpoint_cam.kp0 = viewpoint_cam.kp0.cuda()
++                    viewpoint_cam.kp1 = viewpoint_cam.kp1.cuda()
++                    viewpoint_cam.depth_map = viewpoint_cam.depth_map.cuda()
++                    viewpoint_cam.pre_depth_map = viewpoint_cam.pre_depth_map.cuda()
++
++                    pre_pts = unporject(pre_rendered_depth, ref_viewpoint_cam.view_world_transform, ref_viewpoint_cam.intrinsic, viewpoint_cam.kp0)
++
++                    kp1 = viewpoint_cam.kp1 / 2 + .5
++                    kp1[:, 0] *= viewpoint_cam.original_image.shape[2]
++                    kp1[:, 1] *= viewpoint_cam.original_image.shape[1]
++                    pre_pts_np = pre_pts.detach().cpu().numpy()
++                    kp1_np = kp1.detach().cpu().numpy()
++
++                    match_count = int(pre_pts_np.shape[0])
++                    opencv_success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(pre_pts_np, kp1_np, intrinsic_np, None, iterationsCount=300, reprojectionError=8.0, confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
++                    inlier_count = int(len(inliers)) if inliers is not None else 0
++
++                    rejection_reasons = []
++                    reprojection_rmse_px = None
++                    grid_coverage = None
++                    positive_depth_ratio = None
++                    rotation_step = None
++                    translation_step_ratio = None
++
++                    if not opencv_success:
++                        rejection_reasons.append("opencv_failed")
++                    elif inlier_count < 4:
++                        rejection_reasons.append("too_few_inliers")
++
++                    if not rejection_reasons:
++                        inliers_flat = inliers.flatten()
++                        pre_pts_inliers = pre_pts_np[inliers_flat].reshape(-1, 3)
++                        kp1_inliers = kp1_np[inliers_flat].reshape(-1, 2)
++
++                        initial_params = np.hstack((rotation_vector.flatten(), translation_vector.flatten()))
++                        result = least_squares(reprojection_error, initial_params,
++                                            args=(pre_pts_inliers, kp1_inliers, intrinsic_np),
++                                            verbose=0, ftol=1e-8, xtol=1e-8)
++                        rotation_vector = result.x[:3]
++                        translation_vector = result.x[3:]
++                        reprojection_residual = reprojection_error(
++                            result.x, pre_pts_inliers, kp1_inliers, intrinsic_np)
++                        reprojection_rmse_value = float(np.sqrt(np.mean(reprojection_residual ** 2)))
++                        if np.isfinite(reprojection_rmse_value):
++                            reprojection_rmse_px = reprojection_rmse_value
++
++                        inlier_ratio_candidate = inlier_count / match_count if match_count else 0.0
++
++                        # Quality gate checks
++                        if match_count < getattr(dataset, 'min_match_count', 128):
++                            rejection_reasons.append("match_count")
++                        if inlier_count < getattr(dataset, 'min_inlier_count', 64):
++                            rejection_reasons.append("inlier_count")
++                        if inlier_ratio_candidate < getattr(dataset, 'min_inlier_ratio', 0.80):
++                            rejection_reasons.append("inlier_ratio")
++                        if reprojection_rmse_px is not None and reprojection_rmse_px > getattr(dataset, 'max_reprojection_rmse_px', 2.0):
++                            rejection_reasons.append("reprojection_rmse")
++
++                        # Grid coverage
++                        grid_coverage = keypoint_grid_coverage(
++                            kp1_inliers,
++                            viewpoint_cam.original_image.shape[2],
++                            viewpoint_cam.original_image.shape[1],
++                            grid_size=4,
++                        )
++                        if grid_coverage < getattr(dataset, 'min_grid_coverage', 0.375):
++                            rejection_reasons.append("grid_coverage")
++
++                        # Positive depth ratio (PnP camera coordinates)
++                        rot_mat_rodrigues, _ = cv2.Rodrigues(rotation_vector)
++                        t_vec = translation_vector.reshape(3, 1)
++                        cam_coords = (rot_mat_rodrigues @ pre_pts_inliers.T).T + t_vec.ravel()
++                        positive_depth_ratio = float((cam_coords[:, 2] > 0).mean())
++                        if positive_depth_ratio < getattr(dataset, 'min_positive_depth_ratio', 0.95):
++                            rejection_reasons.append("positive_depth_ratio")
++
++                        # Rotation step
++                        if accepted_rotation_history:
++                            last_accepted_r = accepted_rotation_history[-1]
++                            rot_mat_for_check, _ = cv2.Rodrigues(rotation_vector)
++                            rotation_step = rotation_step_deg(last_accepted_r, rot_mat_for_check)
++                            if rotation_step > getattr(dataset, 'max_rotation_step_deg', 25.0):
++                                rejection_reasons.append("rotation_step")
++
++                        # Translation step ratio (need 3+ inter-camera steps, i.e. 4+ cameras)
++                        if len(accepted_translation_history) >= 4:
++                            recent_trans_steps = []
++                            for i in range(1, min(8, len(accepted_translation_history))):
++                                recent_trans_steps.append(
++                                    np.linalg.norm(accepted_translation_history[-i] - accepted_translation_history[-i-1])
++                                )
++                            if recent_trans_steps:
++                                median_step = float(np.median(recent_trans_steps))
++                                if median_step > 1e-12:
++                                    current_step = np.linalg.norm(t_vec.ravel())
++                                    translation_step_ratio = current_step / median_step
++                                    if translation_step_ratio > getattr(dataset, 'max_translation_step_ratio', 6.0):
++                                        rejection_reasons.append("translation_step_ratio")
++
++                    # Emit telemetry for this attempt
++                    pose_stats = {
++                        "stage": "incremental",
++                        "frame": viewpoint_cam.image_name,
++                        "reference": ref_viewpoint_cam.image_name,
++                        "method": "pnp_ransac_refined",
++                        "opencv_success": bool(opencv_success),
++                        "accepted": len(rejection_reasons) == 0,
++                        "match_count": match_count,
++                        "inlier_count": inlier_count,
++                        "inlier_ratio": inlier_count / match_count if match_count else 0.0,
++                        "grid_coverage": grid_coverage,
++                        "positive_depth_ratio": positive_depth_ratio,
++                        "reprojection_rmse_px": reprojection_rmse_px,
++                        "rotation_step_deg": rotation_step,
++                        "translation_step_ratio": translation_step_ratio,
++                        "retry_index": retry_index,
++                        "rejection_reasons": rejection_reasons,
++                    }
++                    print(
++                        "POSE_TELEMETRY "
++                        + json.dumps(pose_stats, sort_keys=True, allow_nan=False),
++                        flush=True,
++                    )
++
++                    if not rejection_reasons:
++                        # All gates passed — accept this candidate
++                        accepted = True
++                        rotation_matrix, _ = cv2.Rodrigues(-rotation_vector)
++                        translation_vector = translation_vector.reshape(3)
++                        rotation_matrix = torch.from_numpy(rotation_matrix).float().cuda()
++                        translation_vector = torch.from_numpy(translation_vector).float().cuda()
++
++                        projected_rotation = project_to_so3(rotation_matrix)
++                        viewpoint_cam.update_RT(projected_rotation, translation_vector)
+                         viewpoint_cam.is_registered = True
+-                    else:
+-                        end_view_id -= 1
+ 
+-                rotation_matrix, _ = cv2.Rodrigues(-rotation_vector)
+-                translation_vector = translation_vector.reshape(3)
+-                rotation_matrix = torch.from_numpy(rotation_matrix).float().cuda()
+-                translation_vector = torch.from_numpy(translation_vector).float().cuda()
+-                
+-                viewpoint_cam.update_RT(rotation_matrix, translation_vector)
++                        viewpoint_cam.kp0 = viewpoint_cam.kp0[inliers_flat]
++                        viewpoint_cam.kp1 = viewpoint_cam.kp1[inliers_flat]
++                        viewpoint_cam.conf = viewpoint_cam.conf[inliers_flat]
++
++                        # Update accepted history
++                        accepted_camera_indices.append(end_view_id - 1)
++                        accepted_rotation_history.append(
++                            viewpoint_cam.R.detach().cpu().numpy()
++                        )
++                        accepted_translation_history.append(
++                            viewpoint_cam.T.detach().cpu().numpy()
++                        )
++                        break
++
++                if not accepted:
++                    raise RuntimeError(
++                        f"POSE_GATE_REJECTED frame={viewpoint_cam.image_name} "
++                        f"attempts={reference_lookback}"
++                    )
+ 
+                 scale, offset = compute_scale(pre_rendered_depth, viewpoint_cam.pre_depth_map, viewpoint_cam.kp0)
+                 viewpoint_cam.depth_map = viewpoint_cam.depth_map * scale + offset
+-                
++
++                if hasattr(dataset, 'depth_source') and dataset.depth_source != "mast3r":
++                    depth_dir = os.path.join(dataset.source_path, "depths")
++                    depth_file = os.path.join(
++                        depth_dir,
++                        os.path.splitext(viewpoint_cam.image_name)[0] + "_depth.npy"
++                    )
++                    corr_threshold = getattr(dataset, 'vda_corr_threshold', 0.3)
++                    outlier_sigma = getattr(dataset, 'vda_outlier_sigma', 2.5)
++                    min_correlation = getattr(dataset, 'min_correlation', 0.90)
++                    min_vda_inlier_ratio = getattr(dataset, 'min_vda_inlier_ratio', 0.95)
++                    max_normalized_rmse_vda = getattr(dataset, 'max_normalized_rmse', 0.10)
++                    if os.path.exists(depth_file):
++                        vda_v = torch.from_numpy(np.load(depth_file)).float().cuda()
++                        vda_v = F.interpolate(
++                            vda_v.unsqueeze(0).unsqueeze(0),
++                            size=(viewpoint_cam.image_height, viewpoint_cam.image_width),
++                            mode='bilinear', align_corners=False
++                        ).squeeze(0).squeeze(0)
++                        D_vda, vda_stats = align_vda_depth_with_stats(
++                            vda_v,
++                            viewpoint_cam.depth_map,
++                            corr_threshold=min_correlation,
++                            outlier_sigma=outlier_sigma,
++                            min_inlier_ratio=min_vda_inlier_ratio,
++                            max_normalized_rmse=max_normalized_rmse_vda,
++                        )
++                        vda_stats.update({
++                            "stage": "incremental",
++                            "frame": viewpoint_cam.image_name,
++                        })
++                        print(
++                            "VDA_TELEMETRY "
++                            + json.dumps(
++                                vda_stats, sort_keys=True, allow_nan=False
++                            ),
++                            flush=True,
++                        )
++                        if D_vda is not None:
++                            viewpoint_cam.depth_map = D_vda
++                            print(f"VDA_USAGE result=aligned stage=incremental frame={viewpoint_cam.image_name}", flush=True)
++                        else:
++                            print(f"VDA_USAGE result=rejected stage=incremental frame={viewpoint_cam.image_name}", flush=True)
++                    else:
++                        print(
++                            "VDA_TELEMETRY "
++                            + json.dumps(
++                                {
++                                    "result": "missing",
++                                    "reason": "missing_file",
++                                    "stage": "incremental",
++                                    "frame": viewpoint_cam.image_name,
++                                },
++                                sort_keys=True,
++                                allow_nan=False,
++                            ),
++                            flush=True,
++                        )
++                        print(f"VDA_USAGE result=missing stage=incremental frame={viewpoint_cam.image_name}", flush=True)
++
+             pose_optimizer = torch.optim.Adam([{"params": [viewpoint_cam.cam_trans_delta], "lr": opt.translation_lr_init}, {"params": [viewpoint_cam.cam_rot_delta], "lr": opt.rotation_lr_init}])
+             gt_image = viewpoint_cam.original_image.cuda()
+             
+@@ -277,9 +469,12 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 image = render_pkg["render"]
+                 rendered_depth = render_pkg["depth"][0]
+                 voxel_visible_mask = render_pkg["visible_mask"]
+-                occ_mask = get_occlusion_mask(viewpoint_cam=pre_viewpoint_cam1, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
++                occ_mask = get_occlusion_mask(viewpoint_cam=ref_viewpoint_cam, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
+ 
+-                Ll1 = l1_loss(image[:,occ_mask], gt_image[:,occ_mask])
++                if occ_mask.sum() > 0:
++                    Ll1 = l1_loss(image[:,occ_mask], gt_image[:,occ_mask])
++                else:
++                    Ll1 = l1_loss(image, gt_image)
+                 loss = Ll1
+ 
+                 # 2D correspondence loss
+@@ -295,7 +490,8 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                     loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+                     loss += loss_2d * opt.loss_2d_correspondence_weight
+ 
+-                loss.backward()
++                if not torch.isnan(loss) and not torch.isinf(loss):
++                    loss.backward()
+ 
+                 with torch.no_grad():
+                     pose_optimizer.step()
+@@ -311,7 +507,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             progress_bar.close()
+ 
+             with torch.no_grad():
+-                occ_mask = get_occlusion_mask(viewpoint_cam=pre_viewpoint_cam1, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
++                occ_mask = get_occlusion_mask(viewpoint_cam=ref_viewpoint_cam, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
+                 densify_mask = occ_mask.view(-1) == 0
+                 if densify_mask.sum() > 0:
+                     depth_ref =viewpoint_cam.depth_map.cuda()
+@@ -361,8 +557,14 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 midas_depth = viewpoint_cam.depth_map.detach().cuda()
+                 Ldepth = depth_loss(midas_depth, rendered_depth)
+                 loss += Ldepth * opt.depth_loss_weight
+-
+-            # 2D correspondence loss
++                if opt.ssi_loss_weight > 0:
++                    Lssi = ssi_loss(midas_depth, rendered_depth)
++                    loss += Lssi * opt.ssi_loss_weight
++                if opt.grad_loss_weight > 0:
++                    Lgrad = gradient_loss(midas_depth, rendered_depth)
++                    loss += Lgrad * opt.grad_loss_weight
++
++            # 2D correspondence loss (local)
+             if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid > 0:
+                 view1 = scene.getTrainCameras()[viewpoint_cam.uid - 1]
+                 view2 = viewpoint_cam
+@@ -389,7 +591,8 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+                 loss += loss_2d_2 * opt.loss_2d_correspondence_weight
+ 
+-            loss.backward()
++            if not torch.isnan(loss) and not torch.isinf(loss):
++                loss.backward()
+ 
+             with torch.no_grad():
+                 # Progress bar
+@@ -421,6 +624,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                     gaussians.pose_optimizer.zero_grad(set_to_none = True)
+                     update_pose(viewpoint_cam)
+         
++        torch.cuda.empty_cache()
+         opt.iterations = global_iter
+         opt.update_until = global_iter
+         gaussians.training_setup(opt)
+@@ -472,6 +676,12 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 midas_depth = viewpoint_cam.depth_map.detach().cuda()
+                 Ldepth = depth_loss(midas_depth, rendered_depth)
+                 loss += Ldepth * opt.depth_loss_weight
++                if opt.ssi_loss_weight > 0:
++                    Lssi = ssi_loss(midas_depth, rendered_depth)
++                    loss += Lssi * opt.ssi_loss_weight
++                if opt.grad_loss_weight > 0:
++                    Lgrad = gradient_loss(midas_depth, rendered_depth)
++                    loss += Lgrad * opt.grad_loss_weight
+ 
+             # # 2D correspondence loss
+             if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid > 0:
+@@ -500,7 +710,8 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+                 loss += loss_2d_2 * opt.loss_2d_correspondence_weight
+             
+-            loss.backward()
++            if not torch.isnan(loss) and not torch.isinf(loss):
++                loss.backward()
+ 
+             with torch.no_grad():
+                 # Progress bar
+@@ -664,6 +875,12 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             midas_depth = viewpoint_cam.depth_map.detach().cuda()
+             Ldepth = depth_loss(midas_depth, rendered_depth)
+             loss += Ldepth * opt.depth_loss_weight
++            if opt.ssi_loss_weight > 0:
++                Lssi = ssi_loss(midas_depth, rendered_depth)
++                loss += Lssi * opt.ssi_loss_weight
++            if opt.grad_loss_weight > 0:
++                Lgrad = gradient_loss(midas_depth, rendered_depth)
++                loss += Lgrad * opt.grad_loss_weight
+ 
+         # # 2D correspondence loss
+         if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid > 0:
+@@ -690,7 +907,8 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+             loss += loss_2d_2 * opt.loss_2d_correspondence_weight
+ 
+-        loss.backward()
++        if not torch.isnan(loss) and not torch.isinf(loss):
++            loss.backward()
+ 
+         with torch.no_grad():
+             # Progress bar
+@@ -855,4 +1073,4 @@ if __name__ == "__main__":
+     training(lp.extract(args), op.extract(args), pp.extract(args), dataset, args.debug_from, logger)
+     
+     # All done
+-    logger.info("\nTraining complete.")
+\ No newline at end of file
++    logger.info("\nTraining complete.")
+diff --git a/utils/graphics_utils.py b/utils/graphics_utils.py
+index 97f9671..da39e81 100755
+--- a/utils/graphics_utils.py
++++ b/utils/graphics_utils.py
+@@ -229,8 +229,186 @@ def compute_scale(depth1, depth2, keypoint):
+ 
+     return scale, offset
+ 
++
++def align_vda_depth_with_stats(
++    v,
++    D_ref,
++    corr_threshold=0.3,
++    outlier_sigma=2.5,
++    min_inlier_ratio=0.0,
++    max_normalized_rmse=None,
++):
++    """Align VDA relative depth (disparity-like, higher=near) to scene z-depth.
++
++    Fits ``a·v + b ≈ 1/D_ref`` in inverse-depth space via least squares,
++    applies one round of ``outlier_sigma`` rejection, then produces an
++    aligned z-depth ``D_vda = 1 / clamp(a·v + b, eps)``.
++
++    Args:
++        v: VDA disparity tensor (H, W), raw values from NPZ.
++        D_ref: Reference scene-scale z-depth tensor (H, W), higher=far.
++        corr_threshold: Minimum Pearson |ρ| between 1/D_vda and 1/D_ref;
++            if the fit is weaker the function returns None (caller falls back).
++        outlier_sigma: Residual threshold (in σ) for re-fit rejection.
++        min_inlier_ratio: Minimum inlier fraction; if below, return None.
++        max_normalized_rmse: Maximum residual RMSE / median(|1/D_ref|);
++            if exceeded, return None.  ``None`` disables the check.
++
++    Returns:
++        A pair ``(depth, stats)``. ``depth`` is aligned z-depth with the same
++        dtype/device as D_ref, or ``None`` when a safety check rejects it.
++        ``stats`` contains only JSON-serializable diagnostic values.
++    """
++    eps = 1e-6
++    inv_ref = 1.0 / (D_ref + eps)
++
++    # Mask: both v and D_ref must be finite and positive
++    mask = torch.isfinite(v) & torch.isfinite(D_ref) & (D_ref > eps) & (v > eps)
++    v_flat = v[mask].reshape(-1, 1).float()
++    inv_flat = inv_ref[mask].reshape(-1, 1).float()
++    inlier_indices = torch.nonzero(mask.reshape(-1), as_tuple=True)[0]
++
++    valid_count = int(v_flat.numel())
++    stats = {
++        "result": "rejected",
++        "reason": None,
++        "valid_count": valid_count,
++        "inlier_count": 0,
++        "inlier_ratio": 0.0,
++        "slope": None,
++        "offset": None,
++        "correlation": None,
++        "residual_rmse": None,
++        "normalized_rmse": None,
++    }
++
++    if v_flat.numel() < 100:
++        stats["reason"] = "insufficient_valid_points"
++        return None, stats
++
++    # --- first fit ---
++    A = torch.cat([v_flat, torch.ones_like(v_flat)], dim=1)  # [N, 2]
++    sol, *_ = torch.linalg.lstsq(A, inv_flat)
++    a, b = sol[0, 0], sol[1, 0]
++
++    # --- outlier rejection ---
++    residual = torch.abs(A @ sol - inv_flat).squeeze()
++    threshold = float(residual.std()) * outlier_sigma + float(residual.mean())
++    keep = residual <= threshold
++
++    # --- re-fit on inliers ---
++    used_indices = inlier_indices  # for correlation check
++    if keep.sum() >= 100:
++        A2, inv2 = A[keep], inv_flat[keep]
++        sol2, *_ = torch.linalg.lstsq(A2, inv2)
++        a, b = float(sol2[0, 0]), float(sol2[1, 0])
++        used_indices = inlier_indices[keep]
++
++    a, b = float(a), float(b)
++    stats["slope"] = a if math.isfinite(a) else None
++    stats["offset"] = b if math.isfinite(b) else None
++    stats["inlier_count"] = int(used_indices.numel())
++    stats["inlier_ratio"] = (
++        stats["inlier_count"] / valid_count if valid_count else 0.0
++    )
++
++    if not math.isfinite(a) or not math.isfinite(b):
++        stats["reason"] = "nonfinite_fit"
++        return None, stats
++
++    # --- slope safety valve: negative a means VDA and reference point in
++    #     opposite directions (higher v → lower 1/D), which violates the
++    #     disparity → z-depth model ---
++    if a <= 0:
++        print(f"[align_vda_depth] WARNING: negative slope a={a:.4f}, falling back")
++        stats["reason"] = "nonpositive_slope"
++        return None, stats
++
++    # --- correlation safety valve ---
++    if used_indices.numel() < 100:
++        stats["reason"] = "insufficient_inliers"
++        return None, stats
++    inv_vda_flat2 = (a * v.reshape(-1).float()[used_indices] + b)
++    inv_ref_flat2 = inv_ref.reshape(-1).float()[used_indices]
++    stacked = torch.stack([inv_vda_flat2, inv_ref_flat2], dim=0)
++    corr = torch.corrcoef(stacked)[0, 1]
++
++    corr_value = float(corr)
++    stats["correlation"] = corr_value if math.isfinite(corr_value) else None
++    residual_rmse = float(
++        torch.sqrt(torch.mean((inv_vda_flat2 - inv_ref_flat2) ** 2))
++    )
++    stats["residual_rmse"] = (
++        residual_rmse if math.isfinite(residual_rmse) else None
++    )
++
++    # --- normalized RMSE: residual / median(|1/D_ref|) ---
++    median_abs_inv_ref = float(torch.median(torch.abs(inv_ref_flat2)).item())
++    nrmse = residual_rmse / (median_abs_inv_ref + 1e-8)
++    stats["normalized_rmse"] = nrmse if math.isfinite(nrmse) else None
++
++    # --- quality gate: stricter checks beyond basic corr_threshold ---
++    if not math.isfinite(corr_value) or corr_value < corr_threshold:
++        print(f"[align_vda_depth] WARNING: low correlation ρ={float(corr):.4f}, falling back")
++        stats["reason"] = "low_correlation"
++        return None, stats
++
++    if stats["inlier_ratio"] < min_inlier_ratio:
++        print(f"[align_vda_depth] WARNING: low inlier ratio {stats['inlier_ratio']:.4f} < {min_inlier_ratio}, falling back")
++        stats["reason"] = "low_inlier_ratio"
++        return None, stats
++
++    if (max_normalized_rmse is not None
++            and stats["normalized_rmse"] is not None
++            and stats["normalized_rmse"] > max_normalized_rmse):
++        print(f"[align_vda_depth] WARNING: high normalized RMSE {stats['normalized_rmse']:.4f} > {max_normalized_rmse}, falling back")
++        stats["reason"] = "high_normalized_rmse"
++        return None, stats
++
++    # --- produce output, filling invalid pixels with reference depth ---
++    D_vda = 1.0 / torch.clamp(a * v + b, min=eps)
++    # Sanitise: non-finite outputs replaced by reference
++    bad = ~torch.isfinite(D_vda)
++    D_vda[bad] = D_ref[bad]
++    stats["result"] = "aligned"
++    stats["reason"] = None
++    return D_vda.to(device=D_ref.device, dtype=D_ref.dtype), stats
++
++
++def align_vda_depth(v, D_ref, corr_threshold=0.3, outlier_sigma=2.5):
++    """Backward-compatible alignment API returning only the depth tensor."""
++    depth, _ = align_vda_depth_with_stats(
++        v,
++        D_ref,
++        corr_threshold=corr_threshold,
++        outlier_sigma=outlier_sigma,
++    )
++    return depth
++
++
+ def get_depth_from_3d_points(pts_3d, w2c_pose):
+     pts_camera_h = geom_transform_points(pts_3d, w2c_pose)
+     depth = pts_camera_h[:, 2]  # The z-coordinate gives the depth
+-    
+-    return depth
+\ No newline at end of file
++
++    return depth
++
++
++def compute_texture_mask(image, threshold=0.05):
++    """Compute a per-pixel texture mask: low-texture regions get lower weight.
++    Returns a mask in [0, 1] where low-texture areas approach 0."""
++    if image.dim() == 3:
++        gray = image.mean(dim=0, keepdim=True)
++    else:
++        gray = image
++
++    grad_x = torch.abs(gray[:, :-1] - gray[:, 1:])
++    grad_y = torch.abs(gray[:-1, :] - gray[1:, :])
++
++    grad_mag = torch.zeros_like(gray)
++    grad_mag[:, :-1] += grad_x
++    grad_mag[:, 1:] += grad_x
++    grad_mag[:-1, :] += grad_y
++    grad_mag[1:, :] += grad_y
++
++    mask = (grad_mag > threshold).float()
++    return mask.squeeze(0)
