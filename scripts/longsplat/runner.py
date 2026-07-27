@@ -134,6 +134,31 @@ class LongSplatConfig:
     # Converter settings
     convert_iteration: int = 30_000
     convert_prune_ratio: float = 0.6
+    # Quality gate configuration (off by default for backward compatibility).
+    quality_gates: Any = None  # QualityGateConfig | None
+    # Expected native checkpoint iteration — if set, training must produce
+    # this exact iteration (sum of all stage iter counts).
+    expected_native_checkpoint_iteration: int | None = None
+
+
+# Parameter names that are owned by quality gates and must not appear
+# in extra_train_args (to prevent configuration drift).
+_GATE_OWNED_PARAMS = frozenset(
+    {
+        "min_match_count",
+        "min_inlier_count",
+        "min_inlier_ratio",
+        "max_reprojection_rmse_px",
+        "min_grid_coverage",
+        "min_positive_depth_ratio",
+        "max_rotation_step_deg",
+        "max_translation_step_ratio",
+        "reference_lookback",
+        "min_correlation",
+        "max_normalized_rmse",
+        "min_aligned_fraction",
+    }
+)
 
 
 def _validate_config(config: LongSplatConfig) -> None:
@@ -162,6 +187,23 @@ def _validate_config(config: LongSplatConfig) -> None:
     if not (0.0 <= config.convert_prune_ratio <= 1.0):
         raise BackendValidationError(
             f"convert_prune_ratio must be in [0.0, 1.0], got {config.convert_prune_ratio}"
+        )
+    # Validate expected_native_checkpoint_iteration if set
+    if config.expected_native_checkpoint_iteration is not None:
+        if (
+            type(config.expected_native_checkpoint_iteration) is not int
+            or config.expected_native_checkpoint_iteration <= 0
+        ):
+            raise BackendValidationError(
+                "expected_native_checkpoint_iteration must be a positive int, "
+                f"got {config.expected_native_checkpoint_iteration!r}"
+            )
+    # Gate-owned params must not appear in extra_train_args
+    gate_conflicts = _GATE_OWNED_PARAMS & set(config.extra_train_args)
+    if gate_conflicts:
+        raise BackendValidationError(
+            f"extra_train_args must not contain gate-owned params: "
+            f"{sorted(gate_conflicts)}. Use quality_gates config instead."
         )
 
 
@@ -424,16 +466,63 @@ def run_conversion(
 # ---------------------------------------------------------------------------
 
 
+def _reject_nonfinite(d: Any) -> Any:
+    """Recursively scan a JSON-decoded value and reject NaN/Infinity."""
+    import math
+
+    if isinstance(d, float):
+        if not math.isfinite(d):
+            raise BackendValidationError(f"non-finite float value: {d}")
+        return d
+    if isinstance(d, dict):
+        for k, v in d.items():
+            _reject_nonfinite(k)
+            _reject_nonfinite(v)
+        return d
+    if isinstance(d, (list, tuple)):
+        for item in d:
+            _reject_nonfinite(item)
+        return d
+    return d
+
+
+def _check_not_bool(value: Any, name: str) -> None:
+    """Reject bool where int/float is expected (bool is a subclass of int)."""
+    if isinstance(value, bool):
+        raise BackendValidationError(
+            f"{name} must not be a boolean (got {value!r})"
+        )
+
+
 def load_config(path: str | Path) -> LongSplatConfig:
-    """Load a LongSplatConfig from a JSON file.  Unknown keys fail loudly."""
+    """Load a LongSplatConfig from a JSON file.  Unknown keys fail loudly.
+
+    Rejects non-finite numeric values, booleans masquerading as integers,
+    and unknown top-level keys.
+    """
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
+
+    # Reject NaN/Inf anywhere in the parsed data
+    _reject_nonfinite(data)
+
     known = set(LongSplatConfig.__dataclass_fields__)
-    unknown = set(data) - known - {"extra_train_args"}
+    allowed_extra = {"extra_train_args", "quality_gates", "expected_native_checkpoint_iteration"}
+    unknown = set(data) - known - allowed_extra
     if unknown:
         raise BackendValidationError(
-            f"Unknown config keys: {sorted(unknown)}. Known: {sorted(known)}"
+            f"Unknown config keys: {sorted(unknown)}. Known: {sorted(known | allowed_extra)}"
         )
+
+    # Reject bool-as-int for known integer fields
+    _int_fields = {"iterations", "convert_iteration", "seed", "resolution", "sh_degree"}
+    for int_field in _int_fields:
+        if int_field in data:
+            _check_not_bool(data[int_field], int_field)
+
+    if "expected_native_checkpoint_iteration" in data:
+        _check_not_bool(data["expected_native_checkpoint_iteration"], "expected_native_checkpoint_iteration")
+
     # Validate extra_train_args if present
     if "extra_train_args" in data:
         if not isinstance(data["extra_train_args"], dict):
@@ -446,9 +535,32 @@ def load_config(path: str | Path) -> LongSplatConfig:
                 raise BackendValidationError(
                     f"Config extra_train_args must not override reserved param: {key}"
                 )
+            if key in _GATE_OWNED_PARAMS:
+                raise BackendValidationError(
+                    f"Config extra_train_args must not contain gate-owned param: {key}. "
+                    f"Use quality_gates config instead."
+                )
+
+    # Parse quality_gates if present
+    quality_gates = None
+    if "quality_gates" in data:
+        qg_data = data.pop("quality_gates")
+        if qg_data is not None:
+            if not isinstance(qg_data, dict):
+                raise BackendValidationError(
+                    f"quality_gates must be a dict or null, got {type(qg_data).__name__}"
+                )
+            from scripts.longsplat.quality_gates import QualityGateConfig
+
+            quality_gates = QualityGateConfig.from_dict(qg_data)
+
+    expected_checkpoint = data.pop("expected_native_checkpoint_iteration", None)
+
     cfg = LongSplatConfig(
         **{k: v for k, v in data.items() if k in LongSplatConfig.__dataclass_fields__}
     )
+    cfg.quality_gates = quality_gates
+    cfg.expected_native_checkpoint_iteration = expected_checkpoint
     _validate_config(cfg)
     return cfg
 
@@ -457,4 +569,10 @@ def config_to_dict(config: LongSplatConfig) -> dict[str, Any]:
     """Convert config to a JSON-serialisable dict for run records."""
     from dataclasses import asdict
 
-    return asdict(config)
+    d = asdict(config)
+    # Replace quality_gates object with its dict representation
+    if config.quality_gates is not None:
+        d["quality_gates"] = config.quality_gates.to_dict()
+    else:
+        d["quality_gates"] = None
+    return d
