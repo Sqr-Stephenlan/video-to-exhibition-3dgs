@@ -36,6 +36,7 @@ from .manifest_adapter import adapt_manifest
 from .prepare_input import prepare_input
 from .provenance import sha256_file
 from .quality_gates import audit_pose_quality
+from .quality_metrics import analyze_ply_quality
 from .run_record import (
     RunStatus,
     add_artifact,
@@ -698,7 +699,69 @@ def run_pipeline(
             },
         )
 
-        # --- 11. Complete ---
+        # --- 11. PLY publication gate ---
+        if config.quality_gates is not None and config.quality_gates.ply.mode == "enforce":
+            _echo("Running PLY publication gate ...")
+            ply_quality = analyze_ply_quality(converted_ply)
+
+            ply_gate = config.quality_gates.ply
+            ply_reasons: list[str] = []
+
+            effective_frac = ply_quality.get("effective_fraction", 0.0)
+            if effective_frac < ply_gate.min_effective_fraction:
+                ply_reasons.append(
+                    f"effective_fraction {effective_frac:.4f} < {ply_gate.min_effective_fraction}"
+                )
+
+            aniso_q99 = ply_quality.get("anisotropy_q99", 0.0)
+            if aniso_q99 > ply_gate.max_anisotropy_q99:
+                ply_reasons.append(
+                    f"anisotropy_q99 {aniso_q99:.2f} > {ply_gate.max_anisotropy_q99}"
+                )
+
+            quat_frac = ply_quality.get("quaternion_within_1pct_fraction", 0.0)
+            if quat_frac < ply_gate.min_unit_quaternion_fraction:
+                ply_reasons.append(
+                    f"unit_quaternion_fraction {quat_frac:.6f} < {ply_gate.min_unit_quaternion_fraction}"
+                )
+
+            record.setdefault("quality_gates", {})["ply"] = {
+                "thresholds": {
+                    "min_effective_fraction": ply_gate.min_effective_fraction,
+                    "max_anisotropy_q99": ply_gate.max_anisotropy_q99,
+                    "min_unit_quaternion_fraction": ply_gate.min_unit_quaternion_fraction,
+                },
+                "passed": len(ply_reasons) == 0,
+                "reasons": ply_reasons,
+                "metrics": {
+                    "effective_fraction": effective_frac,
+                    "anisotropy_q99": aniso_q99,
+                    "quaternion_within_1pct_fraction": quat_frac,
+                    "finite_core_fraction": ply_quality.get("finite_core_fraction", 0.0),
+                },
+            }
+            write_run_record(record, run_dir)
+
+            if ply_reasons:
+                transition_status(
+                    record,
+                    run_dir,
+                    RunStatus.FAILED,
+                    stage="ply_publication_gate",
+                    details={
+                        "status": "failed",
+                        "reasons": ply_reasons,
+                        "metrics": record["quality_gates"]["ply"]["metrics"],
+                    },
+                )
+                _echo(
+                    f"PLY publication gate FAILED: {'; '.join(ply_reasons)}",
+                    file=sys.stderr,
+                )
+                return 1
+            _echo("PLY publication gate passed.")
+
+        # --- 12. Complete ---
         transition_status(record, run_dir, RunStatus.COMPLETE)
         _echo("Pipeline complete.")
         return 0

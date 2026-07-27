@@ -1,0 +1,177 @@
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index b54c78f..4f37d96 100755
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -163,6 +163,8 @@ class OptimizationParams(ParamGroup):
+         self.ssi_loss_weight = 0.05
+         self.grad_loss_weight = 0.02
+         self.plane_normal_loss_weight = 0.0
++        self.anisotropy_reg_weight = 0.0
++        self.anisotropy_soft_limit = 30.0
+         self.depth_l1_weight_init = 0.1
+         self.depth_l1_weight_final = 0.1
+         self.reproj_loss_weight_init = 1.0
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index 67707d7..67e0255 100755
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -665,7 +665,14 @@ class GaussianModel:
+         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+         opacities = self._opacity.detach().cpu().numpy()
+         scale = self._scaling.detach().cpu().numpy()
+-        rotation = self._rotation.detach().cpu().numpy()
++        rot_tensor = self._rotation.detach()
++        rot_norm = torch.linalg.vector_norm(rot_tensor, dim=1, keepdim=True)
++        identity = torch.zeros_like(rot_tensor)
++        identity[:, 0] = 1.0
++        rot_tensor = torch.where(
++            rot_norm > 1e-8, rot_tensor / rot_norm.clamp_min(1e-8), identity,
++        )
++        rotation = rot_tensor.cpu().numpy()
+ 
+         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+ 
+@@ -684,7 +691,14 @@ class GaussianModel:
+         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+         opacities = self._opacity.detach().cpu().numpy()
+         scale = self._scaling.detach().cpu().numpy()
+-        rotation = self._rotation.detach().cpu().numpy()
++        rot_tensor = self._rotation.detach()
++        rot_norm = torch.linalg.vector_norm(rot_tensor, dim=1, keepdim=True)
++        identity = torch.zeros_like(rot_tensor)
++        identity[:, 0] = 1.0
++        rot_tensor = torch.where(
++            rot_norm > 1e-8, rot_tensor / rot_norm.clamp_min(1e-8), identity,
++        )
++        rotation = rot_tensor.cpu().numpy()
+ 
+         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes_3dgs()]
+ 
+diff --git a/train.py b/train.py
+index 2408642..7d90a76 100755
+--- a/train.py
++++ b/train.py
+@@ -22,7 +22,7 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
+ import torch
+ import torch.nn.functional as F
+ from random import randint
+-from utils.loss_utils import l1_loss, ssim, depth_loss, ssi_loss, gradient_loss, make_depth_quality_mask, normal_consistency_loss
++from utils.loss_utils import l1_loss, ssim, depth_loss, ssi_loss, gradient_loss, make_depth_quality_mask, normal_consistency_loss, anisotropy_regularization
+ from gaussian_renderer import render, network_gui
+ import sys
+ from scene import Scene, GaussianModel
+@@ -181,6 +181,13 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             ssim_loss = (1 - ssim(image, gt_image))
+         scaling_reg = scaling.prod(dim=1).mean()
+         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
++        anisotropy_loss_val = torch.tensor(0.0, device="cuda")
++        if getattr(opt, "anisotropy_reg_weight", 0.0) > 0:
++            La = anisotropy_regularization(
++                scaling, soft_limit=getattr(opt, "anisotropy_soft_limit", 30.0))
++            contrib_a = La * opt.anisotropy_reg_weight
++            anisotropy_loss_val = contrib_a.detach()
++            loss = loss + contrib_a
+ 
+         # Depth loss
+         depth_loss_val = torch.tensor(0.0, device="cuda")
+@@ -236,7 +243,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 iteration, "init", loss,
+                 (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg,
+                 depth_loss_val, Lnormal,
+-                torch.tensor(0.0, device="cuda"),
++                anisotropy_loss_val,
+             )
+ 
+         if not torch.isfinite(loss):
+@@ -623,6 +630,13 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 ssim_loss = (1 - ssim(image, gt_image))
+             scaling_reg = scaling.prod(dim=1).mean()
+             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
++            anisotropy_loss_val = torch.tensor(0.0, device="cuda")
++            if getattr(opt, "anisotropy_reg_weight", 0.0) > 0:
++                La = anisotropy_regularization(
++                    scaling, soft_limit=getattr(opt, "anisotropy_soft_limit", 30.0))
++                contrib_a = La * opt.anisotropy_reg_weight
++                anisotropy_loss_val = contrib_a.detach()
++                loss = loss + contrib_a
+ 
+             # Depth loss
+             depth_loss_val = torch.tensor(0.0, device="cuda")
+@@ -680,7 +694,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                     iteration, "local", loss,
+                     (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg,
+                     depth_loss_val, Lnormal,
+-                    torch.tensor(0.0, device="cuda"),
++                    anisotropy_loss_val,
+                 )
+ 
+             if not torch.isfinite(loss):
+@@ -765,6 +779,13 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 ssim_loss = (1 - ssim(image, gt_image))
+             scaling_reg = scaling.prod(dim=1).mean()
+             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
++            anisotropy_loss_val = torch.tensor(0.0, device="cuda")
++            if getattr(opt, "anisotropy_reg_weight", 0.0) > 0:
++                La = anisotropy_regularization(
++                    scaling, soft_limit=getattr(opt, "anisotropy_soft_limit", 30.0))
++                contrib_a = La * opt.anisotropy_reg_weight
++                anisotropy_loss_val = contrib_a.detach()
++                loss = loss + contrib_a
+ 
+             # Depth loss
+             depth_loss_val = torch.tensor(0.0, device="cuda")
+@@ -822,7 +843,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                     iteration, "global", loss,
+                     (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg,
+                     depth_loss_val, Lnormal,
+-                    torch.tensor(0.0, device="cuda"),
++                    anisotropy_loss_val,
+                 )
+ 
+             if not torch.isfinite(loss):
+@@ -987,6 +1008,13 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             ssim_loss = (1 - ssim(image, gt_image))
+         scaling_reg = scaling.prod(dim=1).mean()
+         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
++        anisotropy_loss_val = torch.tensor(0.0, device="cuda")
++        if getattr(opt, "anisotropy_reg_weight", 0.0) > 0:
++            La = anisotropy_regularization(
++                scaling, soft_limit=getattr(opt, "anisotropy_soft_limit", 30.0))
++            contrib_a = La * opt.anisotropy_reg_weight
++            anisotropy_loss_val = contrib_a.detach()
++            loss = loss + contrib_a
+ 
+         # Depth loss
+         depth_loss_val = torch.tensor(0.0, device="cuda")
+@@ -1042,7 +1070,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 iteration, "refinement", loss,
+                 (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg,
+                 depth_loss_val, Lnormal,
+-                torch.tensor(0.0, device="cuda"),
++                anisotropy_loss_val,
+             )
+ 
+         if not torch.isfinite(loss):
+diff --git a/utils/loss_utils.py b/utils/loss_utils.py
+index e7fed8b..d897313 100755
+--- a/utils/loss_utils.py
++++ b/utils/loss_utils.py
+@@ -241,3 +241,18 @@ def normal_consistency_loss(
+     return (1.0 - cos_sim).mean()
+ 
+ 
++def anisotropy_regularization(
++    scaling: torch.Tensor,
++    *,
++    soft_limit: float,
++) -> torch.Tensor:
++    """Penalise needle-like splats whose axis ratio exceeds *soft_limit*.
++
++    Returns a scalar loss; strictly 0 when every Gaussian's
++    ``max(scale) / min(scale) <= soft_limit``.
++    """
++    import math
++
++    safe = scaling.clamp_min(1e-8)
++    log_ratio = torch.log(safe.amax(dim=1)) - torch.log(safe.amin(dim=1))
++    return torch.relu(log_ratio - math.log(soft_limit)).square().mean()
