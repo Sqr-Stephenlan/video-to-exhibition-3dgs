@@ -91,6 +91,57 @@ def test_coverage_selection_is_explicit_and_preserves_manifest_additivity() -> N
     assert all(decision.component_id == 0 for decision in decisions if decision.selected)
 
 
+def test_coverage_selection_reinitializes_after_rejected_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    def frame(index: int, timestamp: float, blur: float) -> pk.ScannedFrame:
+        bits = np.zeros(64, dtype=bool)
+        bits[: index * 8] = True
+        return pk.ScannedFrame(
+            id=f"segment_0001_frame_{index:06d}",
+            segment_id="segment_0001",
+            sample_index=index,
+            timestamp_sec=timestamp,
+            frame_index=index,
+            blur_score=blur,
+            calibrated_blur_score=blur,
+            overexposed_ratio=0.0,
+            underexposed_ratio=0.0,
+            average_hash_bits=bits,
+            flow_gray=np.full((8, 8), index, dtype=np.uint8),
+            width=8,
+            height=8,
+        )
+
+    def fake_motion(reference: np.ndarray, candidate: np.ndarray, _policy: pk.KeyframePolicy) -> pk.MotionMetrics:
+        reference_index = int(reference[0, 0])
+        candidate_index = int(candidate[0, 0])
+        if reference_index == 1 and candidate_index == 2:
+            return pk.MotionMetrics(True, 100, 100, 1.0, 1.0, 0.01, 0.0, 1.0, 0.001)
+        return pk.MotionMetrics(False, 100, 0, 0.0, 0.0, 0.0, None, None, None, "motion_break")
+
+    monkeypatch.setattr(pk, "estimate_pair_motion", fake_motion)
+    frames = [
+        frame(0, 0.0, 100.0),
+        frame(1, 0.2, 1.0),
+        frame(2, 0.4, 100.0),
+    ]
+
+    decisions = pk.select_coverage_frames(
+        frames,
+        policy(
+            blur_threshold=10.0,
+            adaptive_blur_percentile=0.0,
+            selection_min_gap_sec=0.1,
+            selection_target_gap_sec=0.2,
+            selection_max_gap_sec=0.3,
+        ),
+    )
+
+    assert [decision.selected for decision in decisions] == [True, False, True]
+    assert "blur" in decisions[1].reject_reasons
+    assert decisions[2].reference_frame_id == frames[1].id
+    assert decisions[2].bridge is True
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [

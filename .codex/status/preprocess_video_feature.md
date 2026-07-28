@@ -1,12 +1,17 @@
 # Preprocess Video Feature Status
 
-Last updated: 2026-07-27
+Last updated: 2026-07-28
 
 ## Current Phase
 
 Stage 3 - The opt-in `coverage_v1` keyframe policy is implemented on top of the
 formal schema 2.0 manifest contract. The default remains `legacy`; fidelity
 frame extraction remains part of the same preprocess entrypoint.
+
+The 2026-07-28 Ready precheck follow-up addressed the verified P1 coverage and
+provenance issues in this branch. PR #2 should still remain Draft until the
+schema 2.0 downstream adapter migration is completed or explicitly owned by the
+depth-prior / LongSplat branches.
 
 The feature now has a single CLI entrypoint, focused tests, and user-facing
 documentation. FFmpeg and ffprobe are now installed on PATH, the FFmpeg smoke
@@ -15,6 +20,11 @@ schema `2.0`; generated output is staged and published only after a successful
 run. The feature documentation covers usage, configuration, tuning, manifest
 consumption, downstream consumer contracts, troubleshooting, and generated-
 asset boundaries.
+
+PR #2 remains Draft. Its body now reflects HEAD `75b5204`, the 16-file scope,
+current test evidence, and the unresolved owner decisions for protected shared
+files, dependency/license policy, real-video threshold acceptance, and the
+`scripts/preprocess_video.py` versus `scripts/preprocess/**` layout conflict.
 
 ## Completed
 
@@ -36,6 +46,19 @@ asset boundaries.
 - Added focused synthetic tests for fixed-resolution blur, 2D motion metrics,
   configuration validation, manifest additivity, coverage smoke processing,
   quality reports, and auditing.
+- Addressed the 2026-07-28 Ready precheck P1 findings:
+  - `coverage_v1` can reinitialize against the previous scanned frame when the
+    last selected reference is stale, the selected-frame gap has exceeded the
+    policy maximum, and local motion passes the hard/bridge safety gates;
+  - `summary.coverage_by_segment` now includes segment start/end boundary gaps
+    and uses the same `selection_max_gap_sec` target as
+    `summary.keyframe_quality` for coverage-policy runs;
+  - `summary.keyframe_quality` records `max_selected_gap_target_sec`;
+  - repository provenance is captured before `.preprocess-staging` is created,
+    so staging writes no longer make an otherwise clean checkout appear dirty;
+  - added a schema 2.0 contract fixture at
+    `tests/fixtures/preprocess/frames_manifest_v2_minimal.json` for downstream
+    adapter migration tests.
 
 - Read and followed `.codex/prompts/preprocess_video_feature.md`.
 - Added `requirements.txt` with the minimal preprocess dependency set:
@@ -107,6 +130,9 @@ asset boundaries.
 - Added regression coverage for the new manifest contract, strict paths,
   staged overwrite behavior, VFR rejection, rotation handling, duplicate
   coverage, provenance, and artifact dimensions/checksums.
+- Refreshed PR #2 metadata for HEAD `75b5204`, retained Draft status, replied
+  to the stale `VideoCapture` release review thread with its regression-test
+  evidence, and resolved that thread.
 - Added config-driven parameter tuning:
   - `--config <path>` loads preprocessing settings from a dependency-free JSON
     file.
@@ -148,14 +174,32 @@ asset boundaries.
 ## Verification
 
 - Ran through Git Bash and the required project entrypoint on 2026-07-27:
-  `./dev.sh pytest tests/unit/test_preprocess_keyframes.py
-  tests/unit/test_preprocess_video.py -q --basetemp=.tmp/pytest-all-2`; result:
-  `46 passed`. Pytest emitted one cache warning because the managed sandbox
+  `./dev.sh pytest tests/unit tests/integration -q
+  --basetemp=.tmp/pytest-review`; result: `47 passed`. Pytest emitted one cache
+  warning because the managed sandbox
   denied writes to `.pytest_cache`; test temporary data used the repository
   `.tmp/` directory.
 - Ran `./dev.sh python -m compileall -q scripts tests/unit`; result: exit 0.
 - Ran `./dev.sh python scripts/preprocess_video.py --help`; result: exit 0 and
   the coverage/audit options are listed.
+- Ran through Git Bash and the required project entrypoint on 2026-07-28:
+  `./dev.sh pytest tests/unit/test_preprocess_keyframes.py
+  tests/unit/test_preprocess_video.py -q --basetemp=.tmp/pytest-p1-fixes`;
+  result: `52 passed`. Pytest emitted one cache warning because the managed
+  sandbox denied writes to `.pytest_cache`; test temporary data used the
+  repository `.tmp/` directory.
+- Ran `./dev.sh python -m compileall -q scripts tests/unit`; result: exit 0.
+- Ran `./dev.sh pytest tests/unit tests/integration -q
+  --basetemp=.tmp/pytest-final-p1`; result: `52 passed` with the same
+  `.pytest_cache` warning.
+- Re-ran `data/raw_videos/easy2.mp4` with `coverage_v1`, time segmentation,
+  source PNG frames, and no rejected-image output:
+  `easy2_coverage_recovery` produced 366 candidates, 175 selected, 191
+  rejected, and 72 bridge frames. The run still failed closed because the
+  unified 0.3-second coverage target was exceeded in all three segments
+  (`3.6`, `3.4`, and `2.0` seconds), but this verifies recovery from the
+  previous 8/366 selected-frame collapse and confirms summary/keyframe quality
+  now report the same gap target.
 
 - Ran through the project Python entrypoint with Git Bash:
   `./dev.sh pytest`
@@ -338,16 +382,18 @@ asset boundaries.
   Three segment coverage audits exceeded the 2.0-second target, caused by blur
   rejection rather than duplicate filtering; they are recorded, not silently
   overridden with low-quality frames.
-- Ran `compileall` successfully with the existing `.venv` interpreter. The
-  repository-required `./dev.sh pytest` command could not be launched from the
-  current PowerShell session because Bash is unavailable; the direct venv run
-  used the same project interpreter and passed the focused suite.
+- Located Git for Windows Bash at `D:/Program Files/Git/bin/bash.exe` and used
+  it to run all current checks through `./dev.sh`; no direct venv invocation was
+  needed for the final verification pass.
 
 ## Next Step
 
-Update the PR body to reflect the current HEAD after this follow-up, retain
-Draft status until the new manifest contract and real-video evidence are
-reviewed, and request reviewer approval before switching the PR out of Draft.
+Retain Draft status until the owner explicitly disposes the protected shared
+file changes and dependency/license policy, resolves the script-layout conflict,
+accepts the real-video threshold/coverage evidence, and either migrates the
+depth-prior / LongSplat adapters to schema 2.0 or assigns owners and a concrete
+compatibility plan. Only then request reviewer approval before switching the PR
+out of Draft.
 
 For `restricted_test`, review the `blur=60` and `blur=80` outputs before
 deciding whether the baseline should move from `55` to `60`, or whether the

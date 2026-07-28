@@ -922,10 +922,7 @@ def _coverage_segment_quality(
 ) -> dict[str, Any]:
     selected = [frame for frame, decision in zip(scanned, decisions) if decision.selected]
     timestamps = [frame.timestamp_sec for frame in selected]
-    gaps = [right - left for left, right in zip(timestamps, timestamps[1:])]
-    if timestamps:
-        gaps.extend([timestamps[0] - segment.start_sec, segment.end_sec - timestamps[-1]])
-    max_gap = round_sec(max(gaps, default=0.0))
+    max_gap = selected_frame_max_gap(segment, timestamps)
     failed_reasons: list[str] = []
     if not selected:
         failed_reasons.append("no_selected_frames")
@@ -942,6 +939,15 @@ def _coverage_segment_quality(
         "bridge_frames": bridge_count,
         "failed_reasons": failed_reasons,
     }
+
+
+def selected_frame_max_gap(segment: SegmentWindow, timestamps: Iterable[float]) -> float:
+    ordered = sorted(timestamps)
+    if not ordered:
+        return round_sec(segment.duration_sec)
+    gaps = [right - left for left, right in zip(ordered, ordered[1:])]
+    gaps.extend([ordered[0] - segment.start_sec, segment.end_sec - ordered[-1]])
+    return round_sec(max(gaps, default=0.0))
 
 
 def sample_segment_frames_coverage(
@@ -1064,9 +1070,11 @@ def summarize_frames(
     frames: Iterable[FrameRecord],
     max_selected_gap_sec: float | None = None,
 ) -> dict[str, Any]:
+    segment_list = list(segments)
     segment_counts: dict[str, dict[str, int]] = {
-        segment.id: {"total": 0, "selected": 0, "rejected": 0} for segment in segments
+        segment.id: {"total": 0, "selected": 0, "rejected": 0} for segment in segment_list
     }
+    segment_by_id = {segment.id: segment for segment in segment_list}
     selected_timestamps: dict[str, list[float]] = {segment_id: [] for segment_id in segment_counts}
     reject_counts: Counter[str] = Counter()
     total = selected = rejected = 0
@@ -1084,7 +1092,15 @@ def summarize_frames(
             reject_counts.update(frame.reject_reasons)
 
     coverage_by_segment: dict[str, dict[str, Any]] = {}
+    for segment_id, segment in segment_by_id.items():
+        observed_gap = selected_frame_max_gap(segment, selected_timestamps.get(segment_id, []))
+        coverage_by_segment[segment_id] = {
+            "max_selected_gap_sec": observed_gap,
+            "exceeds_target": max_selected_gap_sec is not None and observed_gap > max_selected_gap_sec,
+        }
     for segment_id, timestamps in selected_timestamps.items():
+        if segment_id in coverage_by_segment:
+            continue
         ordered = sorted(timestamps)
         gaps = [right - left for left, right in zip(ordered, ordered[1:])]
         observed_gap = round_sec(max(gaps, default=0.0))
@@ -1141,7 +1157,12 @@ def build_manifest(
     invalid_frames = [frame.id for frame in frames if frame.width <= 0 or frame.height <= 0]
     if invalid_frames:
         raise PreprocessError(f"Frame records must include positive dimensions: {', '.join(invalid_frames[:3])}")
-    summary = summarize_frames(segments, frames, settings.get("max_selected_gap_sec"))
+    coverage_target = (
+        settings.get("selection_max_gap_sec")
+        if settings.get("keyframe_policy") == "coverage_v1"
+        else settings.get("max_selected_gap_sec")
+    )
+    summary = summarize_frames(segments, frames, coverage_target)
     if keyframe_quality is not None:
         summary["keyframe_quality"] = keyframe_quality
     return {
@@ -1473,6 +1494,7 @@ def preprocess(args: argparse.Namespace, command_args: list[str] | None = None) 
     require_tool("ffprobe")
     settings = resolve_settings(args)
     source_metadata = probe_video(source)
+    revision, dirty = repository_state(repo_root)
     if settings["frame_source"] == "source" and source_metadata.is_vfr:
         raise PreprocessError(
             "--frame-source source is not timestamp-safe for variable-frame-rate input. "
@@ -1572,6 +1594,7 @@ def preprocess(args: argparse.Namespace, command_args: list[str] | None = None) 
                 "bridge_frames": sum(item["bridge_frames"] for item in segment_quality),
                 "component_count": max((item["component_count"] for item in segment_quality), default=0),
                 "max_selected_gap_sec": round_sec(max((item["max_selected_gap_sec"] for item in segment_quality), default=0.0)),
+                "max_selected_gap_target_sec": policy.max_gap_sec,
                 "min_motion_inlier_ratio": policy.min_motion_inlier_ratio,
                 "min_motion_grid_coverage": policy.min_motion_grid_coverage,
                 "failed_segments": [item["segment_id"] for item in failed_segments],
@@ -1586,7 +1609,6 @@ def preprocess(args: argparse.Namespace, command_args: list[str] | None = None) 
             write_manifest(report, manifests_dir / "keyframe_quality_report.json")
 
         settings_fingerprint = stable_hash(settings)
-        revision, dirty = repository_state(repo_root)
         raw_command_args = command_args or [str(args.source_video), "--video-id", args.video_id]
         run = {
             "id": f"{args.video_id}-{(source_metadata.sha256 or 'unknown')[:12]}-{settings_fingerprint[:12]}",

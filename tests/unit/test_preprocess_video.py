@@ -347,7 +347,102 @@ def test_manifest_writes_stable_relative_paths(tmp_path: Path) -> None:
     assert loaded["frames"][0]["width"] == 640
     assert loaded["frames"][0]["height"] == 480
     assert loaded["summary"]["selected_frames"] == 1
-    assert loaded["summary"]["coverage_by_segment"]["segment_0001"]["max_selected_gap_sec"] == 0.0
+    assert loaded["summary"]["coverage_by_segment"]["segment_0001"]["max_selected_gap_sec"] == 12.3
+
+
+def test_manifest_v2_contract_fixture_has_selected_frame_mapping() -> None:
+    fixture_path = ROOT / "tests" / "fixtures" / "preprocess" / "frames_manifest_v2_minimal.json"
+    manifest = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    assert manifest["schema_version"] == "2.0"
+    assert {segment["id"] for segment in manifest["segments"]} == {"segment_0001"}
+    selected_frames = [frame for frame in manifest["frames"] if frame["selected"]]
+    assert [frame["id"] for frame in selected_frames] == ["segment_0001_frame_000001"]
+    assert selected_frames[0]["segment_id"] == "segment_0001"
+    assert selected_frames[0]["path"].startswith("data/frames/contract_v2/selected/")
+    assert selected_frames[0]["sha256"]
+    assert "working_tree_dirty" in manifest["run"]["code"]
+
+
+def test_summary_coverage_counts_segment_boundaries() -> None:
+    segment = pv.SegmentWindow("segment_0001", 1, 0.0, 10.0, "time", ROOT / "data/segments/sample/segment_0001.mp4")
+    frames = [
+        pv.FrameRecord(
+            id="segment_0001_frame_000001",
+            segment_id="segment_0001",
+            path=None,
+            timestamp_sec=2.0,
+            frame_index=1,
+            selected=True,
+            blur_score=100.0,
+            overexposed_ratio=0.0,
+            underexposed_ratio=0.0,
+            duplicate_score=None,
+            reject_reasons=[],
+        ),
+        pv.FrameRecord(
+            id="segment_0001_frame_000002",
+            segment_id="segment_0001",
+            path=None,
+            timestamp_sec=5.0,
+            frame_index=2,
+            selected=True,
+            blur_score=100.0,
+            overexposed_ratio=0.0,
+            underexposed_ratio=0.0,
+            duplicate_score=None,
+            reject_reasons=[],
+        ),
+    ]
+
+    summary = pv.summarize_frames([segment], frames, max_selected_gap_sec=2.0)
+
+    coverage = summary["coverage_by_segment"]["segment_0001"]
+    assert coverage["max_selected_gap_sec"] == 5.0
+    assert coverage["exceeds_target"] is True
+
+
+def test_manifest_coverage_policy_uses_selection_gap_as_summary_target() -> None:
+    source = ROOT / "data" / "raw_videos" / "sample.mp4"
+    normalized = ROOT / "data" / "segments" / "sample" / "normalized.mp4"
+    segment_path = ROOT / "data" / "segments" / "sample" / "segment_0001.mp4"
+    source_metadata = pv.VideoMetadata(source, 1.0, 2.0, 160, 120, "h264", 1234, [])
+    normalized_metadata = pv.VideoMetadata(normalized, 1.0, 2.0, 160, 120, "h264", 4321, [])
+    segments = [pv.SegmentWindow("segment_0001", 1, 0.0, 1.0, "time", segment_path)]
+    frames = [
+        pv.FrameRecord(
+            id="segment_0001_frame_000001",
+            segment_id="segment_0001",
+            path=None,
+            timestamp_sec=0.0,
+            frame_index=1,
+            selected=True,
+            blur_score=100.0,
+            overexposed_ratio=0.0,
+            underexposed_ratio=0.0,
+            duplicate_score=None,
+            reject_reasons=[],
+            width=160,
+            height=120,
+        )
+    ]
+
+    manifest = pv.build_manifest(
+        video_id="sample",
+        source_metadata=source_metadata,
+        normalized_metadata=normalized_metadata,
+        settings={
+            "keyframe_policy": "coverage_v1",
+            "selection_max_gap_sec": 1.0,
+            "max_selected_gap_sec": 2.0,
+        },
+        segments=segments,
+        frames=frames,
+        repo_root=ROOT,
+    )
+
+    assert manifest["summary"]["coverage_target_max_selected_gap_sec"] == 1.0
+    assert manifest["summary"]["coverage_by_segment"]["segment_0001"]["exceeds_target"] is False
 
 
 def test_relative_path_rejects_paths_outside_repository(tmp_path: Path) -> None:
@@ -681,7 +776,7 @@ def test_preprocess_coverage_v1_writes_quality_report_and_audits(
             "--segment-method", "time", "--segment-length-sec", "1.5",
             "--segment-overlap-sec", "0", "--target-fps", "2",
             "--blur-threshold", "0", "--keyframe-policy", "coverage_v1",
-            "--selection-target-gap-sec", "0.5", "--selection-max-gap-sec", "0.6",
+            "--selection-target-gap-sec", "0.5", "--selection-max-gap-sec", "1.0",
             "--force",
         ]
     )
@@ -690,13 +785,96 @@ def test_preprocess_coverage_v1_writes_quality_report_and_audits(
     report_path = output_root / "manifests" / "coverage" / "keyframe_quality_report.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    assert result in {0, 2}
+    assert result == 0
     assert report_path.exists()
     assert manifest["summary"]["keyframe_quality"]["policy"] == "coverage_v1"
+    assert manifest["summary"]["keyframe_quality"]["status"] == "passed"
     assert all("keyframe" in frame for frame in manifest["frames"])
-    assert pv.main(["--audit-manifest", str(manifest_path)]) == (
-        0 if manifest["summary"]["keyframe_quality"]["status"] == "passed" else 2
+    assert pv.main(["--audit-manifest", str(manifest_path)]) == 0
+
+
+def test_preprocess_records_repository_state_before_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+    output_root = tmp_path / "data"
+    prepared = False
+    manifests: list[dict[str, object]] = []
+
+    def fake_repository_state(_repo_root: Path) -> tuple[str, bool]:
+        assert prepared is False
+        return "clean-head", False
+
+    def fake_prepare_output_dirs(
+        output_root: Path, video_id: str, force: bool
+    ) -> tuple[Path, Path, Path, Path, Path, Path]:
+        nonlocal prepared
+        prepared = True
+        staging_root = output_root / ".preprocess-staging" / "run"
+        return (
+            staging_root / "segments" / video_id,
+            staging_root / "frames" / video_id / "selected",
+            staging_root / "frames" / video_id / "rejected",
+            staging_root / "manifests" / video_id,
+            staging_root / "frames" / video_id,
+            staging_root,
+        )
+
+    def fake_write_manifest(manifest: dict[str, object], _destination: Path) -> None:
+        manifests.append(manifest)
+
+    segment = pv.SegmentWindow("segment_0001", 1, 0.0, 1.0, "time")
+    frame = pv.FrameRecord(
+        id="segment_0001_frame_000001",
+        segment_id="segment_0001",
+        path=None,
+        timestamp_sec=0.0,
+        frame_index=1,
+        selected=True,
+        blur_score=100.0,
+        overexposed_ratio=0.0,
+        underexposed_ratio=0.0,
+        duplicate_score=None,
+        reject_reasons=[],
+        width=16,
+        height=16,
     )
+
+    monkeypatch.setattr(pv, "require_tool", lambda _name: "tool")
+    monkeypatch.setattr(
+        pv,
+        "probe_video",
+        lambda path: pv.VideoMetadata(path.resolve(), 1.0, 1.0, 16, 16, "h264", 5, [], "a" * 64),
+    )
+    monkeypatch.setattr(pv, "repository_state", fake_repository_state)
+    monkeypatch.setattr(pv, "prepare_output_dirs", fake_prepare_output_dirs)
+    monkeypatch.setattr(
+        pv,
+        "normalize_video",
+        lambda _source, path, _metadata, _edge: pv.VideoMetadata(path, 1.0, 1.0, 16, 16, "h264", 5, [], "b" * 64),
+    )
+    monkeypatch.setattr(pv, "build_segment_windows", lambda **_kwargs: [segment])
+    monkeypatch.setattr(
+        pv,
+        "write_segment",
+        lambda _normalized_path, segment, path: pv.SegmentWindow(
+            segment.id, segment.index, segment.start_sec, segment.end_sec, segment.reason, path, "c" * 64
+        ),
+    )
+    monkeypatch.setattr(pv, "sample_segment_frames", lambda **_kwargs: [frame])
+    monkeypatch.setattr(pv, "write_manifest", fake_write_manifest)
+    monkeypatch.setattr(pv, "publish_output_dirs", lambda *_args: None)
+
+    args = pv.build_arg_parser().parse_args(
+        [str(source), "--video-id", "sample", "--output-root", str(output_root), "--force"]
+    )
+
+    pv.preprocess(args)
+
+    manifest = manifests[-1]
+    assert manifest["run"]["code"] == {"commit": "clean-head", "working_tree_dirty": False}
 
 
 def test_preprocess_rejects_vfr_source_frame_sampling(

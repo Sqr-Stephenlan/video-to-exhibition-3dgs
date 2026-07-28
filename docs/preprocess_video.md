@@ -265,6 +265,12 @@ specific reconstruction backend, generate COLMAP files, run LongSplat, or create
 depth / pose / camera-intrinsic records. Each downstream branch owns the adapter
 from this manifest into its own input tree.
 
+This PR produces manifest schema `2.0` only. Downstream adapters that still
+accept only schema `1.0` must be migrated or wrapped before this preprocess
+output is used as their input. A minimal schema-2.0 contract fixture is available
+at `tests/fixtures/preprocess/frames_manifest_v2_minimal.json` for adapter-side
+tests.
+
 ### What this module guarantees
 
 | Field or artifact | Meaning for consumers |

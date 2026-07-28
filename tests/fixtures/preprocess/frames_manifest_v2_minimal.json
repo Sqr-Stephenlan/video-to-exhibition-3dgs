@@ -1,0 +1,137 @@
+{
+  "schema_version": "2.0",
+  "video_id": "contract_v2",
+  "source": {
+    "path": "data/raw_videos/contract_v2.mp4",
+    "size_bytes": 1234,
+    "duration_sec": 1.0,
+    "fps": 2.0,
+    "width": 160,
+    "height": 120,
+    "codec": "h264",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "rotation_degrees": 0,
+    "is_vfr": false
+  },
+  "normalized": {
+    "path": "data/segments/contract_v2/normalized.mp4",
+    "duration_sec": 1.0,
+    "fps": 2.0,
+    "width": 160,
+    "height": 120,
+    "codec": "h264",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "rotation_degrees": 0,
+    "is_vfr": false
+  },
+  "settings": {
+    "preset": "baseline",
+    "frame_format": "png",
+    "frame_source": "source",
+    "max_selected_gap_sec": 2.0
+  },
+  "segments": [
+    {
+      "id": "segment_0001",
+      "path": "data/segments/contract_v2/segment_0001.mp4",
+      "index": 1,
+      "start_sec": 0.0,
+      "end_sec": 1.0,
+      "duration_sec": 1.0,
+      "reason": "time",
+      "width": 160,
+      "height": 120,
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ],
+  "frames": [
+    {
+      "id": "segment_0001_frame_000001",
+      "segment_id": "segment_0001",
+      "path": "data/frames/contract_v2/selected/segment_0001/frame_000001_t000000.000.png",
+      "timestamp_sec": 0.0,
+      "frame_index": 1,
+      "width": 160,
+      "height": 120,
+      "selected": true,
+      "blur_score": 100.0,
+      "overexposed_ratio": 0.0,
+      "underexposed_ratio": 0.0,
+      "motion_score": null,
+      "duplicate_score": null,
+      "matched_frame_id": null,
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "reject_reasons": []
+    },
+    {
+      "id": "segment_0001_frame_000002",
+      "segment_id": "segment_0001",
+      "path": null,
+      "timestamp_sec": 0.5,
+      "frame_index": 2,
+      "width": 160,
+      "height": 120,
+      "selected": false,
+      "blur_score": 1.0,
+      "overexposed_ratio": 0.0,
+      "underexposed_ratio": 0.0,
+      "motion_score": 0.0,
+      "duplicate_score": null,
+      "matched_frame_id": null,
+      "sha256": null,
+      "reject_reasons": [
+        "blur"
+      ]
+    }
+  ],
+  "summary": {
+    "total_segments": 1,
+    "total_frames": 2,
+    "selected_frames": 1,
+    "rejected_frames": 1,
+    "frames_by_segment": {
+      "segment_0001": {
+        "total": 2,
+        "selected": 1,
+        "rejected": 1
+      }
+    },
+    "reject_reasons": {
+      "blur": 1
+    },
+    "coverage_target_max_selected_gap_sec": 2.0,
+    "coverage_by_segment": {
+      "segment_0001": {
+        "max_selected_gap_sec": 1.0,
+        "exceeds_target": false
+      }
+    }
+  },
+  "run": {
+    "id": "contract_v2-aaaaaaaaaaaa-eeeeeeeeeeee",
+    "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "settings_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "config": {
+      "path": null,
+      "sha256": null
+    },
+    "code": {
+      "commit": "fixture",
+      "working_tree_dirty": false
+    },
+    "tools": {
+      "python": "3.12.0",
+      "opencv": "5.0.0",
+      "ffmpeg": "fixture",
+      "ffprobe": "fixture"
+    },
+    "command": [
+      "./dev.sh",
+      "python",
+      "scripts/preprocess_video.py",
+      "data/raw_videos/contract_v2.mp4",
+      "--video-id",
+      "contract_v2"
+    ]
+  }
+}

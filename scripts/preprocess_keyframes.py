@@ -312,6 +312,17 @@ def select_coverage_frames(scanned: list[ScannedFrame], policy: KeyframePolicy) 
         if reference_index is not None and gap >= policy.min_gap_sec and not motion_ok:
             if gap >= policy.max_gap_sec and motion is not None and motion_passes_bridge_gate(motion, policy):
                 bridge = True
+            elif gap >= policy.max_gap_sec and index > 0:
+                local_motion = estimate_pair_motion(scanned[index - 1].flow_gray, frame.flow_gray, policy)
+                local_motion_ok, _local_motion_reasons = motion_passes_hard_gate(local_motion, policy)
+                if local_motion_ok or motion_passes_bridge_gate(local_motion, policy):
+                    motion = local_motion
+                    # Reinitialization may reference a rejected scanned frame;
+                    # the selected current frame becomes the next stable anchor.
+                    reference_frame_id = scanned[index - 1].id
+                    bridge = True
+                else:
+                    reasons.extend(motion_reasons)
             else:
                 reasons.extend(motion_reasons)
         selected = not reasons
