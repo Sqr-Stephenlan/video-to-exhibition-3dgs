@@ -86,8 +86,9 @@ All paths are **repository-relative**. Absolute paths and `../` escapes are reje
 | `io.depth_manifest` | Depth manifest output |
 | `io.run_record` | Run record output |
 | `runtime.run_id` | Default run namespace when CLI `--run-id` is omitted (default `default`) |
-| `runtime.target_fps` | Fallback frame duration (`1/fps`) when timestamps are absent, and for the last frame when timestamps are present |
-| `runtime.dedupe_identical_timestamps` | Collapse same-`timestamp_sec` frames when image bytes match (default `true`) |
+| `runtime.target_fps` | Fixed fps used when assembling each VDA temp video (VDA does not consume container PTS) |
+| `runtime.infer_per_segment` | When all selected frames have `segment_id`, run one VDA invocation per segment (default `true`) |
+| `runtime.dedupe_identical_timestamps` | Collapse same-`timestamp_sec` frames with identical bytes **within each VDA batch** (default `true`) |
 | `runtime.overwrite` | Allow clobbering existing depth outputs (default `false`) |
 
 ### Frames manifest
@@ -121,23 +122,30 @@ Example schema: `configs/depth/frames_manifest.example.json`
 | `frames[].frame_id` | yes | 1–128 chars of `[A-Za-z0-9._-]`, must start with alphanumeric; no path segments |
 | `frames[].path` | yes | Repository-relative image path |
 | `frames[].selected` | no | Default `true`; `false` skips the frame |
-| `frames[].timestamp_sec` | no | If any selected frame has it, **all** selected frames must; then frames are sorted ascending; identical timestamps with identical image bytes are collapsed (configurable); assembly uses real inter-frame gaps |
+| `frames[].timestamp_sec` | no | If any selected frame has it, **all** selected frames must; used to order frames **within** a VDA batch |
 | `frames[].width` / `height` | required after adapt | Adapter fills from image bytes when preprocess omits them |
-| `frames[].segment_id` / `reason` / quality fields | no | Preserved from preprocess when present; copied into depth_manifest |
+| `frames[].segment_id` / `reason` / quality fields | no | Preserved from preprocess when present; copied into depth_manifest. When every selected frame has `segment_id` and `runtime.infer_per_segment` is true, each segment is a separate VDA invocation |
 | `video_id` / `source_video` | strongly recommended | Combined with `run_id`, namespaces IO so concurrent preprocess routes do not clobber each other |
 
 At least one frame must remain after selection.
 
-Frame→depth pairing is **strict positional**: after `selected_frames()` ordering (sort + optional timestamp dedupe), `depths[i]` corresponds to selected frame `i`. A count mismatch fails fast.
+Frame→depth pairing is **strict positional**: after `selected_frames()` ordering (per-segment sort/dedupe when enabled), concatenated VDA depth slices map `depths[i]` to selected frame `i`. A count mismatch fails fast.
+
+### Temporal strategy (important)
+
+Pinned Video Depth Anything consumes a decoded frame array / index windows. It does **not** use ffmpeg container PTS to reset temporal state. Therefore:
+
+- Writing real inter-frame gaps into a VFR container does **not** restore model timing across large gaps or scene cuts.
+- This module resets temporal state by **separate VDA invocations per `segment_id`** (`runtime.infer_per_segment: true`).
+- Within one invocation, frames are assembled at fixed `runtime.target_fps`.
+- Identical-timestamp duplicates are collapsed only **within** a batch; conflicting content at the same timestamp inside one batch fails closed. Cross-segment same timestamps are allowed because they never share a VDA window.
 
 ### Runtime data flow (brief)
 
 1. Expand `{video_id}` / `{run_id}` IO templates (`--video-id`, `--run-id` / `runtime.run_id`, and/or manifest `video_id`)
-2. Load selected frames; refuse overwrite of prior outputs unless enabled
-3. Assemble a temporary MP4 with `ffmpeg` using timestamp-driven durations when available
-4. Stage checkpoint to the filename hardcoded by pinned VDA `run.py`, run inference, then restore the original target
-5. Read VDA’s single `*_depths.npz` (`depths` shaped `(N,H,W)`), require `N ==` selected frame count
-6. Write per-frame NPZ under `data/depth/<video_id>/<run_id>/` + namespaced depth manifest + run record
+2. Load selected frames; partition into VDA batches (usually one per `segment_id`); refuse overwrite unless enabled
+3. For each batch: assemble a temporary MP4 at fixed `target_fps`, run VDA, collect `*_depths.npz`
+4. Concatenate depth arrays in selected-frame order; write per-frame NPZ under `data/depth/<video_id>/<run_id>/` + namespaced depth manifest + run record
 
 Temp-video assembly uses ffmpeg concat with a trailing duplicate file entry (so the last
 frame’s `duration` applies). The orchestrator passes `-frames:v N` so the encoded video
@@ -233,6 +241,7 @@ Documented in config comments and `scripts/depth/README.md`. Do **not** assume t
 - `runtime.skip_existing`
 - `io.mask_dir`
 - per-frame `confidence_path`
+- LongSplat mapping / materialize / fail-closed consumer (owned by PR #3)
 
 ---
 
@@ -270,45 +279,42 @@ Then run depth-prior with matching `--video-id` and `--run-id`. Notes for limite
 
 This branch records **frame↔depth** correspondence only. Camera pose / intrinsics are out of scope for depth-prior (handled by later SfM / LongSplat stages).
 
-## Consumer contract: LongSplat (`research/longsplat-route`)
+## Producer contract vs LongSplat consumer (PR #3)
 
-Depth-prior is a **producer** of `depth_manifest.json` + per-frame NPZ. It does **not**
-rename images for LongSplat training. The LongSplat branch is responsible for
-materializing and wiring depth into its prepared input tree.
+Depth-prior is a **producer** of versioned `depth_manifest.json` + per-frame NPZ.
+It does **not** implement LongSplat `prepare_input` materialization, `frame_mapping`
+binding, `depth_source=vda` wiring, or fail-closed consumer checks. Those belong on
+`research/longsplat-route` (PR #3).
 
-Reference helper (depth branch only; no LongSplat import):
-`scripts/depth/longsplat_consumer_contract.py`, covered by
-`tests/unit/depth/test_real_product_adaptation.py`.
-
-### What this module guarantees
+### What this module guarantees (producer)
 
 | Field | Meaning for consumers |
 |---|---|
 | `frames[].frame_id` | Stable id (often from preprocess `id` after adapt) |
 | `frames[].rgb_path` | Repository-relative RGB used for depth inference |
 | `frames[].depth_path` | Repository-relative NPZ with key `depth` |
+| `frames[].segment_id` | Present when upstream provided it; used for VDA batching |
 | `frame_depth_mapping` | Always `strict_positional` vs the selected frames order at run time |
+| `vda_batching` | Records per-segment VDA invocation sizes when batching is used |
 
-### What LongSplat must do (not implemented here)
+### What LongSplat / PR #3 must own
 
-LongSplat `prepare_input` typically copies/renames RGB to `frame_{id:06d}.jpg` and
-writes a `frame_mapping.json`. Depth files loaded by the VDA injection patch are
-looked up by **training image stem**, e.g. `frame_000000_depth.npy`.
-
-Therefore a reliable depth→LongSplat bridge must:
-
-1. Read `depth_manifest` + the prepared `frame_mapping.json` (bind via `frame_id` or `rgb_path`).
-2. Materialize NPZ → `depths/frame_{id:06d}_depth.npy` next to prepared images.
-3. **Not** name depth files from the preprocess RGB basename
-   (e.g. `frame_000001_t000000.000.jpg` → wrong stem / silent miss).
+1. Interpret its own `frame_mapping` schema (list or dict) correctly.
+2. Bind prepared stems (`frame_{id:06d}`) to depth_manifest `frame_id` / `rgb_path`.
+3. Materialize NPZ → `frame_{id:06d}_depth.npy` next to prepared images.
 4. Enable training with an explicit depth source flag (e.g. `depth_source=vda`).
-5. **Fail closed** (or at least ERROR) when a prepared frame has no matching depth
-   file — never silently fall back to MASt3R as if VDA depth were present.
+5. **Fail closed** when a prepared frame has no matching depth — never silently fall back to MASt3R.
 
-Until LongSplat `run_pipeline()` calls materialize automatically and smoke configs
-enable the depth source, **preprocess → depth** and **preprocess → LongSplat** may
-work while **depth → LongSplat** remains incomplete. Own that gap on the LongSplat
-branch; do not change depth-prior output naming to LongSplat’s prepared names.
+Do not treat any helper formerly living under `scripts/depth/` as proof that real
+LongSplat consumption is verified on this branch.
+
+### Responsibility boundary
+
+| Concern | Owner |
+|---|---|
+| Preprocess source schema, sizing policy, selection strategy | PR #2 (`feature/preprocess-video`) |
+| VDA producer, output isolation, real temporal segmentation via per-segment VDA runs | this PR (`research/depth-prior`) |
+| Mapping, prepared-stem materialize, `depth_source=vda`, fail-closed consumer | PR #3 (`research/longsplat-route`) |
 
 ### Joint testing note
 
@@ -324,5 +330,7 @@ Do not permanently fold LongSplat/preprocess sources into this PR.
 | `doctor` validates clone commit + default checkpoint hash | yes |
 | CPU unit/integration tests for NPZ split, path bounds, staging restore, adapter | yes |
 | GPU end-to-end `run` on real exhibition frames | deferred until sample frames + GPU report / waiver |
+| Per-segment VDA invocations (`infer_per_segment`) | yes (when `segment_id` present) |
 | Mask / confidence filtering | deferred |
 | Camera pose fields in depth_manifest | out of scope (frame correspondence only) |
+| LongSplat materialize / fail-closed consumer | out of scope (PR #3) |

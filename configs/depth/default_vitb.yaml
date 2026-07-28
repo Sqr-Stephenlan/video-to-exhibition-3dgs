@@ -36,10 +36,14 @@ runtime:
   # Optional namespace when the same video_id has multiple preprocess routes
   # (e.g. baseline vs longsplat). Defaults to "default" when omitted on CLI.
   run_id: default
-  # Fallback frame duration when timestamps are absent; with timestamps, assembly
-  # uses real inter-frame gaps instead of a flat 1/target_fps cadence.
+  # Fixed fps for each VDA temp-video assembly. Pinned VDA does not consume
+  # container PTS; do not treat ffmpeg durations as model temporal reset.
   target_fps: 5
-  # Collapse identical-timestamp duplicates (same image bytes) before VDA.
+  # When segment_id is present on all selected frames, run one VDA invocation
+  # per segment so temporal state resets across scene cuts / large gaps.
+  infer_per_segment: true
+  # Collapse identical-timestamp duplicates (same image bytes) within each
+  # VDA batch / segment before inference.
   dedupe_identical_timestamps: true
   # Refuse to overwrite existing depth NPZ / depth_manifest / run_record.
   overwrite: false

@@ -100,7 +100,7 @@ def test_synthetic_vda_npz_to_depth_manifest(tmp_path: Path) -> None:
 def test_default_vitb_fingerprint_matches_canonical_lf_bytes() -> None:
     import hashlib
 
-    expected = "8f6963afc79996c4451198260aaba557c7062f1f19efb4a9b00c9733fe5b3d8a"
+    expected = "288cd01a97bc4b13fdcf686bc846fc4a57dd817eeca4b3be38867b1b545165df"
     # This test targets the proposed worktree content before it is committed.
     worktree = (ROOT / "configs" / "depth" / "default_vitb.yaml").read_bytes()
     canonical_worktree = worktree.replace(b"\r\n", b"\n")

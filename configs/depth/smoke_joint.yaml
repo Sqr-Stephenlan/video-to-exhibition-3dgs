@@ -27,6 +27,7 @@ io:
 runtime:
   run_id: default
   target_fps: 5
+  infer_per_segment: true
   dedupe_identical_timestamps: true
   overwrite: false
   # Deferred: not plumbed into VDA yet.

@@ -22,7 +22,6 @@ from scripts.depth.backend_vda import (
     run_vda_on_video,
     sanitize_command_for_record,
     split_vda_depths_to_frame_files,
-    stage_checkpoint_for_vda,
     write_run_record,
 )
 from scripts.depth.config import format_io_template, load_config, resolve_repo_path, to_repo_relative
@@ -30,6 +29,7 @@ from scripts.depth.manifest import (
     assert_outputs_not_conflicting,
     build_depth_manifest,
     load_json,
+    prepare_vda_batches,
     save_json,
     selected_frames,
 )
@@ -75,7 +75,13 @@ def frame_durations_sec(
     fps: float,
     timestamps_sec: list[float] | None = None,
 ) -> list[float]:
-    """Per-frame display durations for ffmpeg concat (seconds)."""
+    """
+    Per-frame display durations for ffmpeg concat (seconds).
+
+    Note: pinned VDA does not consume container PTS for temporal modeling.
+    Prefer fixed fps assembly; timestamp-driven durations are retained only as a
+    low-level helper and must not be treated as VDA temporal reset.
+    """
     if frame_count < 1:
         raise ValueError("frame_count must be >= 1")
     default_duration = 1.0 / float(fps)
@@ -98,8 +104,8 @@ def _assemble_temp_video(
     frame_paths: list[Path],
     fps: float,
     output_video: Path,
-    timestamps_sec: list[float] | None = None,
 ) -> None:
+    """Assemble frames at fixed fps for one VDA invocation."""
     if not frame_paths:
         raise ValueError("No frame paths to assemble")
     missing = [path for path in frame_paths if not path.is_file()]
@@ -111,10 +117,8 @@ def _assemble_temp_video(
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is required to assemble frames into a temp video")
-    if timestamps_sec is not None and len(timestamps_sec) != len(frame_paths):
-        raise ValueError("timestamps_sec length must match frame_paths")
 
-    durations = frame_durations_sec(len(frame_paths), fps, timestamps_sec)
+    durations = frame_durations_sec(len(frame_paths), fps, timestamps_sec=None)
     list_file = output_video.with_suffix(".txt")
     with list_file.open("w", encoding="utf-8") as handle:
         for path, duration in zip(frame_paths, durations, strict=True):
@@ -220,17 +224,15 @@ def cmd_run(
         return 2
     effective_video_id = video_id or manifest_video_id
     dedupe_timestamps = bool(runtime.get("dedupe_identical_timestamps", True))
+    infer_per_segment = bool(runtime.get("infer_per_segment", True))
+    target_fps = float(runtime.get("target_fps", 5))
     frames = selected_frames(
         frames_manifest,
         root=root,
         dedupe_timestamps=dedupe_timestamps,
+        infer_per_segment=infer_per_segment,
     )
-    frame_paths = [resolve_repo_path(root, frame["path"]) for frame in frames]
-    timestamps_sec: list[float] | None = None
-    if frames and all(
-        "timestamp_sec" in frame and frame["timestamp_sec"] is not None for frame in frames
-    ):
-        timestamps_sec = [float(frame["timestamp_sec"]) for frame in frames]
+    vda_batches = prepare_vda_batches(frames, infer_per_segment=infer_per_segment)
 
     try:
         depth_dir = resolve_repo_path(
@@ -276,6 +278,8 @@ def cmd_run(
         print(f"  video_id: {effective_video_id}")
         print(f"  run_id: {effective_run_id}")
         print(f"  selected_frames: {len(frames)}")
+        print(f"  vda_batches: {len(vda_batches)}")
+        print(f"  infer_per_segment: {infer_per_segment}")
         print(f"  depth_dir: {to_repo_relative(root, depth_dir)}")
         print(f"  depth_manifest: {to_repo_relative(root, depth_manifest_path)}")
         print(f"  overwrite: {overwrite}")
@@ -283,6 +287,8 @@ def cmd_run(
 
     started_at = datetime.now(timezone.utc).isoformat()
     command_record: list[str] = []
+    command_invocations: list[list[str]] = []
+    segment_run_meta: list[dict] = []
     result_code = 1
     stdout_tail = ""
     stderr_tail = ""
@@ -292,45 +298,77 @@ def cmd_run(
     status = "failed"
 
     try:
+        import numpy as np
+
         with tempfile.TemporaryDirectory(prefix="depth_prior_") as tmp:
             tmp_dir = Path(tmp)
-            temp_video = tmp_dir / "input.mp4"
-            vda_out = tmp_dir / "vda_out"
-            _assemble_temp_video(
-                frame_paths,
-                float(runtime.get("target_fps", 5)),
-                temp_video,
-                timestamps_sec=timestamps_sec,
-            )
-            result, command, checkpoint_meta = run_vda_on_video(
-                root=root,
-                repo_dir=repo_dir,
-                input_video=temp_video,
-                output_dir=vda_out,
-                backend=backend,
-            )
-            command_record = sanitize_command_for_record(
-                root=root,
-                command=command,
-                temp_dir=tmp_dir,
-            )
-            result_code = result.returncode
-            stdout_tail = (result.stdout or "")[-4000:]
-            stderr_tail = (result.stderr or "")[-4000:]
-            if result.returncode != 0:
-                status = "vda_failed"
-                print("Video Depth Anything failed. See run_record for stdout/stderr tails.")
-                print(to_repo_relative(root, run_record_path))
-                return result.returncode
+            depth_chunks: list = []
+            flat_frames: list[dict] = []
+            for batch_index, (segment_key, batch_frames) in enumerate(vda_batches):
+                flat_frames.extend(batch_frames)
+                frame_paths = [
+                    resolve_repo_path(root, frame["path"]) for frame in batch_frames
+                ]
+                temp_video = tmp_dir / f"input_{batch_index:03d}.mp4"
+                vda_out = tmp_dir / f"vda_out_{batch_index:03d}"
+                _assemble_temp_video(frame_paths, target_fps, temp_video)
+                result, command, checkpoint_meta = run_vda_on_video(
+                    root=root,
+                    repo_dir=repo_dir,
+                    input_video=temp_video,
+                    output_dir=vda_out,
+                    backend=backend,
+                )
+                sanitized = sanitize_command_for_record(
+                    root=root,
+                    command=command,
+                    temp_dir=tmp_dir,
+                )
+                command_invocations.append(sanitized)
+                command_record = sanitized
+                result_code = result.returncode
+                stdout_tail = (stdout_tail + "\n" + (result.stdout or ""))[-4000:]
+                stderr_tail = (stderr_tail + "\n" + (result.stderr or ""))[-4000:]
+                segment_run_meta.append(
+                    {
+                        "segment_id": segment_key,
+                        "frame_count": len(batch_frames),
+                        "command_returncode": result.returncode,
+                    }
+                )
+                if result.returncode != 0:
+                    status = "vda_failed"
+                    print(
+                        "Video Depth Anything failed "
+                        f"(batch {batch_index}, segment={segment_key}). "
+                        "See run_record for stdout/stderr tails."
+                    )
+                    print(to_repo_relative(root, run_record_path))
+                    return result.returncode
 
-            try:
-                # VDA writes one *_depths.npz with depths shaped (N,H,W).
                 vda_npz = find_vda_depths_npz(vda_out)
                 depths = load_vda_depths_array(vda_npz)
-                # Keep a repo-relative note of the source artifact name only (temp path is not retained).
+                if depths.shape[0] != len(batch_frames):
+                    raise ValueError(
+                        f"VDA depths frame count {depths.shape[0]} != "
+                        f"segment batch size {len(batch_frames)} "
+                        f"(segment={segment_key})"
+                    )
+                depth_chunks.append(depths)
                 vda_npz_rel = vda_npz.name
+
+            try:
+                if flat_frames != frames:
+                    raise RuntimeError(
+                        "Internal error: VDA batch frame order diverged from selected_frames"
+                    )
+                combined = (
+                    depth_chunks[0]
+                    if len(depth_chunks) == 1
+                    else np.concatenate(depth_chunks, axis=0)
+                )
                 frame_records = split_vda_depths_to_frame_files(
-                    depths=depths,
+                    depths=combined,
                     frames=frames,
                     depth_dir=depth_dir,
                     root=root,
@@ -348,6 +386,13 @@ def cmd_run(
                     depth_type=backend["depth_type"],
                     frames_manifest_path=frames_manifest_rel,
                 )
+                depth_manifest["vda_batching"] = {
+                    "infer_per_segment": infer_per_segment,
+                    "batches": [
+                        {"segment_id": key, "frame_count": len(batch)}
+                        for key, batch in vda_batches
+                    ],
+                }
                 save_json(depth_manifest_path, depth_manifest)
             except Exception as exc:  # noqa: BLE001 - record failure in run_record
                 status = "postprocess_failed"
@@ -359,7 +404,10 @@ def cmd_run(
 
             status = "ok"
             result_code = 0
-            print(f"wrote {frame_count_written} depth maps")
+            print(
+                f"wrote {frame_count_written} depth maps across "
+                f"{len(vda_batches)} VDA batch(es)"
+            )
             print(f"depth_manifest: {to_repo_relative(root, depth_manifest_path)}")
             return 0
     finally:
@@ -392,6 +440,8 @@ def cmd_run(
                 "local_patch_matplotlib": checkpoint_meta.get("local_patch_matplotlib")
                 or doctor.get("local_patch_matplotlib"),
                 "command": command_record,
+                "commands": command_invocations,
+                "vda_segment_runs": segment_run_meta,
                 "random_seed": None,
                 "command_returncode": result_code,
                 "stdout_tail": stdout_tail,
@@ -400,7 +450,14 @@ def cmd_run(
                 "runtime": {
                     "overwrite": overwrite,
                     "dedupe_identical_timestamps": dedupe_timestamps,
-                    "timestamp_driven_assembly": timestamps_sec is not None,
+                    "infer_per_segment": infer_per_segment,
+                    "vda_batch_count": len(vda_batches),
+                    "assembly_fps": target_fps,
+                    "temporal_note": (
+                        "Pinned VDA does not consume container PTS; temporal reset "
+                        "is performed by separate VDA invocations per segment when "
+                        "infer_per_segment is enabled."
+                    ),
                 },
                 "outputs": {
                     "depth_dir": to_repo_relative(root, depth_dir),

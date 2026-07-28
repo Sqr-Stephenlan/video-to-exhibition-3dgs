@@ -16,7 +16,7 @@ Default config fingerprint (canonical Git blob / LF bytes; use `git show HEAD:co
 
 | File | SHA-256 |
 |---|---|
-| `configs/depth/default_vitb.yaml` | `8f6963afc79996c4451198260aaba557c7062f1f19efb4a9b00c9733fe5b3d8a` |
+| `configs/depth/default_vitb.yaml` | `288cd01a97bc4b13fdcf686bc846fc4a57dd817eeca4b3be38867b1b545165df` |
 
 ## Clone (do not commit the clone)
 

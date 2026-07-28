@@ -49,7 +49,12 @@ Git Bash / WSL (when `.venv/bin/python` exists):
 - `data/manifests/<video_id>/<run_id>/depth_manifest.json` — includes `source_video_id`, `source_frames_manifest` (path), and `frame_depth_mapping: strict_positional`
 - `outputs/reconstructions/depth_prior/<video_id>/<run_id>/run_record.json` — repository-relative paths, backend commit, I/O, and a sanitized command using `<project>` / `<temp>` placeholders
 
-VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)`. The orchestrator validates `N` against the selected frame count and splits into per-frame NPZ files. When selected frames include `timestamp_sec`, they are sorted ascending, identical-timestamp duplicates with matching bytes are collapsed, and temp-video assembly uses real inter-frame gaps (last frame uses `1/target_fps`).
+VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)` per
+invocation. The orchestrator may run **one invocation per `segment_id`**
+(`runtime.infer_per_segment`), concatenates depth arrays in selected-frame order,
+validates total `N`, and splits into per-frame NPZ files. Temp videos use fixed
+`target_fps`; pinned VDA does not consume container PTS, so gap-aware ffmpeg timing
+is **not** treated as temporal reset.
 
 If `backend.checkpoint` is set, it must be project-relative **and**
 `backend.allow_custom_checkpoint: true`. The orchestrator stages that file to the
@@ -71,9 +76,9 @@ Temp-video assembly passes `-frames:v N` so the ffmpeg concat demuxer’s traili
   --config configs/depth/smoke_joint.yaml run --video-id <video_id> --run-id baseline
 ```
 
-See `docs/depth_prior_io.md` for the full contract, including the **LongSplat consumer**
-naming rules (`frame_{id:06d}_depth.npy` must match prepared training stems; materialize
-belongs on `research/longsplat-route`, not this module).
+See `docs/depth_prior_io.md` for the producer contract. LongSplat mapping /
+materialize / `depth_source=vda` / fail-closed consumption belong on
+`research/longsplat-route` (PR #3), not this module.
 
 ## Current deferred items
 

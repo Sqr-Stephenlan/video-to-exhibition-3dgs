@@ -43,7 +43,8 @@ def dedupe_identical_timestamps(
     """
     Collapse frames that share the same timestamp_sec when image bytes match.
 
-    Different content at the same timestamp is an error (ambiguous VDA ordering).
+    Different content at the same timestamp is an error (ambiguous ordering
+    within one VDA invocation). Call this per inference batch / segment.
     """
     by_ts: dict[float, list[dict[str, Any]]] = {}
     for frame in frames:
@@ -62,13 +63,90 @@ def dedupe_identical_timestamps(
         if len(hashes) != 1:
             ids = [frame["frame_id"] for frame in group]
             raise ValueError(
-                "Duplicate timestamp_sec with differing image content; "
-                f"timestamp={timestamp}, frame_ids={ids}. "
-                "Split by segment or resolve the conflict before depth-prior."
+                "Duplicate timestamp_sec with differing image content within one "
+                f"VDA batch; timestamp={timestamp}, frame_ids={ids}. "
+                "Ensure segment_id separates conflicting frames, or resolve upstream."
             )
         # Identical bytes: keep the first occurrence (stable provenance).
         kept.append(group[0])
     return kept
+
+
+def _has_timestamp(frame: dict[str, Any]) -> bool:
+    return "timestamp_sec" in frame and frame["timestamp_sec"] is not None
+
+
+def _has_segment_id(frame: dict[str, Any]) -> bool:
+    value = frame.get("segment_id")
+    return value is not None and value != ""
+
+
+def _sort_and_dedupe_batch(
+    frames: list[dict[str, Any]],
+    *,
+    root: Path | None,
+    dedupe_timestamps: bool,
+) -> list[dict[str, Any]]:
+    selected = list(frames)
+    if selected and all(_has_timestamp(frame) for frame in selected):
+        try:
+            selected = sorted(selected, key=lambda frame: float(frame["timestamp_sec"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "frames_manifest: timestamp_sec must be numeric on selected frames"
+            ) from exc
+        if dedupe_timestamps:
+            if root is None:
+                raise ValueError(
+                    "dedupe_timestamps requires project root to hash frame files"
+                )
+            selected = dedupe_identical_timestamps(selected, root=root)
+    return selected
+
+
+def prepare_vda_batches(
+    frames: list[dict[str, Any]],
+    *,
+    infer_per_segment: bool = True,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """
+    Split selected frames into separate VDA invocations.
+
+    Pinned VDA consumes a decoded frame array / index windows and does not use
+    container PTS for temporal reset. Large gaps therefore do not reset the
+    model; separate invocations (typically one per segment_id) do.
+    """
+    if not frames:
+        raise ValueError("No frames to partition for VDA")
+    if not infer_per_segment:
+        return [("__all__", list(frames))]
+
+    flags = [_has_segment_id(frame) for frame in frames]
+    if any(flags) and not all(flags):
+        raise ValueError(
+            "frames_manifest: either all selected frames must include segment_id "
+            "or none of them may when runtime.infer_per_segment is enabled"
+        )
+    if not all(flags):
+        return [("__all__", list(frames))]
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for frame in frames:
+        key = str(frame["segment_id"])
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(frame)
+
+    def _segment_sort_key(segment_id: str) -> tuple[float, str]:
+        batch = grouped[segment_id]
+        if all(_has_timestamp(frame) for frame in batch):
+            return (min(float(frame["timestamp_sec"]) for frame in batch), segment_id)
+        return (float(order.index(segment_id)), segment_id)
+
+    ordered_ids = sorted(order, key=_segment_sort_key)
+    return [(segment_id, grouped[segment_id]) for segment_id in ordered_ids]
 
 
 def selected_frames(
@@ -76,13 +154,15 @@ def selected_frames(
     *,
     root: Path | None = None,
     dedupe_timestamps: bool = True,
+    infer_per_segment: bool = True,
 ) -> list[dict[str, Any]]:
     """
-    Return selected frames in VDA input order.
+    Return selected frames in VDA input order (flattened across batches).
 
     Mapping to depth slices is strict-positional: depths[i] <-> selected[i].
-    When every selected frame has timestamp_sec, sort ascending and optionally
-    collapse identical-timestamp duplicates (same image bytes).
+    When infer_per_segment is true and every frame has segment_id, ordering and
+    timestamp dedupe are applied within each segment, then segments are ordered
+    by earliest timestamp (or first-seen order).
     """
     require_schema_version(frames_manifest, label="frames_manifest")
     frames = frames_manifest.get("frames")
@@ -106,29 +186,50 @@ def selected_frames(
     if len(ids) != len(set(ids)):
         raise ValueError(f"Duplicate frame_id in selected frames: {ids}")
 
-    def _has_timestamp(frame: dict[str, Any]) -> bool:
-        return "timestamp_sec" in frame and frame["timestamp_sec"] is not None
-
     has_ts = [_has_timestamp(frame) for frame in selected]
     if any(has_ts) and not all(has_ts):
         raise ValueError(
             "frames_manifest: either all selected frames must include timestamp_sec "
             "or none of them may (mixed timestamps are ambiguous for VDA ordering)"
         )
-    if all(has_ts):
-        try:
-            selected = sorted(selected, key=lambda frame: float(frame["timestamp_sec"]))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "frames_manifest: timestamp_sec must be numeric on selected frames"
-            ) from exc
-        if dedupe_timestamps:
-            if root is None:
-                raise ValueError(
-                    "dedupe_timestamps requires project root to hash frame files"
+
+    has_seg = [_has_segment_id(frame) for frame in selected]
+    if any(has_seg) and not all(has_seg):
+        raise ValueError(
+            "frames_manifest: either all selected frames must include segment_id "
+            "or none of them may (mixed segment_id is ambiguous for VDA batching)"
+        )
+
+    if infer_per_segment and all(has_seg):
+        provisional = prepare_vda_batches(selected, infer_per_segment=True)
+        processed: list[tuple[str, list[dict[str, Any]]]] = []
+        for segment_id, batch in provisional:
+            processed.append(
+                (
+                    segment_id,
+                    _sort_and_dedupe_batch(
+                        batch, root=root, dedupe_timestamps=dedupe_timestamps
+                    ),
                 )
-            selected = dedupe_identical_timestamps(selected, root=root)
-    return selected
+            )
+
+        def _batch_sort_key(
+            item: tuple[str, list[dict[str, Any]]],
+        ) -> tuple[float, str]:
+            segment_id, batch = item
+            if batch and all(_has_timestamp(frame) for frame in batch):
+                return (
+                    min(float(frame["timestamp_sec"]) for frame in batch),
+                    segment_id,
+                )
+            return (float([key for key, _ in provisional].index(segment_id)), segment_id)
+
+        processed.sort(key=_batch_sort_key)
+        return [frame for _, batch in processed for frame in batch]
+
+    return _sort_and_dedupe_batch(
+        selected, root=root, dedupe_timestamps=dedupe_timestamps
+    )
 
 
 def assert_outputs_not_conflicting(
