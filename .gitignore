@@ -77,7 +77,10 @@ models/
 *.safetensors
 *.npz
 *.exr
+*.las
+*.laz
 *.ply
+*.ply.origin.json
 *.splat
 *.ksplat
 *.spz
