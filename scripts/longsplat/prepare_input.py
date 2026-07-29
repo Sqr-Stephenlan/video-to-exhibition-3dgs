@@ -72,14 +72,22 @@ def prepare_input(
                 f"expected {expected_sha}, got {actual_sha}"
             )
 
-        mapping.append(
-            {
-                "frame_id": frame_id,
-                "source_path": frame["path"],
-                "prepared_name": dst_name,
-                "sha256": actual_sha,
-            }
-        )
+        mapping_entry: dict[str, Any] = {
+            "frame_id": frame_id,
+            "segment_id": manifest["segment_id"],
+            "source_path": frame["path"],
+            "prepared_name": dst_name,
+            "sha256": actual_sha,
+        }
+        for source_key, mapping_key in (
+            ("producer_frame_id", "producer_frame_id"),
+            ("producer_frame_index", "producer_frame_index"),
+            ("producer_run_id", "producer_run_id"),
+            ("timestamp", "timestamp_sec"),
+        ):
+            if source_key in frame:
+                mapping_entry[mapping_key] = frame[source_key]
+        mapping.append(mapping_entry)
 
     mapping_path = rd / "input" / "frame_mapping.json"
     with open(mapping_path, "w", encoding="utf-8") as fh:

@@ -1,280 +1,803 @@
-"""Integration tests for the preprocess → LongSplat manifest adapter.
-
-Uses fixtures that match the real ``feature/preprocess-video`` schema_version
-``"1.0"`` output format.  Verifies the adapter correctly translates producer
-manifests into consumer manifests accepted by ``validate_input.py``.
-"""
+"""Integration tests for the schema-2 preprocess-to-LongSplat adapter."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
+from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
+import cv2
+import numpy as np
 import pytest
 
 from scripts.longsplat.manifest_adapter import AdapterError, adapt_manifest
 from scripts.longsplat.validate_input import validate_manifest
 
 
-# ---------------------------------------------------------------------------
-# Real-format preprocess manifest fixture builder
-# ---------------------------------------------------------------------------
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
-def _make_producer_manifest(
+def _write_frame(
+    root: Path,
+    relative_path: str,
     *,
-    schema_version: str = "1.0",
-    segment_id: str = "seg_01",
-    frame_count: int = 3,
-    include_width_height: bool = True,
-    include_rejected: bool = False,
-    frame_width: int = 640,
-    frame_height: int = 480,
-) -> dict:
-    """Build a minimal manifest matching the real preprocess producer format.
-
-    The returned manifest MUST be accepted by ``adapt_manifest`` and the
-    result MUST pass ``validate_manifest``.
-    """
-    frames = []
-    for i in range(frame_count):
-        frames.append(
-            {
-                "id": f"frame_{i:06d}_t{i:010.3f}",
-                "segment_id": segment_id,
-                "path": f"frames/test_video/selected/{segment_id}/frame_{i:06d}_t{float(i):010.3f}.jpg",
-                "timestamp_sec": float(i),
-                "frame_index": i,
-                "selected": True,
-                "blur_score": 12.0 + i,
-                "overexposed_ratio": 0.05,
-                "underexposed_ratio": 0.03,
-                "duplicate_score": None if i > 0 else None,
-                "reject_reasons": [],
-            }
-        )
-
-    if include_rejected:
-        frames.append(
-            {
-                "id": f"frame_{frame_count:06d}_t{float(frame_count):010.3f}",
-                "segment_id": segment_id,
-                "path": None,
-                "timestamp_sec": float(frame_count),
-                "frame_index": frame_count,
-                "selected": False,
-                "blur_score": 99.0,
-                "overexposed_ratio": 0.01,
-                "underexposed_ratio": 0.02,
-                "duplicate_score": None,
-                "reject_reasons": ["blurry"],
-            }
-        )
-
-    manifest: dict = {
-        "schema_version": schema_version,
-        "video_id": "test_video",
-        "source": {
-            "path": "data/raw_videos/test_video.mp4",
-            "size_bytes": 1234567,
-            "duration_sec": 10.0,
-            "fps": 30.0,
-            "width": frame_width,
-            "height": frame_height,
-            "codec": "h264",
-        },
-        "normalized": {
-            "path": "data/segments/test_video/normalized.mp4",
-            "duration_sec": 10.0,
-            "fps": 10.0,
-            "width": frame_width,
-            "height": frame_height,
-            "codec": "h264",
-        },
-        "settings": {
-            "preset": "longsplat",
-            "target_fps": 10.0,
-            "max_long_edge": 512,
-            "segment_method": "time",
-            "segment_length_sec": 30.0,
-            "segment_overlap_sec": 10.0,
-        },
-        "segments": [
-            {
-                "id": segment_id,
-                "path": f"data/segments/test_video/{segment_id}.mp4",
-                "index": 0,
-                "start_sec": 0.0,
-                "end_sec": 10.0,
-                "duration_sec": 10.0,
-                "reason": "time",
-            }
-        ],
-        "frames": frames,
-        "summary": {
-            "total_segments": 1,
-            "total_frames": frame_count + (1 if include_rejected else 0),
-            "selected_frames": frame_count,
-            "rejected_frames": 1 if include_rejected else 0,
-            "frames_by_segment": {
-                segment_id: {
-                    "total": frame_count + (1 if include_rejected else 0),
-                    "selected": frame_count,
-                    "rejected": 1 if include_rejected else 0,
-                }
-            },
-            "reject_reasons": {"blurry": 1} if include_rejected else {},
-        },
-    }
-    return manifest
-
-
-# ---------------------------------------------------------------------------
-# Fixture: real frame files on disk (needed for SHA-256 computation)
-# ---------------------------------------------------------------------------
+    width: int,
+    height: int,
+    value: int,
+) -> str:
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        np.full((height, width, 3), value, dtype=np.uint8),
+    )
+    assert ok
+    payload = encoded.tobytes()
+    path = root / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return _sha256(payload)
 
 
 @pytest.fixture
-def repo_root_with_frames(tmp_path: Path) -> Path:
-    """Create a temporary repo root with real frame files matching the manifest."""
-    segment_id = "seg_01"
-    frame_dir = tmp_path / "frames" / "test_video" / "selected" / segment_id
-    frame_dir.mkdir(parents=True)
+def schema2_handoff(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a contract-shaped synthetic handoff for focused negative tests.
 
-    for i in range(3):
-        fname = f"frame_{i:06d}_t{float(i):010.3f}.jpg"
-        path = frame_dir / fname
-        path.write_bytes(b"dummy frame content %d" % i)
+    The frozen ``schema2_coverage_v1`` fixture is the producer-generated
+    compatibility source of truth.
+    """
+    selected_b = "data/frames/video/selected/seg_01/frame_b.jpg"
+    rejected = "data/frames/video/rejected/seg_01/frame_rejected.jpg"
+    selected_other = "data/frames/video/selected/seg_02/frame_other.jpg"
+    selected_a = "data/frames/video/selected/seg_01/frame_a.jpg"
 
-    return tmp_path
+    frame_specs = {
+        selected_b: (800, 600, 16),
+        rejected: (800, 600, 32),
+        selected_other: (640, 360, 48),
+        selected_a: (320, 240, 64),
+    }
+    frame_hashes = {
+        path: _write_frame(
+            tmp_path,
+            path,
+            width=spec[0],
+            height=spec[1],
+            value=spec[2],
+        )
+        for path, spec in frame_specs.items()
+    }
+
+    def frame(
+        frame_id: str,
+        segment_id: str,
+        path: str,
+        timestamp: float,
+        frame_index: int,
+        *,
+        selected: bool,
+        width: int,
+        height: int,
+    ) -> dict[str, Any]:
+        return {
+            "id": frame_id,
+            "segment_id": segment_id,
+            "path": path,
+            "timestamp_sec": timestamp,
+            "frame_index": frame_index,
+            "selected": selected,
+            "blur_score": 42.0,
+            "overexposed_ratio": 0.01,
+            "underexposed_ratio": 0.02,
+            "duplicate_score": None,
+            "reject_reasons": [] if selected else ["blur"],
+            "width": width,
+            "height": height,
+            "sha256": frame_hashes[path],
+            "calibrated_blur_score": 42.0,
+            "keyframe": {
+                "policy": "coverage_v1",
+                "component_id": 0 if selected else None,
+                "selected_by_policy": selected,
+                "bridge": False,
+                "reference_frame_id": None,
+                "adaptive_blur_threshold": 42.0,
+                "quality_score": 1.0,
+                "motion": None,
+            },
+        }
+
+    manifest: dict[str, Any] = {
+        "schema_version": "2.0",
+        "video_id": "video",
+        "source": {
+            "path": "data/raw_videos/video.mp4",
+            "size_bytes": 100,
+            "duration_sec": 5.0,
+            "fps": 30.0,
+            "width": 1920,
+            "height": 1080,
+            "codec": "h264",
+            "sha256": "a" * 64,
+            "rotation_degrees": 0,
+            "is_vfr": False,
+        },
+        "normalized": {
+            "path": "data/segments/video/normalized.mp4",
+            "duration_sec": 5.0,
+            "fps": 10.0,
+            "width": 512,
+            "height": 288,
+            "codec": "h264",
+            "sha256": "b" * 64,
+            "rotation_degrees": 0,
+            "is_vfr": False,
+        },
+        "settings": {
+            "keyframe_policy": "coverage_v1",
+            "selection_max_gap_sec": 2.0,
+            "min_motion_inlier_ratio": 0.1,
+            "min_motion_grid_coverage": 0.1,
+        },
+        "segments": [
+            {
+                "id": "seg_01",
+                "path": "data/segments/video/seg_01.mp4",
+                "index": 0,
+                "start_sec": 0.0,
+                "end_sec": 3.0,
+                "duration_sec": 3.0,
+                "reason": "time",
+                "width": 512,
+                "height": 288,
+                "sha256": "c" * 64,
+            },
+            {
+                "id": "seg_02",
+                "path": "data/segments/video/seg_02.mp4",
+                "index": 1,
+                "start_sec": 3.0,
+                "end_sec": 5.0,
+                "duration_sec": 2.0,
+                "reason": "time",
+                "width": 512,
+                "height": 288,
+                "sha256": "d" * 64,
+            },
+        ],
+        "frames": [
+            frame(
+                "seg_01_frame_000002",
+                "seg_01",
+                selected_b,
+                1.0,
+                10,
+                selected=True,
+                width=800,
+                height=600,
+            ),
+            frame(
+                "seg_01_frame_000003",
+                "seg_01",
+                rejected,
+                1.5,
+                11,
+                selected=False,
+                width=800,
+                height=600,
+            ),
+            frame(
+                "seg_01_frame_000001",
+                "seg_01",
+                selected_a,
+                2.0,
+                12,
+                selected=True,
+                width=320,
+                height=240,
+            ),
+            frame(
+                "seg_02_frame_000001",
+                "seg_02",
+                selected_other,
+                3.5,
+                20,
+                selected=True,
+                width=640,
+                height=360,
+            ),
+        ],
+        "summary": {
+            "total_segments": 2,
+            "total_frames": 4,
+            "selected_frames": 3,
+            "rejected_frames": 1,
+            "frames_by_segment": {
+                "seg_01": {"total": 3, "selected": 2, "rejected": 1},
+                "seg_02": {"total": 1, "selected": 1, "rejected": 0},
+            },
+            "reject_reasons": {"blur": 1},
+            "coverage_target_max_selected_gap_sec": 2.0,
+            "coverage_by_segment": {},
+            "keyframe_quality": {
+                "policy": "coverage_v1",
+                "status": "passed",
+                "selected_frames": 3,
+                "bridge_frames": 0,
+                "component_count": 1,
+                "max_selected_gap_sec": 1.5,
+                "min_motion_inlier_ratio": 0.1,
+                "min_motion_grid_coverage": 0.1,
+                "failed_segments": [],
+            },
+        },
+        "run": {
+            "id": "video-abc123-settings456",
+            "code": {
+                "commit": "75b5204fa313c84c613141b89a0ba4462db599a1",
+                "working_tree_dirty": False,
+            },
+        },
+    }
+    quality_report = {
+        "schema_version": "2.0",
+        "video_id": "video",
+        "policy": "coverage_v1",
+        "status": "passed",
+        "segments": [
+            {
+                "segment_id": "seg_01",
+                "total_frames": 3,
+                "selected_frames": 2,
+                "rejected_frames": 1,
+                "component_count": 1,
+                "max_selected_gap_sec": 1.0,
+                "bridge_frames": 0,
+                "failed_reasons": [],
+            },
+            {
+                "segment_id": "seg_02",
+                "total_frames": 1,
+                "selected_frames": 1,
+                "rejected_frames": 0,
+                "component_count": 1,
+                "max_selected_gap_sec": 1.5,
+                "bridge_frames": 0,
+                "failed_reasons": [],
+            },
+        ],
+    }
+    return manifest, quality_report
 
 
-# ---------------------------------------------------------------------------
-# Adapter happy-path tests
-# ---------------------------------------------------------------------------
+def _adapt(
+    handoff: tuple[dict[str, Any], dict[str, Any]],
+    repo_root: Path,
+) -> dict[str, Any]:
+    manifest, report = handoff
+    return adapt_manifest(
+        manifest,
+        "seg_01",
+        repo_root,
+        quality_report=report,
+    )
 
 
-def test_adapt_and_validate_roundtrip(repo_root_with_frames: Path):
-    """A real-format preprocess manifest adapts and validates successfully."""
-    producer = _make_producer_manifest()
-    consumer = adapt_manifest(producer, "seg_01", repo_root_with_frames)
-
-    # Must pass consumer validation
-    validated = validate_manifest_dict(consumer)
-    assert validated["schema_version"] == 1
-    assert validated["segment_id"] == "seg_01"
-    assert len(validated["frames"]) == 3
-
-    for f in validated["frames"]:
-        assert isinstance(f["frame_id"], int)
-        assert isinstance(f["width"], int) and f["width"] == 640
-        assert isinstance(f["height"], int) and f["height"] == 480
-        assert len(f["sha256"]) == 64
-
-
-def test_adapter_skips_rejected_frames(repo_root_with_frames: Path):
-    """Frames with selected=False are excluded from the consumer manifest."""
-    producer = _make_producer_manifest(include_rejected=True, frame_count=3)
-    consumer = adapt_manifest(producer, "seg_01", repo_root_with_frames)
-    assert len(consumer["frames"]) == 3  # rejected frame excluded
-
-
-def test_adapter_uses_normalized_dimensions(repo_root_with_frames: Path):
-    """Frame dimensions come from normalized metadata, not source."""
-    producer = _make_producer_manifest(frame_width=1280, frame_height=720)
-    consumer = adapt_manifest(producer, "seg_01", repo_root_with_frames)
-    assert consumer["frames"][0]["width"] == 1280
-    assert consumer["frames"][0]["height"] == 720
-
-
-def test_adapter_computes_sha256(repo_root_with_frames: Path):
-    """Each frame in the adapted manifest has a real SHA-256."""
-    producer = _make_producer_manifest(frame_count=1)
-    consumer = adapt_manifest(producer, "seg_01", repo_root_with_frames)
-    sha = consumer["frames"][0]["sha256"]
-    assert len(sha) == 64
-    assert all(c in "0123456789abcdef" for c in sha)
-
-
-def test_adapter_preserves_frame_path(repo_root_with_frames: Path):
-    """Frame paths are kept as relative paths from the producer manifest."""
-    producer = _make_producer_manifest(frame_count=1)
-    consumer = adapt_manifest(producer, "seg_01", repo_root_with_frames)
-    path = consumer["frames"][0]["path"]
-    assert "frame_000000_t" in path
-
-
-# ---------------------------------------------------------------------------
-# Error / rejection tests
-# ---------------------------------------------------------------------------
-
-
-def test_rejects_unsupported_schema_version(repo_root_with_frames: Path):
-    """Only schema_version '1.0' (string) is supported."""
-    producer = _make_producer_manifest(schema_version="2.0")
-    with pytest.raises(AdapterError, match="schema_version"):
-        adapt_manifest(producer, "seg_01", repo_root_with_frames)
-
-
-def test_rejects_integer_schema_version(repo_root_with_frames: Path):
-    """Real producer uses string '1.0', not integer 1."""
-    producer = _make_producer_manifest()
-    producer["schema_version"] = 1  # type: ignore[assignment]
-    with pytest.raises(AdapterError, match="schema_version"):
-        adapt_manifest(producer, "seg_01", repo_root_with_frames)
-
-
-def test_rejects_unknown_segment(repo_root_with_frames: Path):
-    producer = _make_producer_manifest()
-    with pytest.raises(AdapterError, match="Segment.*not found"):
-        adapt_manifest(producer, "nonexistent", repo_root_with_frames)
-
-
-def test_rejects_missing_normalized_dimensions(repo_root_with_frames: Path):
-    producer = _make_producer_manifest()
-    producer["normalized"]["width"] = 0
-    with pytest.raises(AdapterError, match="normalized.width"):
-        adapt_manifest(producer, "seg_01", repo_root_with_frames)
-
-
-def test_rejects_missing_frame_file(repo_root_with_frames: Path):
-    """If a frame path points to a non-existent file, raise an error."""
-    producer = _make_producer_manifest(frame_count=1)
-    producer["frames"][0]["path"] = "frames/test_video/selected/seg_01/nonexistent.jpg"
-    with pytest.raises(AdapterError, match="Frame file not found"):
-        adapt_manifest(producer, "seg_01", repo_root_with_frames)
-
-
-def test_rejects_empty_segment(repo_root_with_frames: Path):
-    """A segment with no selected frames should raise."""
-    producer = _make_producer_manifest(frame_count=0)
-    with pytest.raises(AdapterError, match="No selected frames"):
-        adapt_manifest(producer, "seg_01", repo_root_with_frames)
-
-
-def test_rejects_selected_frame_with_null_path(repo_root_with_frames: Path):
-    """A frame marked selected=True but with path=None is a producer error."""
-    producer = _make_producer_manifest(frame_count=1)
-    producer["frames"][0]["path"] = None
-    producer["frames"][0]["selected"] = True
-    with pytest.raises(AdapterError, match="has no path"):
-        adapt_manifest(producer, "seg_01", repo_root_with_frames)
-
-
-# ---------------------------------------------------------------------------
-# Helper: validate a dict directly (skip file read)
-# ---------------------------------------------------------------------------
-
-
-def validate_manifest_dict(manifest: dict) -> dict:
-    """Validate a manifest dict by writing it to a temp file first."""
+def _validate_manifest_dict(manifest: dict[str, Any]) -> dict[str, Any]:
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, encoding="utf-8"
-    ) as fh:
-        json.dump(manifest, fh)
-        tmp_path = fh.name
+    ) as file:
+        json.dump(manifest, file)
+        path = Path(file.name)
     try:
-        return validate_manifest(tmp_path)
+        return validate_manifest(path)
     finally:
-        Path(tmp_path).unlink()
+        path.unlink()
+
+
+def test_adapts_frozen_real_producer_fixture() -> None:
+    fixture_root = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "longsplat"
+        / "schema2_coverage_v1"
+    )
+    manifest_path = (
+        fixture_root
+        / "data"
+        / "manifests"
+        / "coverage_fixture"
+        / "frames_manifest.json"
+    )
+    report_path = manifest_path.with_name("keyframe_quality_report.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    consumer = adapt_manifest(
+        manifest,
+        "segment_0001",
+        fixture_root,
+        quality_report=report,
+    )
+
+    validated = _validate_manifest_dict(consumer)
+    assert [frame["producer_frame_id"] for frame in validated["frames"]] == [
+        "segment_0001_frame_000001",
+        "segment_0001_frame_000002",
+    ]
+
+
+def test_adapts_schema2_synthetic_handoff_and_passes_consumer_validation(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    consumer = _adapt(schema2_handoff, tmp_path)
+
+    validated = _validate_manifest_dict(consumer)
+    assert validated["schema_version"] == 1
+    assert validated["segment_id"] == "seg_01"
+
+
+def test_preserves_selected_producer_order_with_contiguous_consumer_ids(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    consumer = _adapt(schema2_handoff, tmp_path)
+
+    assert [frame["frame_id"] for frame in consumer["frames"]] == [0, 1]
+    assert [frame["timestamp"] for frame in consumer["frames"]] == [1.0, 2.0]
+    assert [Path(frame["path"]).name for frame in consumer["frames"]] == [
+        "frame_b.jpg",
+        "frame_a.jpg",
+    ]
+
+
+def test_uses_each_selected_frames_dimensions_hash_and_run_id(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, _ = schema2_handoff
+    consumer = _adapt(schema2_handoff, tmp_path)
+
+    assert [(frame["width"], frame["height"]) for frame in consumer["frames"]] == [
+        (800, 600),
+        (320, 240),
+    ]
+    assert [frame["sha256"] for frame in consumer["frames"]] == [
+        manifest["frames"][0]["sha256"],
+        manifest["frames"][2]["sha256"],
+    ]
+    assert [frame["producer_frame_id"] for frame in consumer["frames"]] == [
+        "seg_01_frame_000002",
+        "seg_01_frame_000001",
+    ]
+    assert [frame["producer_frame_index"] for frame in consumer["frames"]] == [
+        10,
+        12,
+    ]
+    assert {frame["producer_run_id"] for frame in consumer["frames"]} == {
+        "video-abc123-settings456"
+    }
+
+
+def test_rejects_producer_sha_mismatch(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["frames"][0]["sha256"] = "0" * 64
+
+    with pytest.raises(AdapterError, match="sha256"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_selected_path_that_escapes_repo_root(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["frames"][0]["path"] = "../outside.jpg"
+
+    with pytest.raises(AdapterError, match="outside|escape|relative"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_schema1(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["schema_version"] = "1.0"
+
+    with pytest.raises(AdapterError, match="schema_version"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_coverage_v1_requires_quality_report(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, _ = schema2_handoff
+
+    with pytest.raises(AdapterError, match="quality report"):
+        adapt_manifest(manifest, "seg_01", tmp_path)
+
+
+def test_rejects_failed_inline_quality_status(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["summary"]["keyframe_quality"]["status"] = "failed"
+
+    with pytest.raises(AdapterError, match="status"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_quality_report_video_mismatch(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    report["video_id"] = "another_video"
+
+    with pytest.raises(AdapterError, match="video_id"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["selected_frames", "rejected_frames", "total_frames"],
+)
+def test_rejects_selected_segment_quality_summary_mismatch(
+    field: str,
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    report["segments"][0][field] += 1
+
+    with pytest.raises(AdapterError, match=field):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_legacy_schema2_does_not_require_quality_report(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, _ = deepcopy(schema2_handoff)
+    manifest["settings"] = {"keyframe_policy": "legacy"}
+    manifest["summary"].pop("keyframe_quality")
+    for frame in manifest["frames"]:
+        frame.pop("calibrated_blur_score")
+        frame.pop("keyframe")
+
+    consumer = adapt_manifest(manifest, "seg_01", tmp_path)
+
+    assert len(consumer["frames"]) == 2
+
+
+def test_rejects_unknown_segment(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = schema2_handoff
+
+    with pytest.raises(AdapterError, match="not found"):
+        adapt_manifest(
+            manifest,
+            "missing",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_segment_without_selected_frames(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, _ = deepcopy(schema2_handoff)
+    manifest["settings"] = {"keyframe_policy": "legacy"}
+    manifest["summary"].pop("keyframe_quality")
+    for frame in manifest["frames"]:
+        frame.pop("calibrated_blur_score")
+        frame.pop("keyframe")
+        if frame["segment_id"] == "seg_01":
+            frame["selected"] = False
+
+    with pytest.raises(AdapterError, match="No selected frames"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+        )
+
+
+@pytest.mark.parametrize("path", ["", "   "])
+def test_rejects_selected_empty_path(
+    path: str,
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["frames"][0]["path"] = path
+
+    with pytest.raises(AdapterError, match="path"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_missing_selected_frame_file(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["frames"][0]["path"] = "data/frames/video/missing.jpg"
+
+    with pytest.raises(AdapterError, match="Frame file not found"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+@pytest.mark.parametrize("field", ["width", "height"])
+def test_rejects_bad_selected_frame_dimensions(
+    field: str,
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["frames"][0][field] = 0
+
+    with pytest.raises(AdapterError, match=field):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_duplicate_selected_producer_frame_id(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["frames"][2]["id"] = manifest["frames"][0]["id"]
+
+    with pytest.raises(AdapterError, match="producer frame id"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), float("-inf")])
+def test_rejects_non_finite_selected_timestamp(
+    timestamp: float,
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["frames"][0]["timestamp_sec"] = timestamp
+
+    with pytest.raises(AdapterError, match="timestamp_sec"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", "1.0"),
+        ("policy", "legacy"),
+        ("status", "failed"),
+    ],
+)
+def test_rejects_invalid_quality_report_header(
+    field: str,
+    value: str,
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    report[field] = value
+
+    with pytest.raises(AdapterError, match=field):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_non_target_segment_quality_summary_mismatch(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    report["segments"][1]["selected_frames"] += 1
+
+    with pytest.raises(AdapterError, match="seg_02.*selected_frames"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("total_frames", -1),
+        ("selected_frames", 1.5),
+        ("rejected_frames", True),
+        ("component_count", -1),
+        ("bridge_frames", -1),
+        ("max_selected_gap_sec", float("nan")),
+        ("failed_reasons", "none"),
+    ],
+)
+def test_rejects_invalid_quality_segment_field(
+    field: str,
+    value: Any,
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    report["segments"][0][field] = value
+
+    with pytest.raises(AdapterError, match=field):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_passed_report_rejects_segment_failed_reasons(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    report["segments"][1]["failed_reasons"] = ["max_selected_gap_sec"]
+
+    with pytest.raises(AdapterError, match="failed_reasons"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+@pytest.mark.parametrize("payload", [b"", b"not a decodable image"])
+def test_rejects_undecodable_selected_frame_even_when_sha_matches(
+    payload: bytes,
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    relative_path = manifest["frames"][0]["path"]
+    (tmp_path / relative_path).write_bytes(payload)
+    manifest["frames"][0]["sha256"] = _sha256(payload)
+
+    with pytest.raises(AdapterError, match="decode"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_report_max_gap_from_stale_bundle(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    report["segments"][0]["max_selected_gap_sec"] = 0.25
+
+    with pytest.raises(AdapterError, match="max_selected_gap_sec"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_report_bridge_count_inconsistent_with_frame_records(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    report["segments"][0]["bridge_frames"] = 1
+
+    with pytest.raises(AdapterError, match="bridge_frames"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_inline_quality_aggregate_mismatch(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["summary"]["keyframe_quality"]["selected_frames"] = 99
+
+    with pytest.raises(AdapterError, match="selected_frames"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )
+
+
+def test_rejects_non_increasing_producer_timestamps(
+    schema2_handoff: tuple[dict[str, Any], dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    manifest, report = deepcopy(schema2_handoff)
+    manifest["frames"][2]["timestamp_sec"] = 1.0
+
+    with pytest.raises(AdapterError, match="strictly increasing"):
+        adapt_manifest(
+            manifest,
+            "seg_01",
+            tmp_path,
+            quality_report=report,
+        )

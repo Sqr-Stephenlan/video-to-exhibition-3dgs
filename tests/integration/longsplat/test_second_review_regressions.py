@@ -11,6 +11,7 @@ import json
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -160,25 +161,39 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
     frame_dir.mkdir(parents=True)
 
     frames = []
-    for i in range(3):
+    timestamps = [1.0, 5.0, 9.0]
+    for i, timestamp in enumerate(timestamps):
         fname = f"frame_{i:06d}.jpg"
         path = frame_dir / fname
-        path.write_bytes(f"dummy_frame_{i}".encode())
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            np.full((480, 640, 3), 64 + i, dtype=np.uint8),
+        )
+        assert ok
+        payload = encoded.tobytes()
+        path.write_bytes(payload)
         frames.append(
             {
                 "id": f"frame_{i:06d}",
                 "segment_id": seg,
                 "path": str(path.relative_to(tmp_path)),
+                "timestamp_sec": timestamp,
+                "frame_index": i,
                 "selected": True,
                 "blur_score": 12.0,
                 "overexposed_ratio": 0.05,
                 "underexposed_ratio": 0.03,
+                "duplicate_score": None,
+                "reject_reasons": [],
+                "width": 640,
+                "height": 480,
+                "sha256": hashlib.sha256(payload).hexdigest(),
             }
         )
 
-    manifest_path = tmp_path / "producer_manifest.json"
+    manifest_path = tmp_path / "frames_manifest.json"
     manifest = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "video_id": "test",
         "source": {
             "path": "raw/test.mp4",
@@ -188,6 +203,9 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
             "width": 640,
             "height": 480,
             "codec": "h264",
+            "sha256": "a" * 64,
+            "rotation_degrees": 0,
+            "is_vfr": False,
         },
         "normalized": {
             "path": "seg/test/normalized.mp4",
@@ -196,6 +214,9 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
             "width": 640,
             "height": 480,
             "codec": "h264",
+            "sha256": "b" * 64,
+            "rotation_degrees": 0,
+            "is_vfr": False,
         },
         "settings": {
             "preset": "longsplat",
@@ -204,6 +225,7 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
             "segment_method": "time",
             "segment_length_sec": 30,
             "segment_overlap_sec": 10,
+            "keyframe_policy": "legacy",
         },
         "segments": [
             {
@@ -214,6 +236,9 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
                 "end_sec": 10,
                 "duration_sec": 10,
                 "reason": "time",
+                "width": 640,
+                "height": 480,
+                "sha256": "c" * 64,
             }
         ],
         "frames": frames,
@@ -226,6 +251,13 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
                 seg: {"total": 3, "selected": 3, "rejected": 0},
             },
             "reject_reasons": {},
+        },
+        "run": {
+            "id": "test-source-settings",
+            "code": {
+                "commit": "75b5204fa313c84c613141b89a0ba4462db599a1",
+                "working_tree_dirty": False,
+            },
         },
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

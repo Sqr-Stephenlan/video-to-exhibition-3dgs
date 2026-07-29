@@ -7,6 +7,7 @@ pytest
 
 # 科学计算
 numpy
+opencv-python
 
 # 3D 文件解析
 plyfile

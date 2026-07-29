@@ -1,0 +1,28 @@
+{
+  "policy": "coverage_v1",
+  "schema_version": "2.0",
+  "segments": [
+    {
+      "bridge_frames": 0,
+      "component_count": 1,
+      "failed_reasons": [],
+      "max_selected_gap_sec": 1.0,
+      "rejected_frames": 1,
+      "segment_id": "segment_0001",
+      "selected_frames": 2,
+      "total_frames": 3
+    },
+    {
+      "bridge_frames": 0,
+      "component_count": 1,
+      "failed_reasons": [],
+      "max_selected_gap_sec": 1.0,
+      "rejected_frames": 1,
+      "segment_id": "segment_0002",
+      "selected_frames": 2,
+      "total_frames": 3
+    }
+  ],
+  "status": "passed",
+  "video_id": "coverage_fixture"
+}

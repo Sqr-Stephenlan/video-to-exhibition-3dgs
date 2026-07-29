@@ -254,6 +254,37 @@ def test_rejects_non_numeric_timestamp(tmp_path, valid_manifest_path):
         validate_manifest(str(p))
 
 
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), float("-inf")])
+def test_rejects_non_finite_timestamp(tmp_path, valid_manifest_path, timestamp):
+    with open(valid_manifest_path) as fh:
+        data = json.load(fh)
+    data["frames"][0]["timestamp"] = timestamp
+    p = tmp_path / "bad_finite_ts.json"
+    p.write_text(json.dumps(data))
+    with pytest.raises(ManifestValidationError, match="timestamp"):
+        validate_manifest(str(p))
+
+
+def test_accepts_producer_trace_fields(tmp_path, valid_manifest_path):
+    with open(valid_manifest_path) as fh:
+        data = json.load(fh)
+    data["frames"][0].update(
+        {
+            "producer_frame_id": "segment_0002_frame_000123",
+            "producer_frame_index": 123,
+            "producer_run_id": "video-source-settings",
+            "timestamp": 1.25,
+        }
+    )
+    p = tmp_path / "with_producer_trace.json"
+    p.write_text(json.dumps(data))
+
+    manifest = validate_manifest(str(p))
+
+    assert manifest["frames"][0]["producer_frame_id"] == "segment_0002_frame_000123"
+    assert manifest["frames"][0]["producer_frame_index"] == 123
+
+
 # ---------------------------------------------------------------------------
 # prepare_input — success and failure
 # ---------------------------------------------------------------------------
@@ -288,6 +319,39 @@ def test_prepare_input_hash_mismatch_raises(tmp_path, valid_manifest_path):
     manifest = validate_manifest(str(p))
     with pytest.raises(PreparedFileHashMismatch):
         prepare_input(manifest, tmp_path / "run_bad")
+
+
+def test_prepare_input_preserves_producer_trace(tmp_path, valid_manifest_path):
+    with open(valid_manifest_path) as fh:
+        data = json.load(fh)
+    data["frames"][0].update(
+        {
+            "producer_frame_id": "segment_0002_frame_000123",
+            "producer_frame_index": 123,
+            "producer_run_id": "video-source-settings",
+            "timestamp": 1.25,
+        }
+    )
+    p = tmp_path / "trace_manifest.json"
+    p.write_text(json.dumps(data))
+    manifest = validate_manifest(p)
+
+    prepare_input(manifest, tmp_path / "run_trace")
+
+    mapping = json.loads(
+        (tmp_path / "run_trace" / "input" / "frame_mapping.json").read_text()
+    )
+    assert mapping[0] == {
+        "frame_id": 0,
+        "segment_id": "test_segment_01",
+        "producer_frame_id": "segment_0002_frame_000123",
+        "producer_frame_index": 123,
+        "producer_run_id": "video-source-settings",
+        "timestamp_sec": 1.25,
+        "source_path": "frames/frame_001.jpg",
+        "prepared_name": "frame_000000.jpg",
+        "sha256": mapping[0]["sha256"],
+    }
 
 
 # ---------------------------------------------------------------------------

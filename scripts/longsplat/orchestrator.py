@@ -86,7 +86,9 @@ def run_pipeline(
     Parameters
     ----------
     manifest_path : str or Path
-        Path to a preprocess manifest (schema_version ``"1.0"``).
+        Path to a preprocess manifest (schema_version ``"2.0"``).  A
+        ``coverage_v1`` manifest requires ``keyframe_quality_report.json`` in
+        the same directory.
     segment_id : str
         Which segment from the manifest to process.
     config : LongSplatConfig
@@ -226,8 +228,64 @@ def run_pipeline(
         with open(manifest_path, "rb") as fh:
             producer_raw = fh.read()
         producer_sha = hashlib.sha256(producer_raw).hexdigest()
+        record["_pv"] = {
+            "project_root": str(pr),
+            "producer_manifest_sha256": producer_sha,
+            "producer_quality_report_sha256": None,
+            "producer_quality_report_binding": None,
+            "backend_commit_actual": backend_identity["commit"],
+            "backend_dirty": backend_identity["dirty"],
+            "backend_submodules": backend_identity["submodules"],
+        }
+        write_run_record(record, run_dir)
         producer = json.loads(producer_raw)
-        consumer = adapt_manifest(producer, segment_id, pr)
+
+        quality_report: dict[str, Any] | None = None
+        producer_run = producer.get("run")
+        if isinstance(producer_run, dict):
+            producer_run_provenance: dict[str, Any] = {}
+            if "id" in producer_run:
+                producer_run_provenance["id"] = producer_run["id"]
+            producer_code = producer_run.get("code")
+            if isinstance(producer_code, dict):
+                producer_code_provenance = {
+                    key: producer_code[key]
+                    for key in ("commit", "working_tree_dirty")
+                    if key in producer_code
+                }
+                if producer_code_provenance:
+                    producer_run_provenance["code"] = producer_code_provenance
+            if producer_run_provenance:
+                record["_pv"]["producer_run"] = producer_run_provenance
+        write_run_record(record, run_dir)
+
+        producer_settings = producer.get("settings")
+        if (
+            isinstance(producer_settings, dict)
+            and producer_settings.get("keyframe_policy") == "coverage_v1"
+        ):
+            quality_report_path = (
+                Path(manifest_path).resolve().parent / "keyframe_quality_report.json"
+            )
+            record["_pv"]["producer_quality_report_path"] = str(quality_report_path)
+            record["_pv"]["producer_quality_report_binding"] = (
+                "semantic_only_no_producer_manifest_digest"
+            )
+            write_run_record(record, run_dir)
+            with quality_report_path.open("rb") as fh:
+                quality_report_raw = fh.read()
+            record["_pv"]["producer_quality_report_sha256"] = hashlib.sha256(
+                quality_report_raw
+            ).hexdigest()
+            write_run_record(record, run_dir)
+            quality_report = json.loads(quality_report_raw)
+
+        consumer = adapt_manifest(
+            producer,
+            segment_id,
+            pr,
+            quality_report=quality_report,
+        )
 
         consumer_manifest_path = run_dir / "consumer_manifest.json"
         consumer_manifest_path.write_text(
@@ -335,13 +393,6 @@ def run_pipeline(
             stage="provenance",
             metadata={"sha256": sha256_file(argv_path)},
         )
-        record["_pv"] = {
-            "project_root": str(pr),
-            "producer_manifest_sha256": producer_sha,
-            "backend_commit_actual": backend_identity["commit"],
-            "backend_dirty": backend_identity["dirty"],
-            "backend_submodules": backend_identity["submodules"],
-        }
         write_run_record(record, run_dir)
 
         # --- 8. Run training ---
@@ -444,21 +495,31 @@ def run_pipeline(
             # Use config gate thresholds when available
             if config.quality_gates is not None:
                 pg = config.quality_gates.pose
-                audit_kwargs.update({
-                    "max_orthogonality_error": pg.max_orthogonality_error,
-                    "max_determinant_error": pg.max_determinant_error,
-                    "max_rotation_step_deg": pg.max_rotation_step_deg,
-                    "max_translation_step_ratio": pg.max_translation_step_ratio,
-                })
+                audit_kwargs.update(
+                    {
+                        "max_orthogonality_error": pg.max_orthogonality_error,
+                        "max_determinant_error": pg.max_determinant_error,
+                        "max_rotation_step_deg": pg.max_rotation_step_deg,
+                        "max_translation_step_ratio": pg.max_translation_step_ratio,
+                    }
+                )
             audit_result = audit_pose_quality(
                 cameras_json, pose_telemetry, **audit_kwargs
             )
             record.setdefault("quality_gates", {})["pose"] = {
                 "thresholds": {
-                    "max_orthogonality_error": audit_kwargs.get("max_orthogonality_error", 1e-4),
-                    "max_determinant_error": audit_kwargs.get("max_determinant_error", 1e-4),
-                    "max_rotation_step_deg": audit_kwargs.get("max_rotation_step_deg", 25.0),
-                    "max_translation_step_ratio": audit_kwargs.get("max_translation_step_ratio", 6.0),
+                    "max_orthogonality_error": audit_kwargs.get(
+                        "max_orthogonality_error", 1e-4
+                    ),
+                    "max_determinant_error": audit_kwargs.get(
+                        "max_determinant_error", 1e-4
+                    ),
+                    "max_rotation_step_deg": audit_kwargs.get(
+                        "max_rotation_step_deg", 25.0
+                    ),
+                    "max_translation_step_ratio": audit_kwargs.get(
+                        "max_translation_step_ratio", 6.0
+                    ),
                 },
                 "passed": audit_result["passed"],
                 "reasons": audit_result["reasons"],
@@ -536,7 +597,9 @@ def run_pipeline(
             if config.quality_gates is not None:
                 vda_min_aligned = config.quality_gates.vda.min_aligned_fraction
 
-            aligned_ratio = aligned / train_camera_count if train_camera_count > 0 else 0.0
+            aligned_ratio = (
+                aligned / train_camera_count if train_camera_count > 0 else 0.0
+            )
             if aligned_ratio < vda_min_aligned:
                 vda_reasons.append(
                     f"VDA aligned ratio {aligned_ratio:.4f} < {vda_min_aligned} "
@@ -713,7 +776,10 @@ def run_pipeline(
         )
 
         # --- 11. PLY publication gate ---
-        if config.quality_gates is not None and config.quality_gates.ply.mode == "enforce":
+        if (
+            config.quality_gates is not None
+            and config.quality_gates.ply.mode == "enforce"
+        ):
             _echo("Running PLY publication gate ...")
             ply_quality = analyze_ply_quality(converted_ply)
 
@@ -750,7 +816,9 @@ def run_pipeline(
                     "effective_fraction": effective_frac,
                     "anisotropy_q99": aniso_q99,
                     "quaternion_within_1pct_fraction": quat_frac,
-                    "finite_core_fraction": ply_quality.get("finite_core_fraction", 0.0),
+                    "finite_core_fraction": ply_quality.get(
+                        "finite_core_fraction", 0.0
+                    ),
                 },
             }
             write_run_record(record, run_dir)

@@ -16,6 +16,7 @@ import json
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -208,31 +209,45 @@ def _make_fake_backend(tmp_path: Path) -> Path:
 
 
 def _make_producer_manifest(tmp_path: Path) -> Path:
-    """Create a minimal preprocess-video producer manifest with real frame files."""
+    """Create a schema-2 legacy producer manifest with real frame files."""
     seg = "seg_01"
     frame_dir = tmp_path / "frames" / seg
     frame_dir.mkdir(parents=True)
 
     frames = []
-    for i in range(3):
+    timestamps = [1.0, 5.0, 9.0]
+    for i, timestamp in enumerate(timestamps):
         fname = f"frame_{i:06d}.jpg"
         path = frame_dir / fname
-        path.write_bytes(f"dummy_frame_{i}".encode())
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            np.full((480, 640, 3), 32 + i, dtype=np.uint8),
+        )
+        assert ok
+        payload = encoded.tobytes()
+        path.write_bytes(payload)
         frames.append(
             {
                 "id": f"frame_{i:06d}",
                 "segment_id": seg,
                 "path": str(path.relative_to(tmp_path)),
+                "timestamp_sec": timestamp,
+                "frame_index": i,
                 "selected": True,
                 "blur_score": 12.0,
                 "overexposed_ratio": 0.05,
                 "underexposed_ratio": 0.03,
+                "duplicate_score": None,
+                "reject_reasons": [],
+                "width": 640,
+                "height": 480,
+                "sha256": hashlib.sha256(payload).hexdigest(),
             }
         )
 
-    manifest_path = tmp_path / "producer_manifest.json"
+    manifest_path = tmp_path / "frames_manifest.json"
     manifest = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "video_id": "test",
         "source": {
             "path": "raw/test.mp4",
@@ -242,6 +257,9 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
             "width": 640,
             "height": 480,
             "codec": "h264",
+            "sha256": "a" * 64,
+            "rotation_degrees": 0,
+            "is_vfr": False,
         },
         "normalized": {
             "path": "seg/test/normalized.mp4",
@@ -250,6 +268,9 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
             "width": 640,
             "height": 480,
             "codec": "h264",
+            "sha256": "b" * 64,
+            "rotation_degrees": 0,
+            "is_vfr": False,
         },
         "settings": {
             "preset": "longsplat",
@@ -258,6 +279,10 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
             "segment_method": "time",
             "segment_length_sec": 30,
             "segment_overlap_sec": 10,
+            "keyframe_policy": "legacy",
+            "selection_max_gap_sec": 4.5,
+            "min_motion_inlier_ratio": 0.1,
+            "min_motion_grid_coverage": 0.1,
         },
         "segments": [
             {
@@ -268,6 +293,9 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
                 "end_sec": 10,
                 "duration_sec": 10,
                 "reason": "time",
+                "width": 640,
+                "height": 480,
+                "sha256": "c" * 64,
             }
         ],
         "frames": frames,
@@ -281,9 +309,91 @@ def _make_producer_manifest(tmp_path: Path) -> Path:
             },
             "reject_reasons": {},
         },
+        "run": {
+            "id": "test-source-settings",
+            "source_sha256": "a" * 64,
+            "settings_fingerprint": "d" * 64,
+            "config": {"path": None, "sha256": None},
+            "code": {
+                "commit": "75b5204fa313c84c613141b89a0ba4462db599a1",
+                "working_tree_dirty": False,
+            },
+            "tools": {
+                "python": "3.11.9",
+                "opencv": "4.10.0",
+                "ffmpeg": "8.0",
+                "ffprobe": "8.0",
+            },
+            "command": ["data/raw_videos/test.mp4", "--video-id", "test"],
+        },
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest_path
+
+
+def _make_coverage_handoff(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a schema-2 coverage_v1 manifest and its producer sidecar."""
+    manifest_path = _make_producer_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["settings"]["keyframe_policy"] = "coverage_v1"
+    for frame in manifest["frames"]:
+        frame["calibrated_blur_score"] = frame["blur_score"]
+        frame["keyframe"] = {
+            "policy": "coverage_v1",
+            "component_id": 0,
+            "selected_by_policy": True,
+            "bridge": False,
+            "reference_frame_id": None,
+            "adaptive_blur_threshold": frame["blur_score"],
+            "quality_score": 1.0,
+            "motion": None,
+        }
+    manifest["summary"]["keyframe_quality"] = {
+        "policy": "coverage_v1",
+        "status": "passed",
+        "selected_frames": 3,
+        "bridge_frames": 0,
+        "component_count": 1,
+        "max_selected_gap_sec": 4.0,
+        "min_motion_inlier_ratio": 0.1,
+        "min_motion_grid_coverage": 0.1,
+        "failed_segments": [],
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    report = {
+        "schema_version": "2.0",
+        "video_id": "test",
+        "policy": "coverage_v1",
+        "status": "passed",
+        "segments": [
+            {
+                "segment_id": "seg_01",
+                "total_frames": 3,
+                "selected_frames": 3,
+                "rejected_frames": 0,
+                "component_count": 1,
+                "max_selected_gap_sec": 4.0,
+                "bridge_frames": 0,
+                "failed_reasons": [],
+            }
+        ],
+    }
+    report_path = manifest_path.parent / "keyframe_quality_report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return manifest_path, report_path
+
+
+def _allow_fake_backend(monkeypatch: pytest.MonkeyPatch, backend: Path) -> None:
+    """Keep handoff tests focused on manifest orchestration, not commit locks."""
+    import scripts.longsplat.orchestrator as orchestrator
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_check_repo",
+        lambda _repo_root, *, backend_mode: backend,
+    )
+    monkeypatch.setattr(orchestrator, "_check_python", lambda _python_exe: None)
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +425,139 @@ def test_sanitise_rejects_spaces():
 # ---------------------------------------------------------------------------
 # Fake-backend orchestrator tests
 # ---------------------------------------------------------------------------
+
+
+def test_orchestrator_coverage_loads_sidecar_and_records_raw_hashes(
+    tmp_path, monkeypatch
+):
+    """coverage_v1 passes its sibling report through and fingerprints both files."""
+    backend = _make_fake_backend(tmp_path)
+    manifest_path, report_path = _make_coverage_handoff(tmp_path)
+    output_dir = tmp_path / "outputs"
+    _allow_fake_backend(monkeypatch, backend)
+
+    import scripts.longsplat.orchestrator as orchestrator
+
+    captured: dict[str, object] = {}
+    real_adapt_manifest = orchestrator.adapt_manifest
+
+    def capture_adapt_manifest(
+        producer_manifest, segment_id, repo_root, *, quality_report=None
+    ):
+        captured["quality_report"] = quality_report
+        return real_adapt_manifest(
+            producer_manifest,
+            segment_id,
+            repo_root,
+            quality_report=quality_report,
+        )
+
+    monkeypatch.setattr(orchestrator, "adapt_manifest", capture_adapt_manifest)
+
+    exit_code = run_pipeline(
+        manifest_path=manifest_path,
+        segment_id="seg_01",
+        config=LongSplatConfig(
+            source_path="",
+            model_path="",
+            iterations=100,
+            seed=0,
+        ),
+        repo_root=backend,
+        output_dir=output_dir,
+        project_root=tmp_path,
+        python_exe=sys.executable,
+    )
+
+    assert exit_code == 0
+    assert captured["quality_report"] == json.loads(
+        report_path.read_text(encoding="utf-8")
+    )
+
+    run_dir = next(output_dir.iterdir())
+    record = json.loads(
+        (run_dir / "reconstruction_run.json").read_text(encoding="utf-8")
+    )
+    assert record["status"] == "complete"
+    assert (
+        record["_pv"]["producer_manifest_sha256"]
+        == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    )
+    assert (
+        record["_pv"]["producer_quality_report_sha256"]
+        == hashlib.sha256(report_path.read_bytes()).hexdigest()
+    )
+    assert (
+        record["_pv"]["producer_quality_report_binding"]
+        == "semantic_only_no_producer_manifest_digest"
+    )
+    assert record["_pv"]["producer_run"] == {
+        "id": "test-source-settings",
+        "code": {
+            "commit": "75b5204fa313c84c613141b89a0ba4462db599a1",
+            "working_tree_dirty": False,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "report_problem",
+    ["missing", "failed", "video_mismatch"],
+)
+def test_orchestrator_coverage_report_problems_fail_before_training(
+    tmp_path, monkeypatch, report_problem
+):
+    """Missing or incoherent coverage evidence fails closed with a terminal record."""
+    backend = _make_fake_backend(tmp_path)
+    manifest_path, report_path = _make_coverage_handoff(tmp_path)
+    output_dir = tmp_path / "outputs"
+    _allow_fake_backend(monkeypatch, backend)
+
+    if report_problem == "missing":
+        report_path.unlink()
+    else:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if report_problem == "failed":
+            report["status"] = "failed"
+        else:
+            report["video_id"] = "different-video"
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    exit_code = run_pipeline(
+        manifest_path=manifest_path,
+        segment_id="seg_01",
+        config=LongSplatConfig(
+            source_path="",
+            model_path="",
+            iterations=100,
+            seed=0,
+        ),
+        repo_root=backend,
+        output_dir=output_dir,
+        project_root=tmp_path,
+        python_exe=sys.executable,
+    )
+
+    assert exit_code == 1
+    assert not (backend / "orchestrator_test_sentinel.json").exists()
+
+    run_dir = next(output_dir.iterdir())
+    record = json.loads(
+        (run_dir / "reconstruction_run.json").read_text(encoding="utf-8")
+    )
+    assert record["status"] == "failed"
+    assert record["stages"]["exception"]["reason"] == "exception"
+    assert (
+        record["_pv"]["producer_manifest_sha256"]
+        == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    )
+    if report_problem == "missing":
+        assert record["_pv"]["producer_quality_report_sha256"] is None
+    else:
+        assert (
+            record["_pv"]["producer_quality_report_sha256"]
+            == hashlib.sha256(report_path.read_bytes()).hexdigest()
+        )
 
 
 def test_orchestrator_fake_backend_completes(tmp_path):
@@ -381,6 +624,14 @@ def test_orchestrator_fake_backend_completes(tmp_path):
     assert record_path.is_file()
     record = json.loads(record_path.read_text())
     assert record["status"] == "complete"
+    assert record["_pv"]["producer_quality_report_sha256"] is None
+    assert record["_pv"]["producer_run"] == {
+        "id": "test-source-settings",
+        "code": {
+            "commit": "75b5204fa313c84c613141b89a0ba4462db599a1",
+            "working_tree_dirty": False,
+        },
+    }
 
     # Check sentinel — training ran in the correct CWD
     sentinel_path = backend / "orchestrator_test_sentinel.json"
@@ -2285,11 +2536,13 @@ def test_audit_pose_quality_large_rotation_step(tmp_path):
     # Build two cameras with a ~142° relative rotation around Z
     theta = np.deg2rad(142.0)
     R0 = np.eye(3)
-    R1 = np.array([
-        [np.cos(theta), -np.sin(theta), 0],
-        [np.sin(theta), np.cos(theta), 0],
-        [0, 0, 1],
-    ])
+    R1 = np.array(
+        [
+            [np.cos(theta), -np.sin(theta), 0],
+            [np.sin(theta), np.cos(theta), 0],
+            [0, 0, 1],
+        ]
+    )
     cameras = [
         _make_camera_entry(R=R0, T=[0.0, 0.0, 1.0]),
         _make_camera_entry(R=R1, T=[0.01, 0.0, 1.0]),
@@ -2330,13 +2583,14 @@ def test_audit_pose_quality_large_translation_step(tmp_path):
     telemetry = {
         "accepted_camera_count": 4,
         "accepted_frames": [
-            "frame_000000", "frame_000001", "frame_000002", "frame_000003",
+            "frame_000000",
+            "frame_000001",
+            "frame_000002",
+            "frame_000003",
         ],
         "attempt_count": 4,
         "rejected_attempt_count": 0,
-        "records": [
-            {"frame": f"frame_{i:06d}", "success": True} for i in range(4)
-        ],
+        "records": [{"frame": f"frame_{i:06d}", "success": True} for i in range(4)],
     }
 
     result = audit_pose_quality(cams_path, telemetry)

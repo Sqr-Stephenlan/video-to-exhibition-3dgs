@@ -13,6 +13,7 @@ the LongSplat backend.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,8 @@ _OPTIONAL_FRAME_KEYS = frozenset(
         "time_base",
         "selection_status",
         "selection_reason",
+        "producer_frame_id",
+        "producer_frame_index",
         "producer_run_id",
     }
 )
@@ -203,9 +206,43 @@ def _validate_frames(manifest: dict[str, Any], source: Path) -> None:
             )
 
         ts = frame.get("timestamp")
-        if ts is not None and not isinstance(ts, (int, float)):
+        if ts is not None and (
+            not isinstance(ts, (int, float))
+            or isinstance(ts, bool)
+            or not math.isfinite(float(ts))
+        ):
             raise ManifestValidationError(
-                f"Manifest {source}: frames[{i}].timestamp must be numeric, got {ts!r}"
+                f"Manifest {source}: frames[{i}].timestamp must be finite numeric, "
+                f"got {ts!r}"
+            )
+
+        producer_frame_id = frame.get("producer_frame_id")
+        if producer_frame_id is not None and (
+            not isinstance(producer_frame_id, str) or not producer_frame_id
+        ):
+            raise ManifestValidationError(
+                f"Manifest {source}: frames[{i}].producer_frame_id must be "
+                "a non-empty string"
+            )
+
+        producer_frame_index = frame.get("producer_frame_index")
+        if producer_frame_index is not None and (
+            not isinstance(producer_frame_index, int)
+            or isinstance(producer_frame_index, bool)
+            or producer_frame_index < 0
+        ):
+            raise ManifestValidationError(
+                f"Manifest {source}: frames[{i}].producer_frame_index must be "
+                "an integer >= 0"
+            )
+
+        producer_run_id = frame.get("producer_run_id")
+        if producer_run_id is not None and (
+            not isinstance(producer_run_id, str) or not producer_run_id
+        ):
+            raise ManifestValidationError(
+                f"Manifest {source}: frames[{i}].producer_run_id must be "
+                "a non-empty string"
             )
 
     _validate_ordering(frames, source)

@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--manifest",
         required=True,
         type=str,
-        help="Path to producer manifest (schema 1.0)",
+        help="Path to producer manifest (schema 2.0)",
     )
     parser.add_argument(
         "--segment-id",
