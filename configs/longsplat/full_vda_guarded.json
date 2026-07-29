@@ -12,14 +12,15 @@
     "depth_source": "vda",
     "vda_corr_threshold": 0.3,
     "vda_outlier_sigma": 2.5,
-    "post_iter": 20000
+    "post_iter": 20000,
+    "init_frame_num": 5
   },
   "convert_iteration": 30000,
   "convert_prune_ratio": 0.6,
   "expected_native_checkpoint_iteration": 50000,
   "quality_gates": {
-    "pose": {"mode": "enforce"},
-    "vda": {"mode": "enforce"},
+    "pose": {"mode": "enforce", "max_rotation_step_deg": 40.0, "max_translation_step_ratio": 20.0, "max_orthogonality_error": 0.001, "max_determinant_error": 0.001},
+    "vda": {"mode": "enforce", "min_aligned_fraction": 0.75},
     "ply": {"mode": "enforce"}
   }
 }

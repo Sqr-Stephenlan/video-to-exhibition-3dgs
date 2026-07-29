@@ -16,7 +16,8 @@
     "pose_iteration": 100,
     "local_iter": 100,
     "global_iter": 100,
-    "post_iter": 50
+    "post_iter": 50,
+    "init_frame_num": 5
   },
   "convert_iteration": 100,
   "convert_prune_ratio": 0.6,
