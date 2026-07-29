@@ -80,11 +80,15 @@ source once with `coverage_v1_legacy_control.json` and once with
 ```
 
 `coverage_v1` performs a first pass at fixed analysis resolutions, calibrates
-the blur floor per segment, and uses adjacent-frame optical-flow/affine
-measurements as a 2D trackability and shake proxy. These measurements are not
-camera pose or 3D geometry. A failed quality gate returns exit code `2` and
-keeps the manifest/report for diagnosis; it never silently falls back to
-legacy selection.
+the blur floor per segment, and uses bidirectionally checked optical flow with
+an affine-first, fundamental-matrix fallback as a 2D trackability proxy. The
+fundamental model tolerates rigid foreground/background parallax when one
+partial affine is insufficient. These measurements are not camera pose or 3D
+geometry. Coverage repair can lower only the adaptive blur percentile within a
+bounded selected-frame graph; it cannot bypass the absolute blur, exposure, or
+full motion gates. A failed quality gate returns exit code `2` and keeps the
+manifest/report for diagnosis; it never silently falls back to legacy
+selection.
 
 ## CLI Options
 
@@ -120,6 +124,11 @@ The single entrypoint is:
 | `--quality-analysis-long-edge` | `512` | Fixed long edge used for calibrated blur analysis. |
 | `--flow-analysis-long-edge` | `320` | Fixed long edge used for adjacent-frame motion analysis. |
 | `--selection-min-gap-sec`, `--selection-target-gap-sec`, `--selection-max-gap-sec` | `0.1`, `0.2`, `0.3` | Coverage cadence and hard maximum gap for `coverage_v1`. |
+| `--motion-model` | `affine` | `affine` or affine-first `auto`; the checked-in coverage profile uses `auto`. |
+| `--flow-forward-backward-max-error-px` | `1.5` | Maximum LK round-trip error at the fixed flow analysis scale. |
+| `--fundamental-ransac-threshold-px`, `--fundamental-ransac-confidence` | `1.5`, `0.999` | Fundamental-model RANSAC controls used only by `auto`. |
+| `--bridge-min-blur-ratio` | `1.0` | Lowest adaptive-blur ratio allowed for a coverage graph node; the absolute blur floor still applies. |
+| `--max-bridge-window-sec`, `--max-bridge-fraction` | `0.0`, `1.0` | Bridge density quality gates; the checked-in coverage profile uses `2.4` and `0.5`. |
 | `--audit-manifest PATH` | none | Validate selected paths, decodability, ordering, and quality status; returns `0` or `2`. |
 | `--force` | `false` | Transactionally replace generated outputs for the same `video_id` after a new run succeeds. |
 
@@ -227,10 +236,15 @@ duplicate_score, matched_frame_id, sha256, reject_reasons
 
 When `keyframe_policy` is `coverage_v1`, rows also carry
 `calibrated_blur_score` and a `keyframe` object containing the policy decision,
-reference frame, adaptive threshold, quality score, bridge flag, and 2D motion
-diagnostics. `summary.keyframe_quality` reports status, maximum selected gap,
-component count, bridge count, thresholds, and failed segments. Consumers must
-use only coverage manifests whose quality `status` is `"passed"`.
+reference frame, adaptive threshold, quality score, bridge flag/reason, and 2D
+motion diagnostics. Motion diagnostics add the selected model and LK
+forward/backward RMSE. Selected bridges always reference the immediately
+preceding selected graph node. The per-segment quality report includes bridge
+fraction, maximum consecutive bridge window, affine/fundamental counts, and
+exact failure reasons. `summary.keyframe_quality` reports status, maximum
+selected gap, component count, bridge count, thresholds, and failed segments.
+Consumers must use only coverage manifests whose quality `status` is
+`"passed"`.
 
 `summary` includes total segment/frame counts, selected and rejected frame
 counts, per-segment frame counts, reject counts by reason, and observed selected

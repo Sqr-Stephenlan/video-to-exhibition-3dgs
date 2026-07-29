@@ -57,6 +57,13 @@ def test_resolve_settings_keeps_existing_defaults_without_config() -> None:
         "max_affine_rotation_deg": 12.0,
         "min_affine_scale": 0.8,
         "max_affine_scale": 1.25,
+        "motion_model": "affine",
+        "flow_forward_backward_max_error_px": 1.5,
+        "fundamental_ransac_threshold_px": 1.5,
+        "fundamental_ransac_confidence": 0.999,
+        "bridge_min_blur_ratio": 1.0,
+        "max_bridge_window_sec": 0.0,
+        "max_bridge_fraction": 1.0,
     }
 
 
@@ -400,6 +407,54 @@ def test_summary_coverage_counts_segment_boundaries() -> None:
     coverage = summary["coverage_by_segment"]["segment_0001"]
     assert coverage["max_selected_gap_sec"] == 5.0
     assert coverage["exceeds_target"] is True
+
+
+def test_coverage_quality_reports_bridge_density_and_motion_models() -> None:
+    segment = pv.SegmentWindow("segment_0001", 1, 0.0, 0.6, "time")
+    scanned = [
+        pv.pk.ScannedFrame(
+            id=f"segment_0001_frame_{index:06d}",
+            segment_id="segment_0001",
+            sample_index=index,
+            timestamp_sec=index * 0.2,
+            frame_index=index,
+            blur_score=100.0,
+            calibrated_blur_score=100.0,
+            overexposed_ratio=0.0,
+            underexposed_ratio=0.0,
+            average_hash_bits=np.zeros(64, dtype=bool),
+            flow_gray=np.zeros((8, 8), dtype=np.uint8),
+            width=8,
+            height=8,
+        )
+        for index in range(3)
+    ]
+    affine = pv.pk.MotionMetrics(True, 100, 90, 0.9, 0.75, 0.01, 0.0, 1.0, 0.001)
+    fundamental = pv.pk.MotionMetrics(
+        True, 100, 95, 0.95, 0.75, 0.01, 0.0, 1.0, 0.001, model="fundamental"
+    )
+    decisions = [
+        pv.pk.KeyframeDecision(True, (), None, None, None, False, 100.0, 1.0, None, 0),
+        pv.pk.KeyframeDecision(
+            True, (), None, None, scanned[0].id, True, 100.0, 0.7, affine, 0, "coverage_graph"
+        ),
+        pv.pk.KeyframeDecision(True, (), None, None, scanned[1].id, False, 100.0, 1.0, fundamental, 0),
+    ]
+    policy = pv.pk.KeyframePolicy.from_settings(
+        parse_settings(
+            "--keyframe-policy", "coverage_v1",
+            "--selection-max-gap-sec", "0.3",
+            "--max-bridge-window-sec", "0.3",
+            "--max-bridge-fraction", "0.2",
+        )
+    )
+
+    quality = pv._coverage_segment_quality(segment, scanned, decisions, policy)
+
+    assert quality["bridge_fraction"] == pytest.approx(1 / 3, abs=1e-6)
+    assert quality["max_consecutive_bridge_window_sec"] == 0.4
+    assert quality["motion_model_counts"] == {"affine": 1, "fundamental": 1}
+    assert quality["failed_reasons"] == ["bridge_fraction", "bridge_window_sec"]
 
 
 def test_manifest_coverage_policy_uses_selection_gap_as_summary_target() -> None:

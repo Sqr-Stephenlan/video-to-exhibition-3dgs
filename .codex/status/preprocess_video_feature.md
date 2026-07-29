@@ -1,12 +1,13 @@
 # Preprocess Video Feature Status
 
-Last updated: 2026-07-28
+Last updated: 2026-07-29
 
 ## Current Phase
 
-Stage 3 - The opt-in `coverage_v1` keyframe policy is implemented on top of the
-formal schema 2.0 manifest contract. The default remains `legacy`; fidelity
-frame extraction remains part of the same preprocess entrypoint.
+Stage 3 - The opt-in `coverage_v1` keyframe policy now includes parallax-safe
+affine-first motion validation and selected-frame coverage graph repair on top
+of the formal schema 2.0 manifest contract. The default remains `legacy`;
+fidelity frame extraction remains part of the same preprocess entrypoint.
 
 The 2026-07-28 Ready precheck follow-up addressed the verified P1 coverage and
 provenance issues in this branch. PR #2 should still remain Draft until the
@@ -27,6 +28,19 @@ files, dependency/license policy, real-video threshold acceptance, and the
 `scripts/preprocess_video.py` versus `scripts/preprocess/**` layout conflict.
 
 ## Completed
+
+- Implemented the 2026-07-29 parallax-safe producer changes on
+  `feature/preprocess-video`:
+  - added bidirectional LK filtering at the fixed flow-analysis scale;
+  - added deterministic affine-first/fundamental-fallback motion estimation,
+    Sampson residual diagnostics, and additive motion model/RMSE fields;
+  - replaced rejected-frame reinitialization with hard-gated selected-frame
+    coverage graph paths, including explicit segment boundary handling;
+  - bounded adaptive-blur bridge recovery with bridge fraction/window quality
+    gates while preserving the absolute blur, exposure, and geometry gates;
+  - added additive bridge reasons and per-segment affine/fundamental counts;
+  - kept `legacy` as the default and kept the two checked-in A/B configs equal
+    except for `keyframe_policy`.
 
 - Implemented the 2026-07-24 coverage-aware keyframe review without reverting
   the current `frames_manifest.json` schema 2.0 contract:
@@ -172,6 +186,20 @@ files, dependency/license policy, real-video threshold acceptance, and the
   joint testing scope.
 
 ## Verification
+
+- Ran the pre-change unit baseline on 2026-07-29: `52 passed`.
+- Added RED tests for parallax model selection and selected-frame graph repair,
+  then passed the focused suites: `25 passed` in
+  `test_preprocess_keyframes.py` and `40 passed` in
+  `test_preprocess_video.py`.
+- Ran `./dev.sh python -m compileall -q scripts tests/unit`; result: exit 0.
+- Ran `./dev.sh pytest tests/unit tests/integration -q`; result: `65 passed`.
+- Ran `./dev.sh python scripts/preprocess_video.py --help`; result: exit 0 and
+  all new motion/bridge configuration options are listed.
+- `./dev.sh ruff check ...` could not run because `ruff` is not installed in
+  the existing `.venv`; no dependency installation was attempted.
+- The specified `桌子.mp4` source is not present in the repository, so the
+  formal table-video A/B remains pending and no generated media was committed.
 
 - Ran through Git Bash and the required project entrypoint on 2026-07-27:
   `./dev.sh pytest tests/unit tests/integration -q
@@ -387,6 +415,12 @@ files, dependency/license policy, real-video threshold acceptance, and the
   needed for the final verification pass.
 
 ## Next Step
+
+Run the locked legacy/coverage A/B and manifest audit on the exact `桌子.mp4`
+source when it is made available under the repository, then review selected
+frames and bridge density before accepting the producer result. After that,
+continue the separately owned schema 2.0 depth adapter and segment-scoped
+LongSplat consumer changes on their respective branches.
 
 Retain Draft status until the owner explicitly disposes the protected shared
 file changes and dependency/license policy, resolves the script-layout conflict,

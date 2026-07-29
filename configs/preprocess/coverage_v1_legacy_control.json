@@ -15,5 +15,12 @@
   "max_median_displacement_diag_ratio": 0.25,
   "max_affine_rotation_deg": 12.0,
   "min_affine_scale": 0.8,
-  "max_affine_scale": 1.25
+  "max_affine_scale": 1.25,
+  "motion_model": "auto",
+  "flow_forward_backward_max_error_px": 1.5,
+  "fundamental_ransac_threshold_px": 1.5,
+  "fundamental_ransac_confidence": 0.999,
+  "bridge_min_blur_ratio": 0.65,
+  "max_bridge_window_sec": 2.4,
+  "max_bridge_fraction": 0.5
 }

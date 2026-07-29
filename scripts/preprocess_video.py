@@ -101,6 +101,12 @@ FLOAT_CONFIG_SETTINGS = frozenset(
         "max_affine_rotation_deg",
         "min_affine_scale",
         "max_affine_scale",
+        "flow_forward_backward_max_error_px",
+        "fundamental_ransac_threshold_px",
+        "fundamental_ransac_confidence",
+        "bridge_min_blur_ratio",
+        "max_bridge_window_sec",
+        "max_bridge_fraction",
         "adaptive_blur_percentile",
         "selection_min_gap_sec",
         "selection_target_gap_sec",
@@ -130,6 +136,7 @@ CHOICE_CONFIG_SETTINGS = {
     "frame_format": frozenset({"jpg", "png"}),
     "frame_source": frozenset({"segment", "source"}),
     "keyframe_policy": frozenset({"legacy", "coverage_v1"}),
+    "motion_model": frozenset({"affine", "auto"}),
 }
 
 
@@ -920,7 +927,8 @@ def _coverage_segment_quality(
     decisions: list[pk.KeyframeDecision],
     policy: pk.KeyframePolicy,
 ) -> dict[str, Any]:
-    selected = [frame for frame, decision in zip(scanned, decisions) if decision.selected]
+    selected_pairs = [(frame, decision) for frame, decision in zip(scanned, decisions) if decision.selected]
+    selected = [frame for frame, _decision in selected_pairs]
     timestamps = [frame.timestamp_sec for frame in selected]
     max_gap = selected_frame_max_gap(segment, timestamps)
     failed_reasons: list[str] = []
@@ -929,6 +937,28 @@ def _coverage_segment_quality(
     if max_gap > policy.max_gap_sec:
         failed_reasons.append("max_selected_gap_sec")
     bridge_count = sum(decision.bridge for decision in decisions if decision.selected)
+    bridge_fraction = float(bridge_count) / float(len(selected)) if selected else 0.0
+    max_bridge_window = 0.0
+    run_start = 0
+    while run_start < len(selected_pairs):
+        if not selected_pairs[run_start][1].bridge:
+            run_start += 1
+            continue
+        run_end = run_start
+        while run_end + 1 < len(selected_pairs) and selected_pairs[run_end + 1][1].bridge:
+            run_end += 1
+        left = segment.start_sec if run_start == 0 else selected_pairs[run_start - 1][0].timestamp_sec
+        right = segment.end_sec if run_end + 1 == len(selected_pairs) else selected_pairs[run_end + 1][0].timestamp_sec
+        max_bridge_window = max(max_bridge_window, right - left)
+        run_start = run_end + 1
+    motion_model_counts = {"affine": 0, "fundamental": 0}
+    for _frame, decision in selected_pairs:
+        if decision.motion is not None and decision.motion.model in motion_model_counts:
+            motion_model_counts[decision.motion.model] += 1
+    if bridge_fraction > policy.max_bridge_fraction:
+        failed_reasons.append("bridge_fraction")
+    if policy.max_bridge_window_sec > 0 and max_bridge_window > policy.max_bridge_window_sec:
+        failed_reasons.append("bridge_window_sec")
     return {
         "segment_id": segment.id,
         "total_frames": len(scanned),
@@ -937,6 +967,9 @@ def _coverage_segment_quality(
         "component_count": 1 if selected else 0,
         "max_selected_gap_sec": max_gap,
         "bridge_frames": bridge_count,
+        "bridge_fraction": round(bridge_fraction, 6),
+        "max_consecutive_bridge_window_sec": round_sec(max_bridge_window),
+        "motion_model_counts": motion_model_counts,
         "failed_reasons": failed_reasons,
     }
 
@@ -987,7 +1020,12 @@ def sample_segment_frames_coverage(
                 height=int(frame.shape[0]),
             )
         )
-    decisions = pk.select_coverage_frames(scanned, policy)
+    decisions = pk.select_coverage_frames(
+        scanned,
+        policy,
+        segment_start_sec=segment.start_sec,
+        segment_end_sec=segment.end_sec,
+    )
     selected_dir = selected_root / segment.id
     rejected_dir = rejected_root / segment.id
     selected_dir.mkdir(parents=True, exist_ok=True)
@@ -1028,6 +1066,7 @@ def sample_segment_frames_coverage(
             "component_id": decision.component_id,
             "selected_by_policy": decision.selected,
             "bridge": decision.bridge,
+            "bridge_reason": decision.bridge_reason,
             "reference_frame_id": decision.reference_frame_id,
             "adaptive_blur_threshold": round(decision.adaptive_blur_threshold, 6),
             "quality_score": round(decision.quality_score, 6),
@@ -1716,6 +1755,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-affine-rotation-deg", type=float, default=None)
     parser.add_argument("--min-affine-scale", type=float, default=None)
     parser.add_argument("--max-affine-scale", type=float, default=None)
+    parser.add_argument("--motion-model", choices=["affine", "auto"], default=None)
+    parser.add_argument("--flow-forward-backward-max-error-px", type=float, default=None)
+    parser.add_argument("--fundamental-ransac-threshold-px", type=float, default=None)
+    parser.add_argument("--fundamental-ransac-confidence", type=float, default=None)
+    parser.add_argument("--bridge-min-blur-ratio", type=float, default=None)
+    parser.add_argument("--max-bridge-window-sec", type=float, default=None)
+    parser.add_argument("--max-bridge-fraction", type=float, default=None)
     parser.add_argument("--force", action="store_true", help="Overwrite existing output directories for this video id.")
     return parser
 
@@ -1739,6 +1785,9 @@ def main(argv: list[str] | None = None) -> int:
             args.max_motion_residual_diag_ratio,
             args.max_median_displacement_diag_ratio, args.max_affine_rotation_deg,
             args.min_affine_scale, args.max_affine_scale,
+            args.motion_model, args.flow_forward_backward_max_error_px,
+            args.fundamental_ransac_threshold_px, args.fundamental_ransac_confidence,
+            args.bridge_min_blur_ratio, args.max_bridge_window_sec, args.max_bridge_fraction,
         ]
         if any(value is not None and value is not False for value in preprocess_values):
             parser.error("--audit-manifest cannot be combined with preprocess options")
