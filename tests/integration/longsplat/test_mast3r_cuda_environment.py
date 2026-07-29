@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 MODEL_SOURCE = (
@@ -19,6 +21,10 @@ MODEL_SOURCE = (
 PATCH_PATH = (
     PROJECT_ROOT / "docs" / "longsplat" / "patches" / "mast3r_low_memory_load.patch"
 )
+_LOCAL_BACKEND_SKIP_REASON = (
+    "requires ignored local third_party/LongSplat checkout; "
+    "the tracked MASt3R patch contract is tested separately"
+)
 
 
 def _load_model_function() -> ast.FunctionDef:
@@ -30,6 +36,10 @@ def _load_model_function() -> ast.FunctionDef:
     )
 
 
+@pytest.mark.skipif(
+    not MODEL_SOURCE.is_file(),
+    reason=_LOCAL_BACKEND_SKIP_REASON,
+)
 def test_mast3r_checkpoint_is_released_before_cuda_transfer():
     function = _load_model_function()
     calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]

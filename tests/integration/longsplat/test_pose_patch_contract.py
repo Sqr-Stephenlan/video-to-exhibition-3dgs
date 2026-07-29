@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 _PATCH_PATH = (
@@ -20,6 +22,10 @@ _PATCH_PATH = (
 )
 
 _BACKEND_ROOT = _PROJECT_ROOT / "third_party" / "LongSplat"
+_LOCAL_BACKEND_SKIP_REASON = (
+    "requires ignored local third_party/LongSplat checkout; "
+    "the tracked pose patch contract is tested separately"
+)
 
 _EXPECTED_BACKEND_FILES = [
     "arguments/__init__.py",
@@ -150,6 +156,10 @@ def test_patch_only_touches_five_backend_files():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not (_BACKEND_ROOT / "scene" / "cameras.py").is_file(),
+    reason=_LOCAL_BACKEND_SKIP_REASON,
+)
 def test_backend_camera_update_rt_rejects_invalid():
     """Current Camera.update_RT must reject non-(3,3) R, non-(3,) t, non-finite."""
     if str(_PROJECT_ROOT) not in sys.path:
@@ -167,6 +177,10 @@ def test_backend_camera_update_rt_rejects_invalid():
     )
 
 
+@pytest.mark.skipif(
+    not (_BACKEND_ROOT / "utils" / "pose_utils.py").is_file(),
+    reason=_LOCAL_BACKEND_SKIP_REASON,
+)
 def test_backend_has_project_to_so3():
     """project_to_so3 helper must exist in the backend utils."""
     pose_utils = _BACKEND_ROOT / "utils" / "pose_utils.py"
@@ -177,6 +191,13 @@ def test_backend_has_project_to_so3():
     )
 
 
+@pytest.mark.skipif(
+    not all(
+        (_BACKEND_ROOT / path).is_file()
+        for path in ("scene/__init__.py", "train.py")
+    ),
+    reason=_LOCAL_BACKEND_SKIP_REASON,
+)
 def test_backend_has_pose_telemetry():
     """POSE_TELEMETRY must be emitted in the incremental registration path."""
     scene_init = _BACKEND_ROOT / "scene" / "__init__.py"
