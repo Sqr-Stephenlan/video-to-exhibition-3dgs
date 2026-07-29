@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert preprocess_manifest.json into depth-prior frames_manifest.json."""
+"""Adapt preprocess frames_manifest.json into depth-prior frames_manifest.json."""
 
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ from scripts.depth.config import (
 )
 from scripts.depth.manifest import save_json
 
+# Upstream preprocess (PR #2) ships schema 2.0; 1.0 retained for older fixtures.
+SUPPORTED_PREPROCESS_SCHEMAS = {"1.0", "2.0"}
+
 # Provenance keys copied from preprocess when present.
 _PROVENANCE_KEYS = (
     "segment_id",
@@ -31,6 +34,9 @@ _PROVENANCE_KEYS = (
     "underexposed_ratio",
     "duplicate_score",
     "reject_reasons",
+    "calibrated_blur_score",
+    "keyframe",
+    "sha256",
 )
 
 
@@ -68,6 +74,22 @@ def _selection_reason(frame: dict[str, Any]) -> str | None:
     return None
 
 
+def _assert_coverage_quality_gate(preprocess_manifest: dict[str, Any]) -> None:
+    """Fail closed when coverage keyframe quality is present but not passed."""
+    summary = preprocess_manifest.get("summary")
+    if not isinstance(summary, dict):
+        return
+    quality = summary.get("keyframe_quality")
+    if not isinstance(quality, dict):
+        return
+    status = quality.get("status")
+    if status != "passed":
+        raise ValueError(
+            "preprocess summary.keyframe_quality.status must be 'passed' before "
+            f"depth-prior adaptation; got {status!r}"
+        )
+
+
 def adapt_preprocess_to_frames_manifest(
     preprocess_manifest: dict[str, Any],
     *,
@@ -78,15 +100,23 @@ def adapt_preprocess_to_frames_manifest(
     """
     Map preprocess output to the depth-prior frames_manifest contract.
 
+    Accepts upstream preprocess schema 2.0 (PR #2) and legacy 1.0 fixtures.
+    Depth-prior output schema remains 1.0.
+
     - frames[].id -> frames[].frame_id
     - keep segment_id / quality provenance when present
     - width/height required (filled from image bytes when missing)
     - selected=true with missing path is an error
     - timestamp_sec must be all-present or all-absent after adaptation
+    - if summary.keyframe_quality is present, status must be "passed"
     """
-    schema = preprocess_manifest.get("schema_version", "1.0")
-    if schema != "1.0":
-        raise ValueError(f"Unsupported preprocess schema_version: {schema!r}")
+    schema = str(preprocess_manifest.get("schema_version", "1.0"))
+    if schema not in SUPPORTED_PREPROCESS_SCHEMAS:
+        raise ValueError(
+            "Unsupported preprocess schema_version: "
+            f"{schema!r}; supported={sorted(SUPPORTED_PREPROCESS_SCHEMAS)}"
+        )
+    _assert_coverage_quality_gate(preprocess_manifest)
 
     video_id = preprocess_manifest.get("video_id")
     if video_id not in (None, ""):
@@ -94,7 +124,7 @@ def adapt_preprocess_to_frames_manifest(
 
     frames_in = preprocess_manifest.get("frames")
     if not isinstance(frames_in, list) or not frames_in:
-        raise ValueError("preprocess_manifest.frames must be a non-empty list")
+        raise ValueError("preprocess frames_manifest.frames must be a non-empty list")
 
     frames_out: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -149,7 +179,7 @@ def adapt_preprocess_to_frames_manifest(
         frames_out.append(record)
 
     if not frames_out:
-        raise ValueError("No selected frames with paths in preprocess_manifest")
+        raise ValueError("No selected frames with paths in preprocess frames_manifest")
 
     has_ts = ["timestamp_sec" in frame for frame in frames_out]
     if any(has_ts) and not all(has_ts):
@@ -167,6 +197,7 @@ def adapt_preprocess_to_frames_manifest(
         "schema_version": "1.0",
         "video_id": video_id,
         "source_video": source_path,
+        "source_preprocess_schema": schema,
         "source_preprocess_manifest": frames_manifest_path,
         "frames": frames_out,
     }
@@ -174,16 +205,22 @@ def adapt_preprocess_to_frames_manifest(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Adapt preprocess_manifest.json to depth-prior frames_manifest.json"
+        description=(
+            "Adapt preprocess frames_manifest.json (schema 2.0 from PR #2, or "
+            "legacy 1.0) to depth-prior frames_manifest.json"
+        )
     )
     parser.add_argument(
         "preprocess_manifest",
-        help="Repository-relative path to preprocess_manifest.json",
+        help=(
+            "Repository-relative path to preprocess frames_manifest.json "
+            "(typically data/manifests/<video_id>/frames_manifest.json)"
+        ),
     )
     parser.add_argument(
         "--output",
         default="data/manifests/{video_id}/{run_id}/frames_manifest.json",
-        help="Repository-relative output path (supports {video_id} and {run_id})",
+        help="Repository-relative depth-prior output path (supports {video_id} and {run_id})",
     )
     parser.add_argument(
         "--run-id",

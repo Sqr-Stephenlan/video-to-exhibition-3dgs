@@ -194,7 +194,7 @@ Default path: `data/manifests/<video_id>/<run_id>/depth_manifest.json`
     {
       "frame_id": "demo_short_000001",
       "rgb_path": "data/frames/demo_short/000001.png",
-      "depth_path": "data/depth/demo_short_000001.npz",
+      "depth_path": "data/depth/demo_short/default/demo_short_000001.npz",
       "depth_type": "relative",
       "confidence_path": null,
       "depth_index": 0
@@ -247,28 +247,31 @@ Documented in config comments and `scripts/depth/README.md`. Do **not** assume t
 
 ## Bridge from video preprocessing
 
-Preprocess PR (`feature/preprocess-video`, not part of this PR) writes:
+Preprocess PR (`feature/preprocess-video`, PR #2) writes:
 
-`data/manifests/<video_id>/preprocess_manifest.json`
+`data/manifests/<video_id>/frames_manifest.json`
 
-with `frames[].id` (not `frame_id`). Depth-prior expects a frames_manifest with
-`frames[].frame_id`, defaulting to `data/manifests/<video_id>/<run_id>/frames_manifest.json`.
+with `schema_version: "2.0"` and `frames[].id` (not `frame_id`). Depth-prior expects a
+depth-side frames_manifest with `frames[].frame_id`, defaulting to
+`data/manifests/<video_id>/<run_id>/frames_manifest.json`.
 
 Convert with:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\depth\adapt_preprocess_manifest.py `
-  data\manifests\<video_id>\preprocess_manifest.json `
+  data\manifests\<video_id>\frames_manifest.json `
   --run-id baseline
 # default --output data/manifests/{video_id}/{run_id}/frames_manifest.json
 ```
 
 Adapter rules (fail closed):
 
+- accepts preprocess schema `"2.0"` (PR #2) and legacy `"1.0"` fixtures; depth output stays `"1.0"`
 - selected frames must have a non-null repository-relative `path`
 - `width`/`height` are required (filled from image bytes when preprocess omits them)
 - preserve `segment_id`, selection `reason`, and quality provenance fields when present
 - `timestamp_sec` must be all-present or all-absent (null counts as absent)
+- if `summary.keyframe_quality` is present, `status` must be `"passed"`
 - paths may not escape the repository root
 - duplicate `frame_id` values are rejected
 

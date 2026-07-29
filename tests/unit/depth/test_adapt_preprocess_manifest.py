@@ -54,10 +54,11 @@ def test_adapt_preprocess_manifest_maps_id_and_filters() -> None:
     }
     adapted = adapt_preprocess_to_frames_manifest(
         payload,
-        frames_manifest_path="data/manifests/joint_smoke/preprocess_manifest.json",
+        frames_manifest_path="data/manifests/joint_smoke/frames_manifest.json",
         fill_missing_size=False,
     )
     assert adapted["schema_version"] == "1.0"
+    assert adapted["source_preprocess_schema"] == "1.0"
     assert adapted["video_id"] == "joint_smoke"
     assert adapted["source_video"] == "data/raw_videos/joint_smoke.mp4"
     assert [f["frame_id"] for f in adapted["frames"]] == [
@@ -71,6 +72,106 @@ def test_adapt_preprocess_manifest_maps_id_and_filters() -> None:
     # Round-trip into depth-prior selection rules.
     selected = selected_frames(adapted, dedupe_timestamps=False)
     assert len(selected) == 2
+
+
+def test_adapt_preprocess_schema_v2_maps_and_filters() -> None:
+    payload = {
+        "schema_version": "2.0",
+        "video_id": "contract_v2",
+        "source": {"path": "data/raw_videos/contract_v2.mp4"},
+        "summary": {"keyframe_quality": {"status": "passed"}},
+        "frames": [
+            {
+                "id": "segment_0001_frame_000001",
+                "segment_id": "segment_0001",
+                "path": "data/frames/contract_v2/selected/segment_0001/a.png",
+                "timestamp_sec": 0.0,
+                "frame_index": 1,
+                "width": 160,
+                "height": 120,
+                "selected": True,
+                "blur_score": 100.0,
+                "reject_reasons": [],
+            },
+            {
+                "id": "segment_0001_frame_000002",
+                "segment_id": "segment_0001",
+                "path": None,
+                "timestamp_sec": 0.5,
+                "frame_index": 2,
+                "width": 160,
+                "height": 120,
+                "selected": False,
+            },
+            {
+                "id": "segment_0001_frame_000003",
+                "segment_id": "segment_0001",
+                "path": "data/frames/contract_v2/selected/segment_0001/c.png",
+                "timestamp_sec": 1.0,
+                "frame_index": 3,
+                "width": 160,
+                "height": 120,
+                "selected": True,
+                "sha256": "abcd",
+            },
+        ],
+    }
+    adapted = adapt_preprocess_to_frames_manifest(
+        payload,
+        frames_manifest_path="data/manifests/contract_v2/frames_manifest.json",
+        fill_missing_size=False,
+    )
+    assert adapted["schema_version"] == "1.0"
+    assert adapted["source_preprocess_schema"] == "2.0"
+    assert adapted["source_video"] == "data/raw_videos/contract_v2.mp4"
+    assert [frame["frame_id"] for frame in adapted["frames"]] == [
+        "segment_0001_frame_000001",
+        "segment_0001_frame_000003",
+    ]
+    assert adapted["frames"][0]["segment_id"] == "segment_0001"
+    assert adapted["frames"][1]["sha256"] == "abcd"
+    selected = selected_frames(adapted, dedupe_timestamps=False)
+    assert len(selected) == 2
+
+
+def test_adapt_rejects_failed_coverage_quality_gate() -> None:
+    payload = {
+        "schema_version": "2.0",
+        "video_id": "bad_coverage",
+        "summary": {"keyframe_quality": {"status": "failed"}},
+        "frames": [
+            {
+                "id": "segment_0001_frame_000001",
+                "path": "data/frames/a.jpg",
+                "selected": True,
+                "timestamp_sec": 0.0,
+                "width": 64,
+                "height": 64,
+                "segment_id": "segment_0001",
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="keyframe_quality"):
+        adapt_preprocess_to_frames_manifest(payload, fill_missing_size=False)
+
+
+def test_adapt_rejects_unsupported_schema() -> None:
+    with pytest.raises(ValueError, match="Unsupported preprocess schema_version"):
+        adapt_preprocess_to_frames_manifest(
+            {
+                "schema_version": "9.9",
+                "frames": [
+                    {
+                        "id": "segment_0001_frame_000001",
+                        "path": "data/frames/a.jpg",
+                        "selected": True,
+                        "width": 64,
+                        "height": 64,
+                    }
+                ],
+            },
+            fill_missing_size=False,
+        )
 
 
 def test_adapt_rejects_null_timestamp_mixed_with_numeric() -> None:

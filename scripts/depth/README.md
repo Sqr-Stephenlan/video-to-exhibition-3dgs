@@ -69,7 +69,7 @@ Temp-video assembly passes `-frames:v N` so the ffmpeg concat demuxer’s traili
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\depth\adapt_preprocess_manifest.py `
-  data\manifests\<video_id>\preprocess_manifest.json `
+  data\manifests\<video_id>\frames_manifest.json `
   --run-id baseline
 
 .\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py `
