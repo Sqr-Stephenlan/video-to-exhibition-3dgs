@@ -1156,6 +1156,7 @@ def test_absolute_depth_path_rejected(tmp_path):
     run_dir = tmp_path / "run"
     input_dir = run_dir / "input"
     input_dir.mkdir(parents=True)
+    absolute_depth_path = (tmp_path / "absolute" / "depth.npz").resolve()
 
     mapping = [
         {"source_path": "frames/frame_000000.jpg", "prepared_name": "frame_000000.jpg"},
@@ -1166,7 +1167,7 @@ def test_absolute_depth_path_rejected(tmp_path):
         "frames": [
             {
                 "rgb_path": "frames/frame_000000.jpg",
-                "depth_path": "C:/absolute/path/depth.npz",
+                "depth_path": str(absolute_depth_path),
                 "sha256": "a" * 64,
             },
         ],
