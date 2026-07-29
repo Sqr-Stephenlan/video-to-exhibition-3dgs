@@ -29,6 +29,19 @@ files, dependency/license policy, real-video threshold acceptance, and the
 
 ## Completed
 
+- Ran the 2026-07-29 desk/table parameter matrix against the exact expected
+  source hash. The controlled legacy/coverage blur sweep and the 512-pixel
+  LongSplat cadence sweep are recorded in
+  `docs/preprocess_table_parallax_ab_2026-07-29.md`.
+  - all legacy control runs audited successfully with 394-401 selected frames;
+  - all `coverage_v1` rows failed the 0.3-second coverage gate, including the
+    formal 10 FPS / 512-pixel candidate;
+  - the formal candidate retained 88 of 1,013 sampled frames, with the main
+    rejection reasons being insufficient bidirectional LK tracks (684) and
+    insufficient tracked points (151);
+  - rejected artifacts are retained under ignored `data/` paths for review and
+    are not eligible for VDA or LongSplat processing.
+
 - Implemented the 2026-07-29 parallax-safe producer changes on
   `feature/preprocess-video`:
   - added bidirectional LK filtering at the fixed flow-analysis scale;
@@ -413,6 +426,15 @@ files, dependency/license policy, real-video threshold acceptance, and the
 - Located Git for Windows Bash at `D:/Program Files/Git/bin/bash.exe` and used
   it to run all current checks through `./dev.sh`; no direct venv invocation was
   needed for the final verification pass.
+
+## Desk Matrix Decision
+
+The exact table-video source is now available as `data/raw_videos/desk.mp4`
+and was tested. The formal `table_parallax_candidate_20260729` artifact is
+rejected by the automatic coverage gate; do not run VDA or LongSplat against
+it. Do not lower geometry/flow/coverage thresholds or use shorter segments to
+make a boundary-gap result pass. Inspect the capture and reshoot or replace it
+before a new producer candidate is considered.
 
 ## Next Step
 
