@@ -186,7 +186,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Step 2: build config
     config = LongSplatConfig(
-        source_path=str(args.source_path),
+        source_path=str(args.source_path.resolve()),
         model_path=str(destination_model),
         iterations=args.conversion_iterations,  # placeholder — not used for conversion only
         seed=0,
@@ -195,8 +195,9 @@ def main(argv: list[str] | None = None) -> None:
         convert_prune_ratio=args.prune_ratio,
     )
 
+    repo_root_resolved = args.repo_root.resolve()
     convert_cmd = build_convert_command(
-        args.repo_root,
+        repo_root_resolved,
         config,
         str(args.backend_python),
     )
@@ -213,14 +214,15 @@ def main(argv: list[str] | None = None) -> None:
     if args.dry_run:
         print(f"[DRY-RUN] Would execute: {' '.join(convert_cmd)}")
         output_record.parent.mkdir(parents=True, exist_ok=True)
-        output_record.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+        output_record.write_text(
+            json.dumps(record, indent=2, default=str), encoding="utf-8"
+        )
         print(f"Record written to {output_record}")
         return
 
     # Step 3: run conversion
-    repo_root = args.repo_root.resolve()
     env = subprocess.os.environ.copy()
-    env["PYTHONPATH"] = str(repo_root) + (
+    env["PYTHONPATH"] = str(repo_root_resolved) + (
         subprocess.os.pathsep + env.get("PYTHONPATH", "")
         if env.get("PYTHONPATH")
         else ""
@@ -230,7 +232,7 @@ def main(argv: list[str] | None = None) -> None:
         convert_cmd,
         capture_output=True,
         text=True,
-        cwd=str(repo_root),
+        cwd=str(repo_root_resolved),
         env=env,
     )
 
@@ -260,7 +262,9 @@ def main(argv: list[str] | None = None) -> None:
             record["conversion_error"] = "converted PLY not found"
 
     output_record.parent.mkdir(parents=True, exist_ok=True)
-    output_record.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+    output_record.write_text(
+        json.dumps(record, indent=2, default=str), encoding="utf-8"
+    )
     print(f"Record written to {output_record}")
 
     if result.returncode != 0:
