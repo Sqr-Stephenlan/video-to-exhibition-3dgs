@@ -1,0 +1,546 @@
+# Preprocess Video Feature Status
+
+Last updated: 2026-07-29
+
+## Current Phase
+
+Stage 3 - The opt-in `coverage_v1` keyframe policy now includes parallax-safe
+affine-first motion validation and selected-frame coverage graph repair on top
+of the formal schema 2.0 manifest contract. The default remains `legacy`;
+fidelity frame extraction remains part of the same preprocess entrypoint.
+
+The 2026-07-28 Ready precheck follow-up addressed the verified P1 coverage and
+provenance issues in this branch. PR #2 should still remain Draft until the
+schema 2.0 downstream adapter migration is completed or explicitly owned by the
+depth-prior / LongSplat branches.
+
+The feature now has a single CLI entrypoint, focused tests, and user-facing
+documentation. FFmpeg and ffprobe are now installed on PATH, the FFmpeg smoke
+test passes. The formal handoff artifact is now `frames_manifest.json`, with
+schema `2.0`; generated output is staged and published only after a successful
+run. The feature documentation covers usage, configuration, tuning, manifest
+consumption, downstream consumer contracts, troubleshooting, and generated-
+asset boundaries.
+
+PR #2 remains Draft. Its body now reflects HEAD `75b5204`, the 16-file scope,
+current test evidence, and the unresolved owner decisions for protected shared
+files, dependency/license policy, real-video threshold acceptance, and the
+`scripts/preprocess_video.py` versus `scripts/preprocess/**` layout conflict.
+
+## Completed
+
+- Ran the 2026-07-29 desk/table parameter matrix against the exact expected
+  source hash. The controlled legacy/coverage blur sweep and the 512-pixel
+  LongSplat cadence sweep are recorded in
+  `docs/preprocess_table_parallax_ab_2026-07-29.md`.
+  - all legacy control runs audited successfully with 394-401 selected frames;
+  - all `coverage_v1` rows failed the 0.3-second coverage gate, including the
+    formal 10 FPS / 512-pixel candidate;
+  - the formal candidate retained 88 of 1,013 sampled frames, with the main
+    rejection reasons being insufficient bidirectional LK tracks (684) and
+    insufficient tracked points (151);
+  - rejected artifacts are retained under ignored `data/` paths for review and
+    are not eligible for VDA or LongSplat processing.
+
+- Implemented the 2026-07-29 parallax-safe producer changes on
+  `feature/preprocess-video`:
+  - added bidirectional LK filtering at the fixed flow-analysis scale;
+  - added deterministic affine-first/fundamental-fallback motion estimation,
+    Sampson residual diagnostics, and additive motion model/RMSE fields;
+  - replaced rejected-frame reinitialization with hard-gated selected-frame
+    coverage graph paths, including explicit segment boundary handling;
+  - bounded adaptive-blur bridge recovery with bridge fraction/window quality
+    gates while preserving the absolute blur, exposure, and geometry gates;
+  - added additive bridge reasons and per-segment affine/fundamental counts;
+  - kept `legacy` as the default and kept the two checked-in A/B configs equal
+    except for `keyframe_policy`.
+
+- Implemented the 2026-07-24 coverage-aware keyframe review without reverting
+  the current `frames_manifest.json` schema 2.0 contract:
+  - added `scripts/preprocess_keyframes.py` with fixed-scale calibrated blur,
+    LK optical flow, RANSAC affine diagnostics, hard motion gates, bounded
+    bridge rules, and a pure coverage selector;
+  - added strict `legacy|coverage_v1` configuration and kept legacy as the
+    default behavior;
+  - added two-pass candidate scan/materialization with frame-count and timestamp
+    consistency checks;
+  - added additive per-frame keyframe diagnostics,
+    `summary.keyframe_quality`, and `keyframe_quality_report.json`;
+  - added `--audit-manifest`, fail-closed quality exit code `2`, and no silent
+    fallback to legacy;
+  - added `configs/preprocess/coverage_v1.json` and documentation for controlled
+    policy A/B runs.
+- Added focused synthetic tests for fixed-resolution blur, 2D motion metrics,
+  configuration validation, manifest additivity, coverage smoke processing,
+  quality reports, and auditing.
+- Addressed the 2026-07-28 Ready precheck P1 findings:
+  - `coverage_v1` can reinitialize against the previous scanned frame when the
+    last selected reference is stale, the selected-frame gap has exceeded the
+    policy maximum, and local motion passes the hard/bridge safety gates;
+  - `summary.coverage_by_segment` now includes segment start/end boundary gaps
+    and uses the same `selection_max_gap_sec` target as
+    `summary.keyframe_quality` for coverage-policy runs;
+  - `summary.keyframe_quality` records `max_selected_gap_target_sec`;
+  - repository provenance is captured before `.preprocess-staging` is created,
+    so staging writes no longer make an otherwise clean checkout appear dirty;
+  - added a schema 2.0 contract fixture at
+    `tests/fixtures/preprocess/frames_manifest_v2_minimal.json` for downstream
+    adapter migration tests.
+
+- Read and followed `.codex/prompts/preprocess_video_feature.md`.
+- Added `requirements.txt` with the minimal preprocess dependency set:
+  `numpy`, `opencv-python`, `scenedetect[opencv]`, and `pytest`.
+- Updated `dev.sh` so the project Python entrypoint can use either
+  `.venv/bin/python` or Windows `.venv/Scripts/python.exe`.
+- Added `scripts/preprocess_video.py` with:
+  - CLI options for output root, video id, presets, segmentation settings,
+    frame quality thresholds, rejected-frame saving, and forced overwrite.
+  - `ffmpeg` and `ffprobe` availability checks with clear setup errors.
+  - ffprobe metadata probing.
+  - H.264 MP4 normalization.
+  - time-window segmentation.
+  - optional PySceneDetect scene segmentation with time-window fallback.
+  - OpenCV frame sampling, blur/exposure scoring, average-hash duplicate
+    filtering, selected/rejected frame handling, and manifest generation.
+- Addressed the outstanding review feedback by:
+  - ensuring `cv2.VideoCapture` is released in a `finally` block even when
+    frame sampling raises an error;
+  - adding `-hide_banner -loglevel error` to per-segment FFmpeg calls so long
+    runs do not buffer banner noise in memory.
+- Added regression tests covering:
+  - quiet segment FFmpeg command construction;
+  - `VideoCapture` release on frame-write failure.
+- Added `tests/unit/test_preprocess_video.py` covering:
+  - time-window segmentation and tiny-tail merge behavior.
+  - offset window math.
+  - blur, exposure, and duplicate hash scoring.
+  - manifest relative paths and summary counts.
+  - FFmpeg smoke flow, skipped when `ffmpeg` or `ffprobe` is unavailable.
+- Added `docs/preprocess_video.md` with usage, requirements, outputs, manifest
+  shape, and verification instructions.
+- Fixed Windows Unicode frame output: OpenCV image encoding is now written via
+  Python file I/O, and write failures raise a preprocessing error instead of
+  producing manifest paths for missing images.
+- Added a regression test covering image writes under Unicode paths.
+- Moved preprocess tests to `tests/unit/` so the main-branch CPU workflow
+  discovers and executes them; retained the required
+  `tests/integration/` and `tests/gpu/` directory placeholders.
+- Migrated PySceneDetect scene-window conversion from deprecated
+  `FrameTimecode.get_seconds()` calls to the `seconds` property.
+- Installed FFmpeg 8.1.2 through winget as a user-scoped package. Both
+  `ffmpeg` and `ffprobe` resolve from the installed `bin` directory, with the
+  required `libx264` H.264 encoder and MP4 muxer available.
+- Added an optional fidelity frame path:
+  - `--frame-format jpg|png` controls selected/rejected frame image encoding.
+  - `--frame-source segment|source` controls whether frames are sampled from
+    generated segment MP4s or directly from the original source video using the
+    segment time windows.
+  - The default remains `segment` + `jpg` for backward compatibility.
+  - `source` + `png` avoids second-generation segment-video sampling and JPEG
+    compression for final reconstruction frames while keeping H.264 MP4
+    normalized/segment outputs for downstream tool compatibility.
+- Addressed the review contract and reproducibility gaps:
+  - renamed the formal manifest to `frames_manifest.json` and upgraded the
+    schema to `2.0`;
+  - added frame/segment dimensions, SHA-256 values, motion diagnostics, and
+    duplicate match IDs;
+  - rejected source/config/output paths outside the repository instead of
+    serializing absolute paths;
+  - recorded source/config/code/tool provenance, resolved settings fingerprint,
+    complete command, and deterministic Run ID;
+  - staged generated files under a temporary run directory and published them
+    with rollback protection, so failed runs do not delete a prior result;
+  - bounded average-hash comparisons by a time window and added a maximum
+    selected-frame gap coverage guard;
+  - detected VFR input and fail-closed for unsafe source-frame seeking, while
+    applying rotation metadata explicitly for source-frame extraction.
+- Added regression coverage for the new manifest contract, strict paths,
+  staged overwrite behavior, VFR rejection, rotation handling, duplicate
+  coverage, provenance, and artifact dimensions/checksums.
+- Refreshed PR #2 metadata for HEAD `75b5204`, retained Draft status, replied
+  to the stale `VideoCapture` release review thread with its regression-test
+  evidence, and resolved that thread.
+- Added config-driven parameter tuning:
+  - `--config <path>` loads preprocessing settings from a dependency-free JSON
+    file.
+  - Settings resolve in the order built-in preset defaults, JSON config, then
+    explicit CLI options.
+  - Unknown fields, invalid types, and invalid choices fail with clear errors
+    instead of silently falling back to defaults.
+  - `--save-rejected` now also supports `--no-save-rejected` so CLI overrides
+    work in both directions.
+  - Added `configs/preprocess/baseline_real_video.json` as the editable
+    real-video tuning profile and documented the repeatable tuning workflow.
+- Ran a real-video parameter sweep against `data/raw_videos/pressure_test.mp4`
+  using the checked-in baseline config plus targeted CLI overrides for:
+  - blur threshold: `40`, `50`, `55`, `60`
+  - duplicate hash threshold: `4` and `3`
+  - target FPS: `5` and `4`
+  - segment overlap: `10` and `6`
+  - minimum segment length: `2` and `3`
+  - exposure ratios: `0.6` and `0.5`
+- Confirmed an important tuning semantic from the implementation: lower
+  `duplicate_hash_threshold` values are less strict, because duplicate rejection
+  happens when `duplicate_score <= duplicate_hash_threshold`.
+- Identified the first tuning pass recommendation for this sample:
+  - keep `duplicate_hash_threshold` at `4`
+  - increase `blur_threshold` to around `55`
+  - optionally reduce `target_fps` from `5` to `4` when disk and frame-count
+    pressure matter more than maximizing coverage
+  - leave exposure thresholds unchanged for now because no frames on
+    `pressure_test.mp4` tripped either exposure filter at `0.6` or `0.5`
+- Expanded `docs/preprocess_video.md` so the feature README now documents the
+  owned pipeline boundary, non-goals, CLI option table, preset defaults, config
+  precedence, output layout, manifest handoff contract, tuning guidance,
+  troubleshooting, and generated-asset Git boundaries.
+- Added a preprocess consumer contract to `docs/preprocess_video.md` that
+  defines producer guarantees, downstream adapter responsibilities, manifest
+  ordering rules, backend naming boundaries, LongSplat bridge expectations, and
+  joint testing scope.
+
+## Verification
+
+- Ran the pre-change unit baseline on 2026-07-29: `52 passed`.
+- Added RED tests for parallax model selection and selected-frame graph repair,
+  then passed the focused suites: `25 passed` in
+  `test_preprocess_keyframes.py` and `40 passed` in
+  `test_preprocess_video.py`.
+- Ran `./dev.sh python -m compileall -q scripts tests/unit`; result: exit 0.
+- Ran `./dev.sh pytest tests/unit tests/integration -q`; result: `65 passed`.
+- Ran `./dev.sh python scripts/preprocess_video.py --help`; result: exit 0 and
+  all new motion/bridge configuration options are listed.
+- `./dev.sh ruff check ...` could not run because `ruff` is not installed in
+  the existing `.venv`; no dependency installation was attempted.
+- The specified `桌子.mp4` source is not present in the repository, so the
+  formal table-video A/B remains pending and no generated media was committed.
+
+- Ran through Git Bash and the required project entrypoint on 2026-07-27:
+  `./dev.sh pytest tests/unit tests/integration -q
+  --basetemp=.tmp/pytest-review`; result: `47 passed`. Pytest emitted one cache
+  warning because the managed sandbox
+  denied writes to `.pytest_cache`; test temporary data used the repository
+  `.tmp/` directory.
+- Ran `./dev.sh python -m compileall -q scripts tests/unit`; result: exit 0.
+- Ran `./dev.sh python scripts/preprocess_video.py --help`; result: exit 0 and
+  the coverage/audit options are listed.
+- Ran through Git Bash and the required project entrypoint on 2026-07-28:
+  `./dev.sh pytest tests/unit/test_preprocess_keyframes.py
+  tests/unit/test_preprocess_video.py -q --basetemp=.tmp/pytest-p1-fixes`;
+  result: `52 passed`. Pytest emitted one cache warning because the managed
+  sandbox denied writes to `.pytest_cache`; test temporary data used the
+  repository `.tmp/` directory.
+- Ran `./dev.sh python -m compileall -q scripts tests/unit`; result: exit 0.
+- Ran `./dev.sh pytest tests/unit tests/integration -q
+  --basetemp=.tmp/pytest-final-p1`; result: `52 passed` with the same
+  `.pytest_cache` warning.
+- Re-ran `data/raw_videos/easy2.mp4` with `coverage_v1`, time segmentation,
+  source PNG frames, and no rejected-image output:
+  `easy2_coverage_recovery` produced 366 candidates, 175 selected, 191
+  rejected, and 72 bridge frames. The run still failed closed because the
+  unified 0.3-second coverage target was exceeded in all three segments
+  (`3.6`, `3.4`, and `2.0` seconds), but this verifies recovery from the
+  previous 8/366 selected-frame collapse and confirms summary/keyframe quality
+  now report the same gap target.
+
+- Ran through the project Python entrypoint with Git Bash:
+  `./dev.sh pytest`
+- Result with the installed FFmpeg bin directory on PATH: `12 passed`.
+- Ran the main-branch CI test scope:
+  `./dev.sh pytest tests/unit tests/integration`; result: `12 passed`.
+- Ran `bash -n dev.sh` and `./dev.sh python -m compileall -q scripts tests/unit`.
+- Ran a synthetic FFmpeg smoke flow through the CLI. It produced 2 segments,
+  4 sampled frames, 2 selected frames, and a complete manifest; temporary
+  outputs were removed after validation.
+- Re-ran the diagnostic preprocess flow on `data/raw_videos/bad_video_1.mp4`
+  with filtering disabled and rejected-frame saving enabled. The result had 1
+  segment, 101 sampled frames, 87 selected JPGs, and 14 rejected JPGs; all
+  selected and rejected manifest paths exist.
+- Ran CLI help successfully:
+  `./dev.sh python scripts/preprocess_video.py --help`
+- Ran the fidelity frame extraction tests through the project Python entrypoint:
+  `./dev.sh pytest tests/unit/test_preprocess_video.py`; result: `14 passed`.
+- Ran the full test suite through the project Python entrypoint:
+  `./dev.sh pytest`; result: `14 passed`.
+- Re-ran the full test suite after adding JSON tuning support through the
+  project Python entrypoint: `./dev.sh pytest`; result: `20 passed`.
+- Re-ran `./dev.sh pytest tests/unit/test_preprocess_video.py` after the review
+  feedback fix; result: `20 passed, 2 skipped`.
+- Re-ran `./dev.sh python -m compileall -q scripts tests/unit`.
+- Re-ran the full test suite after the review feedback fix:
+  `./dev.sh pytest`; result: `20 passed, 2 skipped`.
+- Ran CLI help and compile checks after the config change:
+  `./dev.sh python scripts/preprocess_video.py --help` and
+  `./dev.sh python -m compileall -q scripts tests/unit`.
+- Verified the checked-in tuning profile resolves to `baseline`, source-frame
+  PNG output, and rejected-frame saving, while an explicit
+  `--blur-threshold 55` overrides the JSON value.
+- Verified a missing `--config` path exits with a clear one-line error before
+  output directories are written.
+- Ran compile check:
+  `./dev.sh python -m compileall -q scripts tests/unit`.
+- Ran the missing-FFmpeg failure path successfully; it exits with a clear setup
+  message before writing outputs.
+- Ran a real-video baseline pressure pass on
+  `data/raw_videos/pressure_test.mp4` with `scene,time` segmentation and
+  rejected-frame saving enabled. The 79.4 second HEVC source completed in 25.8
+  seconds and produced 5 segments, 497 sampled frames, 281 selected frames, and
+  216 rejected frames.
+- Validated every pressure-pass artifact: all 6 generated MP4 files decode with
+  FFmpeg, all 497 JPEG files decode with OpenCV, and all 503 paths referenced by
+  the manifest exist.
+- The pressure pass used about 150.3 MiB of generated output from an 11.1 MiB
+  source when rejected JPEGs were retained.
+- Ran a focused real-video tuning sweep with source-frame PNG output and saved
+  rejected frames. Key `pressure_test.mp4` results:
+  - baseline config (`blur=40`, `dup=4`, `fps=5`, `overlap=10`):
+    497 sampled, 285 selected, 212 rejected
+  - `blur=55`, `dup=4`, `fps=5`, `overlap=10`:
+    497 sampled, 264 selected, 233 rejected
+  - `blur=55`, `dup=4`, `fps=5`, `overlap=6`:
+    457 sampled, 254 selected, 203 rejected
+  - `blur=55`, `dup=4`, `fps=4`, `overlap=10`:
+    428 sampled, 250 selected, 178 rejected
+  - `blur=55`, `dup=3`, `fps=5`, `overlap=10`:
+    497 sampled, 304 selected, 193 rejected
+  - `blur=55`, `dup=3`, `fps=5`, `overlap=6`:
+    457 sampled, 291 selected, 166 rejected
+- The sweep showed:
+  - raising blur threshold from `40` to `55` increased blur rejections from
+    `82` to `104` on the same sample
+  - lowering duplicate threshold from `4` to `3` reduced duplicate rejections
+    from `129` to `89`, which confirms it is a looser setting rather than a
+    stricter one
+  - `min_segment_sec=3` had no effect on this sample versus `2`
+  - `overexposed_ratio=0.5` and `underexposed_ratio=0.5` still rejected zero
+    frames on this sample
+- The pressure sweep temporarily exhausted free disk space while retaining
+  rejected PNGs for every run. Experimental outputs were partially cleaned to
+  recover workspace capacity after capturing the metrics above.
+- Re-ran a narrower keep-output comparison for manual review on
+  `pressure_test.mp4` and retained these result sets:
+  - `pressure_keep_baseline_blur40_dup4_fps5`
+  - `pressure_keep_blur55_dup4_fps5`
+  - `pressure_keep_blur60_dup4_fps5`
+  - `pressure_keep_blur55_dup4_fps4`
+- Computed selected-frame blur statistics from the retained manifests. For this
+  sample, the highest average selected blur score came from
+  `pressure_keep_blur60_dup4_fps5`, followed closely by
+  `pressure_keep_blur55_dup4_fps5`.
+- Generated a visual review video from the selected frames of
+  `pressure_keep_blur60_dup4_fps5` at:
+  `data/frames/pressure_keep_blur60_dup4_fps5/selected/selected_review.mp4`
+- Ran a second retained real-video matrix on the supplied 39.1-second iOS HEVC
+  sample. Output identifiers use `ios_test_*` because CLI video IDs cannot
+  contain spaces. All runs used source-frame PNG extraction, time fallback
+  segmentation, duplicate threshold `4`, and did not save rejected images to
+  limit disk usage:
+  - `ios_test_blur55_fps5_dup4`, `blur=55`, `fps=5`: 118/246 selected
+    (47.97%), selected-frame mean blur score 421.16.
+  - `ios_test_blur60_fps5_dup4` and `ios_test_blur65_fps5_dup4`: identical
+    result to `blur=55`; the threshold did not reject any additional frame.
+  - `ios_test_blur100_fps5_dup4`: 116/246 selected (47.15%), mean 426.89.
+  - `ios_test_blur150_fps5_dup4`: 113/246 selected (45.93%), mean 434.97.
+  - `ios_test_blur200_fps5_dup4`: 109/246 selected (44.31%), mean 445.40;
+    this is the sharpest retained practical candidate for this sample.
+  - `ios_test_blur60_fps6_dup4`: 122/295 selected (41.36%), mean 403.94;
+    raising sampling density added only four selected frames and reduced mean
+    selected-frame sharpness.
+- Generated the iOS quality-first visual review video at:
+  `data/frames/ios_test_blur200_fps5_dup4/selected/selected_review.mp4`.
+- Ran a retained tuning matrix on `data/raw_videos/restricted_test.mp4`, a
+  62.167-second 960x720 controlled sample. All runs used source-frame PNG
+  extraction, `max_long_edge=1600`, `duplicate_hash_threshold=4` unless
+  explicitly noted, and `save_rejected=false` to limit output volume:
+  - Locked baseline `blur=55`, `fps=5`, `overlap=10`: 411 sampled, 115
+    selected (27.98%), selected mean blur 91.14, selected PNGs 47.0 MiB.
+  - `blur=60`, `fps=5`, `overlap=10`: 105 selected (25.55%), mean 94.38;
+    this is the current balanced quality candidate.
+  - `blur=65`: 89 selected (21.65%), mean 100.03.
+  - `blur=70`: 81 selected (19.71%), mean 103.29.
+  - `blur=80`: 69 selected (16.79%), mean 108.99; quality-first extreme.
+  - `blur=60`, `duplicate_hash_threshold=3`: 107 selected, mean 93.86;
+    loosening duplicate rejection added only two frames and slightly reduced
+    mean quality, so it is not recommended.
+  - `blur=60`, `fps=4`: 81/310 selected (26.13%), mean 92.62; lower sampling
+    did not improve quality.
+  - `blur=60`, `fps=6`: 110/493 selected (22.31%), mean 95.75; it added only
+    five selected frames over fps 5 while increasing candidate volume.
+  - `blur=60`, `fps=5`, `overlap=6`: 93/371 selected (25.07%), mean 92.04;
+    it reduces segment output from 42.3 MiB to 39.8 MiB but slightly lowers
+    selected-frame quality.
+- The restricted-video matrix supports keeping `duplicate_hash_threshold=4`,
+  `target_fps=5`, and `segment_overlap_sec=10`. The current recommendation is
+  `blur_threshold=60` for balanced reconstruction coverage, with `70` or `80`
+  reserved for a quality-first run after visual review.
+- Generated review videos for the two decision points:
+  - `data/frames/restricted_test_blur60_d4_fps5_r1600/selected/selected_review.mp4`
+  - `data/frames/restricted_test_blur80_d4_fps5_r1600/selected/selected_review.mp4`
+- Ran retained per-video matrices on `data/raw_videos/easy1.mp4` and
+  `data/raw_videos/easy2.mp4`. Both are portrait 720x960 samples, but their
+  Laplacian blur-score distributions differ enough that they cannot safely use
+  one global blur threshold:
+  - `easy1` baseline `blur=55` rejected all 216 sampled frames as blur. Its
+    all-frame median blur score is only 7.43, and visual inspection confirmed
+    genuinely soft footage rather than a metrics-only low-texture artifact.
+  - `easy1 blur=5, dup=4`: 125 selected (57.87%), mean blur 8.93.
+  - `easy1 blur=6.5, dup=4`: 87 selected (40.28%), mean blur 10.33.
+  - `easy1 blur=7.5, dup=4`: 67 selected (31.02%), mean blur 11.34.
+  - `easy1 blur=7.5, dup=3`: 79 selected (36.57%), mean blur 11.22; this is
+    the current balanced candidate because the looser duplicate threshold adds
+    12 frames with only a 1% mean-quality reduction.
+  - `easy1 blur=10, dup=4`: 36 selected; `blur=15` leaves only 7 frames and is
+    too strict for reconstruction coverage.
+  - `easy2` baseline `blur=55, dup=4`: 138/266 selected (51.88%), mean blur
+    159.06.
+  - `easy2 blur=75, dup=4`: 117 selected, mean blur 175.87.
+  - `easy2 blur=75, dup=3`: 130 selected, mean blur 174.59; it adds mostly
+    near-duplicate coverage and is not preferred over the stricter setting.
+  - `easy2 blur=85, dup=4`: 111 selected (41.73%), mean blur 181.14; this is
+    the current balanced candidate because it raises the minimum blur score to
+    85.10 while losing only six frames versus `blur=75`.
+  - `easy2 blur=100, dup=4`: 98 selected; `blur=125` leaves 77 frames and is a
+    quality-first rather than balanced setting.
+- Generated review videos for the selected easy-video candidates:
+  - `data/frames/easy1_b7p5_d3_fps5_o10/selected/selected_review.mp4`
+  - `data/frames/easy2_b85_d4_fps5_o10/selected/selected_review.mp4`
+- Documentation-only README expansion reviewed against
+  `scripts/preprocess_video.py`, `configs/preprocess/baseline_real_video.json`,
+  `.gitignore`, and the current feature status. No code or test behavior was
+  changed.
+- Documentation-only consumer contract reviewed against
+  `scripts/preprocess_video.py` manifest fields and the current preprocess
+  feature contract. No code or test behavior was changed.
+- Re-ran the focused preprocess suite after the review follow-up: `34 passed`.
+- Added and passed FFmpeg-generated compatibility fixtures for VFR detection,
+  display rotation metadata, and a real two-scene cut.
+- Re-ran the supplied 53.10-second `easy2.mp4` source
+  (`129157254a897cfae1132001e026e98993767c755d9c3117ee0d3a337d71dd64`)
+  with time segmentation, source PNG frames, the baseline config, and the new
+  duplicate coverage settings. The run produced 366 candidates, 191 selected,
+  and 175 rejected (`blur: 93`, `duplicate: 84`), retaining seven more frames
+  than the reviewed 184-selected baseline while preserving the same blur count.
+  All saved frame, segment, and normalized-video checksums matched the manifest.
+  Three segment coverage audits exceeded the 2.0-second target, caused by blur
+  rejection rather than duplicate filtering; they are recorded, not silently
+  overridden with low-quality frames.
+- Located Git for Windows Bash at `D:/Program Files/Git/bin/bash.exe` and used
+  it to run all current checks through `./dev.sh`; no direct venv invocation was
+  needed for the final verification pass.
+
+## Desk Matrix Decision
+
+The exact table-video source is now available as `data/raw_videos/desk.mp4`
+and was tested. The formal `table_parallax_candidate_20260729` artifact is
+rejected by the automatic coverage gate; do not run VDA or LongSplat against
+it. Do not lower geometry/flow/coverage thresholds or use shorter segments to
+make a boundary-gap result pass. Inspect the capture and reshoot or replace it
+before a new producer candidate is considered.
+
+## Next Step
+
+Run the locked legacy/coverage A/B and manifest audit on the exact `桌子.mp4`
+source when it is made available under the repository, then review selected
+frames and bridge density before accepting the producer result. After that,
+continue the separately owned schema 2.0 depth adapter and segment-scoped
+LongSplat consumer changes on their respective branches.
+
+Retain Draft status until the owner explicitly disposes the protected shared
+file changes and dependency/license policy, resolves the script-layout conflict,
+accepts the real-video threshold/coverage evidence, and either migrates the
+depth-prior / LongSplat adapters to schema 2.0 or assigns owners and a concrete
+compatibility plan. Only then request reviewer approval before switching the PR
+out of Draft.
+
+For `restricted_test`, review the `blur=60` and `blur=80` outputs before
+deciding whether the baseline should move from `55` to `60`, or whether the
+quality-first setting should remain an explicit per-video override.
+
+Review `data/manifests/easy2_contract_window/frames_manifest.json` together
+with its selected/rejected PNGs to decide whether the 2.0-second coverage target
+should remain an audit threshold or become a stricter quality/coverage policy.
+
+For the easy samples, review `easy1_b7p5_d3_fps5_o10` and
+`easy2_b85_d4_fps5_o10`. The current evidence supports per-video overrides:
+`easy1` needs `blur_threshold=7.5` and `duplicate_hash_threshold=3`, while
+`easy2` performs best at `blur_threshold=85` and
+`duplicate_hash_threshold=4`; both retain `target_fps=5` and overlap 10.
+
+- candidate baseline update for the next pass:
+  - `blur_threshold: 55.0`
+  - keep `duplicate_hash_threshold: 4`
+  - optionally set `target_fps: 4.0` if storage and review load need to come
+    down
+  - keep exposure thresholds at `0.6`
+- iOS quality-first candidate, kept separate pending manual visual acceptance:
+  - `blur_threshold: 200.0`
+  - `target_fps: 5.0`
+  - `duplicate_hash_threshold: 4`
+- confirmation command:
+
+```bash
+./dev.sh python scripts/preprocess_video.py data/raw_videos/<video>.mp4 --video-id <id> --config configs/preprocess/baseline_real_video.json --force
+```
+
+- follow-up comparison:
+
+```bash
+./dev.sh python scripts/preprocess_video.py data/raw_videos/<video>.mp4 --video-id <id> --preset longsplat --force
+```
+
+## Open Decisions
+
+- No new virtual environment is needed; `.venv` already exists.
+- FFmpeg is installed user-scoped through winget; a newly opened shell will
+  inherit the updated user PATH.
+- Existing VSCode/Git Bash processes opened before the installation retain the
+  old PATH. A fresh VSCode process resolves both `ffmpeg` and `ffprobe` to the
+  installed FFmpeg 8.1.2 `bin` directory.
+- No dependency installation was run in this session because the required Python
+  packages were already present in `.venv`.
+- Scene segmentation is included in the MVP; real scene-cut behavior still
+  needs validation on a representative exhibition video.
+- A real-video diagnostic exposed and resolved a Windows Unicode-path issue in
+  frame writing. The original run recorded 87 selected frames but wrote zero
+  JPGs; the fixed run is consistent.
+- The baseline pressure pass technically succeeds, but real-video quality needs
+  manual acceptance. Scene detection isolated a 3 second fast-camera-motion
+  window as `segment_0004`, where only 3 of 15 frames were selected, and visual
+  sampling found some motion-blurred frames that still scored just above the
+  current blur threshold of 40.
+- The first tuning sweep supports increasing `blur_threshold` into the mid-50s
+  for this footage, but it also confirms that tightening blur alone reduces
+  retained coverage. The next configuration update should avoid simultaneously
+  loosening duplicate rejection unless that tradeoff is explicitly desired.
+- Reducing overlap or target FPS lowers generated output size and review volume,
+  but it also reduces total candidate frames. That tradeoff should be accepted
+  only if the remaining selected frames are still sufficient for downstream
+  reconstruction.
+- PySceneDetect emits deprecation warnings for `FrameTimecode.get_seconds()` in
+  the current scene-window conversion code. Resolved by using the `seconds`
+  property; a representative real-video scene run is still recommended.
+- The fidelity frame path improves the final frame assets but does not make
+  resizing mathematically lossless; downscaling still resamples pixels. It is a
+  project-compatible way to avoid extra H.264 and JPEG generation loss for
+  downstream reconstruction inputs.
+- Source-based frame sampling uses OpenCV frame-index seeking only for detected
+  CFR inputs; VFR source-frame runs now fail closed and instruct callers to use
+  normalized segment sampling. Representative phone/AR footage still needs
+  timing and visual acceptance, including a real rotated fixture.
+
+## Current Non-Goals
+
+- Do not clone LongSplat, MASt3R, DUSt3R, Depth Anything, gsplat, SuperSplat, or
+  other large third-party repositories for this feature.
+- Do not implement reconstruction, depth estimation, model compression, web
+  display, annotation UI, or model export.
+
+## Status Update Rules
+
+When work continues, update this file before finishing the conversation if any
+of the following changed:
+
+- Current phase.
+- Completed implementation or tests.
+- Next recommended step.
+- New blocker, risk, or decision.
+- Dependency or file-layout convention.
