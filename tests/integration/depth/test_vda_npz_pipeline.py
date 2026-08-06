@@ -88,6 +88,9 @@ def test_synthetic_vda_npz_to_depth_manifest(tmp_path: Path) -> None:
     payload = json.loads(depth_manifest_path.read_text(encoding="utf-8"))
     assert len(payload["frames"]) == 2
     assert payload["frames"][0]["depth_path"] == "data/depth/demo_0001.npz"
+    assert len(payload["frames"][0]["sha256"]) == 64
+    assert payload["producer_gates"]["file_integrity"]["status"] == "passed"
+    assert payload["producer_gates"]["vda_quality"]["status"] == "not_evaluated"
     assert payload["source_video_id"] == "demo"
     assert payload["source_frames_manifest"] == "data/manifests/frames_manifest.json"
     assert payload["frame_depth_mapping"] == "strict_positional"

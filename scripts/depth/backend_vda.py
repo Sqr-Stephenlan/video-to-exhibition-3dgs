@@ -432,6 +432,14 @@ def split_vda_depths_to_frame_files(
     depth_type: str,
     overwrite: bool = False,
 ) -> list[dict[str, Any]]:
+    """
+    Write one NPZ per frame and return producer frame records.
+
+    Each record includes ``sha256`` (64 lowercase hex of the NPZ bytes) so route
+    consumers can verify materialization without an out-of-band hash patch.
+    File integrity (float32 / finite / 2-D) is enforced here; VDA geometric
+    quality (correlation / inlier / nRMSE) is intentionally not claimed.
+    """
     if depths.shape[0] != len(frames):
         raise ValueError(
             f"VDA depths frame count {depths.shape[0]} != selected frames {len(frames)}"
@@ -445,14 +453,31 @@ def split_vda_depths_to_frame_files(
             raise FileExistsError(
                 f"Depth output already exists (set runtime.overwrite: true): {dest.as_posix()}"
             )
-        np.savez_compressed(dest, depth=np.asarray(depths[index]))
+        depth = np.asarray(depths[index], dtype=np.float32)
+        if depth.ndim != 2 or depth.shape[0] == 0 or depth.shape[1] == 0:
+            raise ValueError(
+                f"frame {frame_id}: depth must be non-empty 2-D, got shape {depth.shape}"
+            )
+        if not np.all(np.isfinite(depth)):
+            raise ValueError(f"frame {frame_id}: depth contains NaN or Inf values")
+        np.savez_compressed(dest, depth=depth)
+        digest = sha256_file(dest)
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise RuntimeError(f"internal sha256 encoding error for {dest.as_posix()}")
         record: dict[str, Any] = {
             "frame_id": frame_id,
             "rgb_path": frame["path"],
             "depth_path": to_repo_relative(root, dest),
+            "sha256": digest,
             "depth_type": depth_type,
             "confidence_path": None,
             "depth_index": index,
+            "integrity": {
+                "status": "passed",
+                "dtype": "float32",
+                "shape": [int(depth.shape[0]), int(depth.shape[1])],
+                "finite": True,
+            },
         }
         for key in (
             "segment_id",

@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from scripts.depth.config import require_schema_version, resolve_repo_path, validate_frame_id
 
 
@@ -262,6 +264,151 @@ def assert_outputs_not_conflicting(
         )
 
 
+_SHA256_HEX = frozenset("0123456789abcdef")
+
+
+def validate_frame_record_sha256(frame: dict[str, Any], *, label: str) -> str:
+    """Require a 64-char lowercase hex sha256 on a depth frame record."""
+    digest = frame.get("sha256")
+    if not isinstance(digest, str) or not digest:
+        raise ValueError(f"{label}: sha256 is required (64 lowercase hex chars)")
+    if len(digest) != 64 or any(ch not in _SHA256_HEX for ch in digest):
+        raise ValueError(
+            f"{label}: sha256 must be 64 lowercase hex chars, got {digest!r}"
+        )
+    return digest
+
+
+def verify_depth_file_integrity(
+    *,
+    root: Path,
+    frame: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    """
+    Verify NPZ file integrity for one producer frame record.
+
+    This gate covers hash / dtype / finite / shape only. It does **not** evaluate
+    VDA geometric quality (correlation, inlier ratio, nRMSE).
+    """
+    digest = validate_frame_record_sha256(frame, label=label)
+    depth_rel = frame.get("depth_path")
+    if not isinstance(depth_rel, str) or not depth_rel:
+        raise ValueError(f"{label}: depth_path is required")
+    path = resolve_repo_path(root, depth_rel)
+    if not path.is_file():
+        raise FileNotFoundError(f"{label}: depth file missing: {depth_rel}")
+    actual = _sha256_file(path)
+    if actual != digest:
+        raise ValueError(
+            f"{label}: depth NPZ sha256 mismatch: expected {digest}, got {actual}"
+        )
+
+    with np.load(path, allow_pickle=False) as data:
+        if "depth" not in data:
+            raise ValueError(f"{label}: NPZ missing 'depth' key")
+        depth = data["depth"]
+    if depth.dtype != np.float32:
+        raise ValueError(f"{label}: depth dtype must be float32, got {depth.dtype}")
+    if depth.ndim != 2 or depth.shape[0] == 0 or depth.shape[1] == 0:
+        raise ValueError(f"{label}: depth must be non-empty 2-D, got {depth.shape}")
+    if not np.all(np.isfinite(depth)):
+        raise ValueError(f"{label}: depth contains NaN or Inf")
+    return {
+        "status": "passed",
+        "sha256": digest,
+        "dtype": "float32",
+        "shape": [int(depth.shape[0]), int(depth.shape[1])],
+        "finite": True,
+    }
+
+
+def producer_gates_block(
+    *,
+    file_integrity_status: str = "passed",
+    vda_quality_status: str = "not_evaluated",
+) -> dict[str, Any]:
+    """
+    Explicit dual-gate block for depth_manifest.
+
+    ``file_integrity`` may pass when NPZ files are readable and hashed.
+    ``vda_quality`` stays ``not_evaluated`` on the producer unless a consumer
+    quality audit is attached later; never treat integrity as quality pass.
+    """
+    if file_integrity_status not in {"passed", "failed", "not_evaluated"}:
+        raise ValueError(f"invalid file_integrity status: {file_integrity_status}")
+    if vda_quality_status not in {"passed", "failed", "not_evaluated"}:
+        raise ValueError(f"invalid vda_quality status: {vda_quality_status}")
+    return {
+        "file_integrity": {
+            "status": file_integrity_status,
+            # Checks actually enforced when writing/verifying per-frame NPZ.
+            # Identity/order vs a full source manifest is enforced by assemble, not here.
+            "checks": ["sha256", "float32", "finite", "shape_2d"],
+        },
+        "vda_quality": {
+            "status": vda_quality_status,
+            "owner": "consumer/route",
+            "checks": ["correlation", "inlier", "nRMSE", "aligned"],
+            "note": (
+                "Depth-prior producer does not claim geometric VDA quality. "
+                "Route pose/VDA quality gates remain authoritative."
+            ),
+        },
+    }
+
+
+def _normalized_chunk_metadata(chunk: Any, *, label: str) -> dict[str, Any]:
+    """Validate and copy split-chunk provenance onto depth_manifest."""
+    if not isinstance(chunk, dict):
+        raise ValueError(f"{label} must be an object when present")
+    for key in (
+        "chunk_id",
+        "source_index_start",
+        "source_index_end",
+        "frame_count",
+        "overlap_prefix_count",
+    ):
+        if key not in chunk:
+            raise ValueError(f"{label}.{key} is required")
+    chunk_id = chunk["chunk_id"]
+    if not isinstance(chunk_id, str) or not chunk_id:
+        raise ValueError(f"{label}.chunk_id must be a non-empty string")
+    start = int(chunk["source_index_start"])
+    end = int(chunk["source_index_end"])
+    frame_count = int(chunk["frame_count"])
+    overlap_prefix_count = int(chunk["overlap_prefix_count"])
+    if start < 0 or end <= start:
+        raise ValueError(f"{label}: need 0 <= source_index_start < source_index_end")
+    if frame_count != end - start:
+        raise ValueError(
+            f"{label}: frame_count={frame_count} != "
+            f"source_index_end-start ({end - start})"
+        )
+    if overlap_prefix_count < 0 or overlap_prefix_count > frame_count:
+        raise ValueError(
+            f"{label}.overlap_prefix_count must be in [0, frame_count], "
+            f"got {overlap_prefix_count}"
+        )
+    overlap_with = chunk.get("overlap_with_chunk_id")
+    if overlap_with is not None and (
+        not isinstance(overlap_with, str) or not overlap_with
+    ):
+        raise ValueError(f"{label}.overlap_with_chunk_id must be a non-empty string or null")
+    if overlap_prefix_count > 0 and not overlap_with:
+        raise ValueError(
+            f"{label}: overlap_with_chunk_id is required when overlap_prefix_count > 0"
+        )
+    return {
+        "chunk_id": chunk_id,
+        "source_index_start": start,
+        "source_index_end": end,
+        "frame_count": frame_count,
+        "overlap_prefix_count": overlap_prefix_count,
+        "overlap_with_chunk_id": overlap_with,
+    }
+
+
 def build_depth_manifest(
     *,
     frames_manifest: dict[str, Any],
@@ -269,18 +416,33 @@ def build_depth_manifest(
     backend: dict[str, Any],
     depth_type: str,
     frames_manifest_path: str | None = None,
+    file_integrity_status: str = "passed",
+    vda_quality_status: str = "not_evaluated",
 ) -> dict[str, Any]:
     """
     Build depth_manifest.json.
 
     frame_depth_mapping is always strict_positional: depths[i] matches the i-th
     selected frame after selected_frames() ordering (optional timestamp sort/dedupe).
+
+    Every frame record must include ``sha256`` (64 lowercase hex of the NPZ).
+    When the input frames_manifest carries ``chunk`` provenance (from
+    ``split_selected_manifest.py``), it is copied onto the depth_manifest so
+    assemble can verify overlap_prefix_count.
     """
-    return {
+    if not frame_records:
+        raise ValueError("frame_records must be non-empty")
+    for index, frame in enumerate(frame_records):
+        validate_frame_record_sha256(frame, label=f"frames[{index}]")
+    payload: dict[str, Any] = {
         "schema_version": "1.0",
         "source_video_id": frames_manifest.get("video_id"),
         "source_frames_manifest": frames_manifest_path,
         "frame_depth_mapping": "strict_positional",
+        "producer_gates": producer_gates_block(
+            file_integrity_status=file_integrity_status,
+            vda_quality_status=vda_quality_status,
+        ),
         "depth_scale": {
             "mode": depth_type,
             # relative: unitless soft prior; metric: meters when backend supports it
@@ -295,3 +457,14 @@ def build_depth_manifest(
         },
         "frames": frame_records,
     }
+    if "chunk" in frames_manifest and frames_manifest["chunk"] is not None:
+        payload["chunk"] = _normalized_chunk_metadata(
+            frames_manifest["chunk"], label="frames_manifest.chunk"
+        )
+        if payload["chunk"]["frame_count"] != len(frame_records):
+            raise ValueError(
+                "frames_manifest.chunk.frame_count="
+                f"{payload['chunk']['frame_count']} != depth frame_records "
+                f"{len(frame_records)}"
+            )
+    return payload

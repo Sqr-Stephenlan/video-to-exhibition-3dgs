@@ -179,6 +179,18 @@ Default path: `data/manifests/<video_id>/<run_id>/depth_manifest.json`
   "source_video_id": "demo_short",
   "source_frames_manifest": "data/manifests/frames_manifest.json",
   "frame_depth_mapping": "strict_positional",
+  "producer_gates": {
+    "file_integrity": {
+      "status": "passed",
+      "checks": ["sha256", "float32", "finite", "shape_2d"]
+    },
+    "vda_quality": {
+      "status": "not_evaluated",
+      "owner": "consumer/route",
+      "checks": ["correlation", "inlier", "nRMSE", "aligned"],
+      "note": "Depth-prior producer does not claim geometric VDA quality."
+    }
+  },
   "depth_scale": {
     "mode": "relative",
     "unit": null
@@ -195,9 +207,16 @@ Default path: `data/manifests/<video_id>/<run_id>/depth_manifest.json`
       "frame_id": "demo_short_000001",
       "rgb_path": "data/frames/demo_short/000001.png",
       "depth_path": "data/depth/demo_short/default/demo_short_000001.npz",
+      "sha256": "<64-lowercase-hex of the NPZ file bytes>",
       "depth_type": "relative",
       "confidence_path": null,
-      "depth_index": 0
+      "depth_index": 0,
+      "integrity": {
+        "status": "passed",
+        "dtype": "float32",
+        "shape": [720, 1280],
+        "finite": true
+      }
     }
   ]
 }
@@ -208,10 +227,73 @@ Default path: `data/manifests/<video_id>/<run_id>/depth_manifest.json`
 | `source_video_id` | From input `video_id` (may be null) |
 | `source_frames_manifest` | Repository-relative path of the input frames manifest |
 | `frame_depth_mapping` | Always `strict_positional` |
+| `frames[].sha256` | **Required.** SHA-256 of the per-frame NPZ file (64 lowercase hex). Route materialization compares this to on-disk bytes. |
+| `producer_gates.file_integrity` | Producer file gate: hash / float32 / finite / 2-D / order. May be `passed` when files are readable. |
+| `producer_gates.vda_quality` | Always `not_evaluated` on this producer unless a later consumer audit is attached. **Never** treat integrity as geometric quality pass. |
 | `depth_scale.mode` | `relative` or `metric` |
 | `depth_scale.unit` | `null` for relative soft prior; `"meters"` when metric |
 
 `confidence_path` is always `null` in this PR (mask / confidence export deferred).
+
+### Chunk split / assemble (bounded VDA)
+
+For long segments that OOM as a single VDA batch, use the tracked helpers
+(overlap is a **frame count**, never the source start index):
+
+```powershell
+.\.venv\Scripts\python.exe scripts\depth\split_selected_manifest.py `
+  data\manifests\<video_id>\<run_id>\frames_manifest.json `
+  --chunk a=0:49 --chunk b=39:91 `
+  --output-dir data\manifests\<video_id>\chunks `
+  --report data\manifests\<video_id>\chunks\split_report.json
+# B.overlap_prefix_count == 10 (not 39)
+
+# After per-chunk `run_depth_prior.py run` writes depth_manifest + sha256:
+.\.venv\Scripts\python.exe scripts\depth\assemble_depth_manifests.py `
+  --source-frames-manifest data\manifests\<video_id>\<run_id>\frames_manifest.json `
+  --chunk-a data\manifests\...\depth_manifest_a.json `
+  --chunk-b data\manifests\...\depth_manifest_b.json `
+  --drop-b-prefix 10 `
+  --output data\manifests\...\depth_manifest.json `
+  --report data\manifests\...\depth_assembly_report.json
+```
+
+Assembly verifies identity/order/hash/file integrity and keeps
+`producer_gates.vda_quality.status = not_evaluated`. When depth is run on a
+split frames_manifest, `chunk` (including `overlap_prefix_count`) is copied into
+each chunk depth_manifest; assemble requires that field when `--drop-b-prefix > 0`.
+
+### Producer contract vs LongSplat consumer (PR #3)
+
+Depth-prior is a **producer** of versioned `depth_manifest.json` + per-frame NPZ
+**with per-frame `sha256`**. It does **not** implement LongSplat `prepare_input`
+materialization, `frame_mapping` binding, `depth_source=vda` wiring, or fail-closed
+consumer geometric quality gates. Those belong on `research/longsplat-route` (PR #3).
+
+### What this module guarantees (producer)
+
+| Field | Meaning for consumers |
+|---|---|
+| `frames[].frame_id` | Stable id (often from preprocess `id` after adapt) |
+| `frames[].rgb_path` | Repository-relative RGB used for depth inference |
+| `frames[].depth_path` | Repository-relative NPZ with key `depth` |
+| `frames[].sha256` | SHA-256 of that NPZ file |
+| `frames[].segment_id` | Present when upstream provided it; used for VDA batching |
+| `frame_depth_mapping` | Always `strict_positional` vs the selected frames order at run time |
+| `producer_gates.file_integrity` | Hash/dtype/finite/shape gate only |
+| `producer_gates.vda_quality` | Not claimed by producer (`not_evaluated`) |
+| `vda_batching` | Records per-segment VDA invocation sizes when batching is used |
+
+### What LongSplat / PR #3 must own
+
+1. Interpret its own `frame_mapping` schema (list or dict) correctly.
+2. Bind prepared stems (`frame_{id:06d}`) to depth_manifest `frame_id` / `rgb_path`.
+3. Materialize NPZ → `frame_{id:06d}_depth.npy` next to prepared images (verify `sha256`).
+4. Enable training with an explicit depth source flag (e.g. `depth_source=vda`).
+5. **Fail closed** when a prepared frame has no matching depth — never silently fall back to MASt3R.
+6. Own geometric VDA quality gates (correlation / inlier / nRMSE); do not accept producer file integrity as quality pass.
+
+Do not treat chunk success or finite/schema-only checks as proof that reconstruction quality passed.
 
 ### Run record
 
@@ -284,40 +366,14 @@ This branch records **frame↔depth** correspondence only. Camera pose / intrins
 
 ## Producer contract vs LongSplat consumer (PR #3)
 
-Depth-prior is a **producer** of versioned `depth_manifest.json` + per-frame NPZ.
-It does **not** implement LongSplat `prepare_input` materialization, `frame_mapping`
-binding, `depth_source=vda` wiring, or fail-closed consumer checks. Those belong on
-`research/longsplat-route` (PR #3).
-
-### What this module guarantees (producer)
-
-| Field | Meaning for consumers |
-|---|---|
-| `frames[].frame_id` | Stable id (often from preprocess `id` after adapt) |
-| `frames[].rgb_path` | Repository-relative RGB used for depth inference |
-| `frames[].depth_path` | Repository-relative NPZ with key `depth` |
-| `frames[].segment_id` | Present when upstream provided it; used for VDA batching |
-| `frame_depth_mapping` | Always `strict_positional` vs the selected frames order at run time |
-| `vda_batching` | Records per-segment VDA invocation sizes when batching is used |
-
-### What LongSplat / PR #3 must own
-
-1. Interpret its own `frame_mapping` schema (list or dict) correctly.
-2. Bind prepared stems (`frame_{id:06d}`) to depth_manifest `frame_id` / `rgb_path`.
-3. Materialize NPZ → `frame_{id:06d}_depth.npy` next to prepared images.
-4. Enable training with an explicit depth source flag (e.g. `depth_source=vda`).
-5. **Fail closed** when a prepared frame has no matching depth — never silently fall back to MASt3R.
-
-Do not treat any helper formerly living under `scripts/depth/` as proof that real
-LongSplat consumption is verified on this branch.
-
-### Responsibility boundary
+See the Outputs section above for the authoritative producer fields (`sha256`,
+`producer_gates`). Summary:
 
 | Concern | Owner |
 |---|---|
 | Preprocess source schema, sizing policy, selection strategy | PR #2 (`feature/preprocess-video`) |
-| VDA producer, output isolation, real temporal segmentation via per-segment VDA runs | this PR (`research/depth-prior`) |
-| Mapping, prepared-stem materialize, `depth_source=vda`, fail-closed consumer | PR #3 (`research/longsplat-route`) |
+| VDA producer, per-frame SHA, chunk/assemble metadata, file-integrity gate | this PR (`research/depth-prior`) |
+| Mapping, prepared-stem materialize, `depth_source=vda`, geometric quality + fail-closed consumer | PR #3 (`research/longsplat-route`) |
 
 ### Joint testing note
 
@@ -331,8 +387,12 @@ Do not permanently fold LongSplat/preprocess sources into this PR.
 | Goal | Status in current PR |
 |---|---|
 | `doctor` validates clone commit + default checkpoint hash | yes |
-| CPU unit/integration tests for NPZ split, path bounds, staging restore, adapter | yes |
+| Per-frame NPZ `sha256` in depth_manifest | yes |
+| Dual gates: file integrity vs VDA quality (`not_evaluated` on producer) | yes |
+| Tracked chunk split/assemble with overlap_prefix_count semantics | yes |
+| CPU unit/integration tests for NPZ split, path bounds, staging restore, adapter, assembly | yes |
 | GPU end-to-end `run` on real exhibition frames | deferred until sample frames + GPU report / waiver |
+| Geometric VDA quality pass / LongSplat materialize | **not** claimed here (PR #3) |
 | Per-segment VDA invocations (`infer_per_segment`) | yes (when `segment_id` present) |
 | Mask / confidence filtering | deferred |
 | Camera pose fields in depth_manifest | out of scope (frame correspondence only) |

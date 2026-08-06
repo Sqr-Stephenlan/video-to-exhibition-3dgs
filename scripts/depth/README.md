@@ -45,9 +45,18 @@ Git Bash / WSL (when `.venv/bin/python` exists):
 
 ## Outputs
 
-- `data/depth/<video_id>/<run_id>/<frame_id>.npz` — one file per selected frame; each stores a single `depth` array
-- `data/manifests/<video_id>/<run_id>/depth_manifest.json` — includes `source_video_id`, `source_frames_manifest` (path), and `frame_depth_mapping: strict_positional`
+- `data/depth/<video_id>/<run_id>/<frame_id>.npz` — one file per selected frame; each stores a single `depth` array (`float32`, finite)
+- `data/manifests/<video_id>/<run_id>/depth_manifest.json` — includes per-frame `sha256`, `producer_gates` (file integrity vs VDA quality), `source_video_id`, `source_frames_manifest`, and `frame_depth_mapping: strict_positional`
 - `outputs/reconstructions/depth_prior/<video_id>/<run_id>/run_record.json` — repository-relative paths, backend commit, I/O, and a sanitized command using `<project>` / `<temp>` placeholders
+
+Bounded / low-VRAM chunking (overlap count, not start index):
+
+```powershell
+.\.venv\Scripts\python.exe scripts\depth\split_selected_manifest.py ... --chunk a=0:49 --chunk b=39:91 ...
+.\.venv\Scripts\python.exe scripts\depth\assemble_depth_manifests.py ... --drop-b-prefix 10 ...
+```
+
+See `docs/depth_prior_io.md` for details. File integrity pass ≠ VDA geometric quality pass.
 
 VDA `run.py` emits a single `*_depths.npz` with key `depths` shaped `(N,H,W)` per
 invocation. The orchestrator may run **one invocation per `segment_id`**

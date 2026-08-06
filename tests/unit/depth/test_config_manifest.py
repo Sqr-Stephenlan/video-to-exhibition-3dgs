@@ -52,6 +52,7 @@ def test_selected_frames_and_depth_manifest() -> None:
                 "frame_id": "a",
                 "rgb_path": "data/frames/a.png",
                 "depth_path": "data/depth/a.npz",
+                "sha256": "a" * 64,
                 "depth_type": "relative",
                 "confidence_path": None,
             }
@@ -64,6 +65,9 @@ def test_selected_frames_and_depth_manifest() -> None:
     assert depth_manifest["source_video_id"] == "demo"
     assert depth_manifest["source_frames_manifest"] == "data/manifests/frames_manifest.json"
     assert depth_manifest["frame_depth_mapping"] == "strict_positional"
+    assert depth_manifest["frames"][0]["sha256"] == "a" * 64
+    assert depth_manifest["producer_gates"]["file_integrity"]["status"] == "passed"
+    assert depth_manifest["producer_gates"]["vda_quality"]["status"] == "not_evaluated"
     assert depth_manifest["depth_scale"] == {"mode": "relative", "unit": None}
     assert len(depth_manifest["frames"]) == 1
 

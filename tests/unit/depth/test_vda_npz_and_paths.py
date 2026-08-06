@@ -17,6 +17,7 @@ from scripts.depth.backend_vda import (
     find_vda_depths_npz,
     load_vda_depths_array,
     sanitize_command_for_record,
+    sha256_file,
     split_vda_depths_to_frame_files,
     stage_checkpoint_for_vda,
 )
@@ -88,9 +89,13 @@ def test_split_vda_depths_npz_roundtrip(tmp_path: Path) -> None:
     )
     assert len(records) == 3
     assert records[1]["depth_path"] == "data/depth/f2.npz"
+    assert isinstance(records[1]["sha256"], str) and len(records[1]["sha256"]) == 64
+    assert records[1]["sha256"] == records[1]["sha256"].lower()
     with np.load(root / records[1]["depth_path"]) as data:
         assert "depth" in data
+        assert data["depth"].dtype == np.float32
         assert float(data["depth"].mean()) == 2.0
+    assert records[1]["sha256"] == sha256_file(root / records[1]["depth_path"])
 
 
 def test_split_vda_depths_rejects_frame_count_mismatch(tmp_path: Path) -> None:

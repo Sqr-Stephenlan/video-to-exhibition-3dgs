@@ -59,6 +59,7 @@ outputs/splats/**
 outputs/compressed/**
 outputs/renders/**
 outputs/web_demo/**
+outputs/reports/**
 !outputs/reconstructions/.gitkeep
 !outputs/splats/.gitkeep
 !outputs/compressed/.gitkeep
