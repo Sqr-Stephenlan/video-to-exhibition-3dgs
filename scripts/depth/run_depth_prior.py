@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""Depth-prior CLI: environment doctor and Video Depth Anything orchestration."""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.depth.backend_vda import (
+    doctor_backend,
+    find_vda_depths_npz,
+    load_vda_depths_array,
+    run_vda_on_video,
+    sanitize_command_for_record,
+    split_vda_depths_to_frame_files,
+    write_run_record,
+)
+from scripts.depth.config import format_io_template, load_config, resolve_repo_path, to_repo_relative
+from scripts.depth.manifest import (
+    assert_outputs_not_conflicting,
+    build_depth_manifest,
+    load_json,
+    prepare_vda_batches,
+    save_json,
+    selected_frames,
+)
+
+
+def project_root() -> Path:
+    return ROOT
+
+
+def cmd_doctor(config_path: Path) -> int:
+    root = project_root()
+    config = load_config(config_path)
+    report = doctor_backend(root, config)
+    print("depth-prior doctor")
+    print(f"  config: {to_repo_relative(root, config_path)}")
+    print(f"  encoder: {config['backend']['encoder']} ({config['backend']['depth_type']})")
+    print(f"  repo_exists: {report['repo_exists']}")
+    print(f"  pinned_commit: {report['pinned_commit']}")
+    print(f"  actual_commit: {report['actual_commit']}")
+    print(f"  checkpoint_exists: {report['checkpoint_exists']}")
+    if report.get("checkpoint"):
+        print(f"  checkpoint: {report['checkpoint']}")
+    if report.get("checkpoint_sha256"):
+        print(f"  checkpoint_sha256: {report['checkpoint_sha256']}")
+    if report.get("allow_custom_checkpoint"):
+        print(f"  allow_custom_checkpoint: {report['allow_custom_checkpoint']}")
+    for note in report.get("notes") or []:
+        print(f"  note: {note}")
+    print(f"  torch_importable: {report['torch_importable']}")
+    print(f"  cuda_available: {report['cuda_available']}")
+    print(f"  ffmpeg: {report.get('ffmpeg')}")
+    if report["issues"]:
+        print("issues:")
+        for issue in report["issues"]:
+            print(f"  - {issue}")
+        return 1
+    print("status: ok (environment ready; sample frames still required for run)")
+    return 0
+
+
+def frame_durations_sec(
+    frame_count: int,
+    fps: float,
+    timestamps_sec: list[float] | None = None,
+) -> list[float]:
+    """
+    Per-frame display durations for ffmpeg concat (seconds).
+
+    Note: pinned VDA does not consume container PTS for temporal modeling.
+    Prefer fixed fps assembly; timestamp-driven durations are retained only as a
+    low-level helper and must not be treated as VDA temporal reset.
+    """
+    if frame_count < 1:
+        raise ValueError("frame_count must be >= 1")
+    default_duration = 1.0 / float(fps)
+    if timestamps_sec is None:
+        return [default_duration] * frame_count
+    if len(timestamps_sec) != frame_count:
+        raise ValueError("timestamps_sec length must match frame_count")
+    durations: list[float] = []
+    for index in range(frame_count):
+        if index + 1 < frame_count:
+            durations.append(
+                max(float(timestamps_sec[index + 1]) - float(timestamps_sec[index]), 1e-3)
+            )
+        else:
+            durations.append(default_duration)
+    return durations
+
+
+def _assemble_temp_video(
+    frame_paths: list[Path],
+    fps: float,
+    output_video: Path,
+) -> None:
+    """Assemble frames at fixed fps for one VDA invocation."""
+    if not frame_paths:
+        raise ValueError("No frame paths to assemble")
+    missing = [path for path in frame_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing frame files (sample frames not available yet):\n  "
+            + "\n  ".join(path.as_posix() for path in missing[:5])
+        )
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required to assemble frames into a temp video")
+
+    durations = frame_durations_sec(len(frame_paths), fps, timestamps_sec=None)
+    list_file = output_video.with_suffix(".txt")
+    with list_file.open("w", encoding="utf-8") as handle:
+        for path, duration in zip(frame_paths, durations, strict=True):
+            handle.write(f"file '{path.resolve().as_posix()}'\n")
+            handle.write(f"duration {duration:.6f}\n")
+        # ffmpeg concat demuxer requires a trailing file entry so the last
+        # duration applies; that would otherwise emit N+1 frames.
+        handle.write(f"file '{frame_paths[-1].resolve().as_posix()}'\n")
+
+    cmd = build_ffmpeg_concat_command(
+        ffmpeg=ffmpeg,
+        list_file=list_file,
+        output_video=output_video,
+        frame_count=len(frame_paths),
+    )
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
+
+
+def build_ffmpeg_concat_command(
+    *,
+    ffmpeg: str,
+    list_file: Path,
+    output_video: Path,
+    frame_count: int,
+) -> list[str]:
+    """Build ffmpeg concat command that emits exactly frame_count frames."""
+    if frame_count < 1:
+        raise ValueError("frame_count must be >= 1")
+    return [
+        ffmpeg,
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_file),
+        "-vsync",
+        "vfr",
+        # Truncate the duplicated trailing concat entry so VDA sees N frames,
+        # matching selected_frames / strict positional depth mapping.
+        "-frames:v",
+        str(frame_count),
+        "-pix_fmt",
+        "yuv420p",
+        str(output_video),
+    ]
+
+
+def cmd_run(
+    config_path: Path,
+    dry_run: bool = False,
+    video_id: str | None = None,
+    run_id: str | None = None,
+) -> int:
+    root = project_root()
+    config = load_config(config_path)
+    backend = config["backend"]
+    io = config["io"]
+    runtime = config.get("runtime") or {}
+    effective_run_id = run_id or runtime.get("run_id") or "default"
+
+    config_rel = to_repo_relative(root, config_path)
+    try:
+        frames_manifest_rel = format_io_template(
+            io["frames_manifest"],
+            video_id=video_id,
+            run_id=effective_run_id,
+        )
+    except ValueError as exc:
+        print(
+            f"{exc}\n"
+            "Pass --video-id / --run-id when io.frames_manifest uses {video_id}/{run_id}, "
+            "or point frames_manifest at an explicit path."
+        )
+        return 2
+    frames_manifest_path = resolve_repo_path(root, frames_manifest_rel)
+    if not frames_manifest_path.is_file():
+        example = root / "configs" / "depth" / "frames_manifest.example.json"
+        print(
+            "frames_manifest not found. Place selected frames and a manifest first.\n"
+            f"  expected: {frames_manifest_rel}\n"
+            f"  example schema: {to_repo_relative(root, example)}"
+        )
+        return 2
+
+    doctor = doctor_backend(root, config)
+    if doctor["issues"] and not dry_run:
+        print("Environment is not ready:")
+        for issue in doctor["issues"]:
+            print(f"  - {issue}")
+        return 1
+
+    frames_manifest = load_json(frames_manifest_path)
+    manifest_video_id = frames_manifest.get("video_id")
+    if video_id and manifest_video_id and str(video_id) != str(manifest_video_id):
+        print(
+            f"--video-id {video_id!r} does not match frames_manifest.video_id "
+            f"{manifest_video_id!r}"
+        )
+        return 2
+    effective_video_id = video_id or manifest_video_id
+    dedupe_timestamps = bool(runtime.get("dedupe_identical_timestamps", True))
+    infer_per_segment = bool(runtime.get("infer_per_segment", True))
+    target_fps = float(runtime.get("target_fps", 5))
+    frames = selected_frames(
+        frames_manifest,
+        root=root,
+        dedupe_timestamps=dedupe_timestamps,
+        infer_per_segment=infer_per_segment,
+    )
+    vda_batches = prepare_vda_batches(frames, infer_per_segment=infer_per_segment)
+
+    try:
+        depth_dir = resolve_repo_path(
+            root,
+            format_io_template(
+                io["depth_dir"],
+                video_id=effective_video_id,
+                run_id=effective_run_id,
+            ),
+        )
+        depth_manifest_path = resolve_repo_path(
+            root,
+            format_io_template(
+                io["depth_manifest"],
+                video_id=effective_video_id,
+                run_id=effective_run_id,
+            ),
+        )
+        run_record_path = resolve_repo_path(
+            root,
+            format_io_template(
+                io["run_record"],
+                video_id=effective_video_id,
+                run_id=effective_run_id,
+            ),
+        )
+    except ValueError as exc:
+        print(str(exc))
+        return 2
+    repo_dir = resolve_repo_path(root, backend["repo_dir"])
+    overwrite = bool(runtime.get("overwrite", False))
+    assert_outputs_not_conflicting(
+        root=root,
+        depth_dir=depth_dir,
+        depth_manifest_path=depth_manifest_path,
+        run_record_path=run_record_path,
+        frames=frames,
+        overwrite=overwrite,
+    )
+
+    if dry_run:
+        print("dry-run ok")
+        print(f"  video_id: {effective_video_id}")
+        print(f"  run_id: {effective_run_id}")
+        print(f"  selected_frames: {len(frames)}")
+        print(f"  vda_batches: {len(vda_batches)}")
+        print(f"  infer_per_segment: {infer_per_segment}")
+        print(f"  depth_dir: {to_repo_relative(root, depth_dir)}")
+        print(f"  depth_manifest: {to_repo_relative(root, depth_manifest_path)}")
+        print(f"  overwrite: {overwrite}")
+        return 0
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    command_record: list[str] = []
+    command_invocations: list[list[str]] = []
+    segment_run_meta: list[dict] = []
+    result_code = 1
+    stdout_tail = ""
+    stderr_tail = ""
+    vda_npz_rel: str | None = None
+    frame_count_written = 0
+    checkpoint_meta: dict = {}
+    status = "failed"
+
+    try:
+        import numpy as np
+
+        with tempfile.TemporaryDirectory(prefix="depth_prior_") as tmp:
+            tmp_dir = Path(tmp)
+            depth_chunks: list = []
+            flat_frames: list[dict] = []
+            for batch_index, (segment_key, batch_frames) in enumerate(vda_batches):
+                flat_frames.extend(batch_frames)
+                frame_paths = [
+                    resolve_repo_path(root, frame["path"]) for frame in batch_frames
+                ]
+                temp_video = tmp_dir / f"input_{batch_index:03d}.mp4"
+                vda_out = tmp_dir / f"vda_out_{batch_index:03d}"
+                _assemble_temp_video(frame_paths, target_fps, temp_video)
+                result, command, checkpoint_meta = run_vda_on_video(
+                    root=root,
+                    repo_dir=repo_dir,
+                    input_video=temp_video,
+                    output_dir=vda_out,
+                    backend=backend,
+                )
+                sanitized = sanitize_command_for_record(
+                    root=root,
+                    command=command,
+                    temp_dir=tmp_dir,
+                )
+                command_invocations.append(sanitized)
+                command_record = sanitized
+                result_code = result.returncode
+                stdout_tail = (stdout_tail + "\n" + (result.stdout or ""))[-4000:]
+                stderr_tail = (stderr_tail + "\n" + (result.stderr or ""))[-4000:]
+                segment_run_meta.append(
+                    {
+                        "segment_id": segment_key,
+                        "frame_count": len(batch_frames),
+                        "command_returncode": result.returncode,
+                    }
+                )
+                if result.returncode != 0:
+                    status = "vda_failed"
+                    print(
+                        "Video Depth Anything failed "
+                        f"(batch {batch_index}, segment={segment_key}). "
+                        "See run_record for stdout/stderr tails."
+                    )
+                    print(to_repo_relative(root, run_record_path))
+                    return result.returncode
+
+                vda_npz = find_vda_depths_npz(vda_out)
+                depths = load_vda_depths_array(vda_npz)
+                if depths.shape[0] != len(batch_frames):
+                    raise ValueError(
+                        f"VDA depths frame count {depths.shape[0]} != "
+                        f"segment batch size {len(batch_frames)} "
+                        f"(segment={segment_key})"
+                    )
+                depth_chunks.append(depths)
+                vda_npz_rel = vda_npz.name
+
+            try:
+                if flat_frames != frames:
+                    raise RuntimeError(
+                        "Internal error: VDA batch frame order diverged from selected_frames"
+                    )
+                combined = (
+                    depth_chunks[0]
+                    if len(depth_chunks) == 1
+                    else np.concatenate(depth_chunks, axis=0)
+                )
+                frame_records = split_vda_depths_to_frame_files(
+                    depths=combined,
+                    frames=frames,
+                    depth_dir=depth_dir,
+                    root=root,
+                    depth_type=backend["depth_type"],
+                    overwrite=overwrite,
+                )
+                frame_count_written = len(frame_records)
+                depth_manifest = build_depth_manifest(
+                    frames_manifest=frames_manifest,
+                    frame_records=frame_records,
+                    backend={
+                        **backend,
+                        "commit": doctor.get("actual_commit") or backend.get("commit"),
+                    },
+                    depth_type=backend["depth_type"],
+                    frames_manifest_path=frames_manifest_rel,
+                )
+                depth_manifest["vda_batching"] = {
+                    "infer_per_segment": infer_per_segment,
+                    "batches": [
+                        {"segment_id": key, "frame_count": len(batch)}
+                        for key, batch in vda_batches
+                    ],
+                }
+                save_json(depth_manifest_path, depth_manifest)
+            except Exception as exc:  # noqa: BLE001 - record failure in run_record
+                status = "postprocess_failed"
+                result_code = 3
+                stderr_tail = (stderr_tail + f"\npostprocess_error: {exc}")[-4000:]
+                print(f"Depth post-process failed: {exc}")
+                print(to_repo_relative(root, run_record_path))
+                return 3
+
+            status = "ok"
+            result_code = 0
+            print(
+                f"wrote {frame_count_written} depth maps across "
+                f"{len(vda_batches)} VDA batch(es)"
+            )
+            print(f"depth_manifest: {to_repo_relative(root, depth_manifest_path)}")
+            return 0
+    finally:
+        write_run_record(
+            run_record_path,
+            {
+                "module": "depth-prior",
+                "status": status,
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "config": config_rel,
+                "frames_manifest": frames_manifest_rel,
+                "video_id": effective_video_id,
+                "run_id": effective_run_id,
+                "backend_name": backend.get("name"),
+                "backend_repo_dir": backend.get("repo_dir"),
+                "backend_commit": doctor.get("actual_commit"),
+                "encoder": backend["encoder"],
+                "depth_type": backend["depth_type"],
+                "checkpoint": checkpoint_meta.get("checkpoint_source") or doctor.get("checkpoint"),
+                "checkpoint_vda_path": checkpoint_meta.get("checkpoint_vda_path")
+                or doctor.get("checkpoint_vda_path"),
+                "checkpoint_staged": checkpoint_meta.get("checkpoint_staged"),
+                "checkpoint_target_restored": checkpoint_meta.get("checkpoint_target_restored"),
+                "checkpoint_target_originally_present": checkpoint_meta.get(
+                    "checkpoint_target_originally_present"
+                ),
+                "checkpoint_sha256": checkpoint_meta.get("checkpoint_sha256")
+                or doctor.get("checkpoint_sha256"),
+                "local_patch_matplotlib": checkpoint_meta.get("local_patch_matplotlib")
+                or doctor.get("local_patch_matplotlib"),
+                "command": command_record,
+                "commands": command_invocations,
+                "vda_segment_runs": segment_run_meta,
+                "random_seed": None,
+                "command_returncode": result_code,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "vda_depths_npz": vda_npz_rel,
+                "runtime": {
+                    "overwrite": overwrite,
+                    "dedupe_identical_timestamps": dedupe_timestamps,
+                    "infer_per_segment": infer_per_segment,
+                    "vda_batch_count": len(vda_batches),
+                    "assembly_fps": target_fps,
+                    "temporal_note": (
+                        "Pinned VDA does not consume container PTS; temporal reset "
+                        "is performed by separate VDA invocations per segment when "
+                        "infer_per_segment is enabled."
+                    ),
+                },
+                "outputs": {
+                    "depth_dir": to_repo_relative(root, depth_dir),
+                    "depth_manifest": to_repo_relative(root, depth_manifest_path),
+                    "run_record": to_repo_relative(root, run_record_path),
+                    "frame_count": frame_count_written,
+                },
+            },
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Exhibition 3DGS depth-prior orchestration")
+    parser.add_argument(
+        "--config",
+        default="configs/depth/default_vitb.yaml",
+        help="Repository-relative YAML config (default: vitb relative)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("doctor", help="Check VDA clone, vitb weights, torch, ffmpeg")
+    run_parser = sub.add_parser("run", help="Run depth prior from frames_manifest")
+    run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate config and manifest only; do not call VDA",
+    )
+    run_parser.add_argument(
+        "--video-id",
+        default=None,
+        help=(
+            "Expand {video_id} in io paths. Required when frames_manifest uses {video_id}. "
+            "Must match frames_manifest.video_id when both are set."
+        ),
+    )
+    run_parser.add_argument(
+        "--run-id",
+        default=None,
+        help=(
+            "Expand {run_id} in io paths (default: runtime.run_id or 'default'). "
+            "Use distinct values for baseline vs LongSplat preprocess on the same video."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    config_path = resolve_repo_path(project_root(), args.config)
+    if args.command == "doctor":
+        return cmd_doctor(config_path)
+    if args.command == "run":
+        return cmd_run(
+            config_path,
+            dry_run=bool(args.dry_run),
+            video_id=args.video_id,
+            run_id=args.run_id,
+        )
+    parser.error(f"Unknown command: {args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

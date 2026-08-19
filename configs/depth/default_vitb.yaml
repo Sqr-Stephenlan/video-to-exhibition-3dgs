@@ -1,0 +1,53 @@
+# Default depth-prior config: Video Depth Anything Relative Base (vitb).
+# Paths are repository-relative. Do not put absolute personal paths here.
+# IO templates may include {video_id} and {run_id} so baseline/LongSplat runs
+# on the same source video do not clobber each other (frame_id alone is not unique).
+
+schema_version: "1.0"
+module: depth-prior
+
+backend:
+  name: video-depth-anything
+  # Pin recorded in configs/depth/backend_pin.md
+  repo_dir: third_party/Video-Depth-Anything
+  commit: "4f5ae23172ba60fd7bc11ef671cca678842c7072"
+  encoder: vitb
+  depth_type: relative  # relative | metric
+  input_size: 518
+  max_res: 1280
+  fp16: true
+  # Optional project-relative weight path. If set, it is staged into the
+  # filename hardcoded by VDA run.py under repo_dir/checkpoints/.
+  # Leave empty to use the default encoder/depth_type checkpoint name.
+  # Non-empty checkpoint also requires allow_custom_checkpoint: true
+  # (explicit reviewer opt-in); otherwise doctor/run fail closed.
+  checkpoint: ""
+  allow_custom_checkpoint: false
+
+io:
+  frames_manifest: data/manifests/{video_id}/{run_id}/frames_manifest.json
+  depth_dir: data/depth/{video_id}/{run_id}
+  # Deferred in this PR: mask generation / confidence export is not implemented yet.
+  mask_dir: data/masks/{video_id}/{run_id}
+  depth_manifest: data/manifests/{video_id}/{run_id}/depth_manifest.json
+  run_record: outputs/reconstructions/depth_prior/{video_id}/{run_id}/run_record.json
+
+runtime:
+  # Optional namespace when the same video_id has multiple preprocess routes
+  # (e.g. baseline vs longsplat). Defaults to "default" when omitted on CLI.
+  run_id: default
+  # Fixed fps for each VDA temp-video assembly. Pinned VDA does not consume
+  # container PTS; do not treat ffmpeg durations as model temporal reset.
+  target_fps: 5
+  # When segment_id is present on all selected frames, run one VDA invocation
+  # per segment so temporal state resets across scene cuts / large gaps.
+  infer_per_segment: true
+  # Collapse identical-timestamp duplicates (same image bytes) within each
+  # VDA batch / segment before inference.
+  dedupe_identical_timestamps: true
+  # Refuse to overwrite existing depth NPZ / depth_manifest / run_record.
+  overwrite: false
+  # Deferred in this PR: the current VDA wrapper does not yet plumb device selection.
+  device: cuda
+  # Deferred in this PR: rerun / cache skipping policy is not implemented yet.
+  skip_existing: false

@@ -59,6 +59,7 @@ outputs/splats/**
 outputs/compressed/**
 outputs/renders/**
 outputs/web_demo/**
+outputs/reports/**
 !outputs/reconstructions/.gitkeep
 !outputs/splats/.gitkeep
 !outputs/compressed/.gitkeep
@@ -125,3 +126,6 @@ docs/exhibition_3dgs_technical_plan.md
 docs/rectification_guidance_2026-07-10.md
 docs/研究方案_07_08.pdf
 docs/第一次架构讨论2026.7.8.md
+
+# Local caches (keep packages off system drive temp/cache)
+.cache/
