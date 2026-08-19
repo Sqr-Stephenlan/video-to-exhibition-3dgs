@@ -9,6 +9,7 @@ Related files:
 | CLI entry | `scripts/depth/run_depth_prior.py` |
 | Preprocess adapter | `scripts/depth/adapt_preprocess_manifest.py` |
 | Default config | `configs/depth/default_vitb.yaml` |
+| 12GB quality config | `configs/depth/default_vitl.yaml` (relative Large, `max_res: 1024`) |
 | Low-VRAM smoke config | `configs/depth/smoke_joint.yaml` (resolution only; deferred fields still unused) |
 | Backend pin | `configs/depth/backend_pin.md` |
 | Setup / commands | `scripts/depth/README.md` |
@@ -359,7 +360,8 @@ Adapter rules (fail closed):
 
 Then run depth-prior with matching `--video-id` and `--run-id`. Notes for limited GPUs:
 
-- Low VRAM / OOM: use `configs/depth/smoke_joint.yaml` (`input_size: 308`, `max_res: 512`)
+- 12GB laptop quality: `configs/depth/default_vitl.yaml` (`vitl`, `max_res: 1024`). If OOM, lower `max_res` or split chunks; do not use metric. If VRAM allows, try `max_res: 1280`.
+- 6GB smoke only: `configs/depth/smoke_joint.yaml` (`input_size: 308`, `max_res: 512`) — not a quality baseline
 - Broken `xformers` CUDA build: uninstall or reinstall a wheel matching local torch/CUDA; lowering resolution alone does not fix xformers operator errors
 
 This branch records **frame↔depth** correspondence only. Camera pose / intrinsics are out of scope for depth-prior (handled by later SfM / LongSplat stages).

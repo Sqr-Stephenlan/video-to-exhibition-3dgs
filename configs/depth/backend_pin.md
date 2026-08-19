@@ -33,6 +33,18 @@ mkdir -p third_party/Video-Depth-Anything/checkpoints
 # https://huggingface.co/depth-anything/Video-Depth-Anything-Base/resolve/main/video_depth_anything_vitb.pth
 ```
 
+## Optional Large weights (12GB quality config)
+
+`configs/depth/default_vitl.yaml` uses relative **Large** (`vitl`). Place:
+
+`third_party/Video-Depth-Anything/checkpoints/video_depth_anything_vitl.pth`
+
+```text
+https://huggingface.co/depth-anything/Video-Depth-Anything-Large/resolve/main/video_depth_anything_vitl.pth
+```
+
+Doctor currently pins SHA-256 only for the default Base relative checkpoint. Large is existence-checked by filename; keep `backend.checkpoint` empty so VDA `run.py` loads the expected `vitl` name. Keep `depth_type: relative` (do not switch this quality line to metric).
+
 `backend.checkpoint` may point to another project-relative weight file **only when**
 `backend.allow_custom_checkpoint: true` is set (explicit reviewer opt-in). Before
 inference, the orchestrator temporarily stages it to the filename that pinned VDA

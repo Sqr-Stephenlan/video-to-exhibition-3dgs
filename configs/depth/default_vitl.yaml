@@ -1,0 +1,40 @@
+# Quality config for 12GB laptop GPUs (e.g. RTX 4080 Laptop).
+# Video Depth Anything Relative Large (vitl). Does not replace default_vitb.yaml.
+# Use a distinct --run-id (runtime.run_id defaults to vitl) so vitb outputs are not overwritten.
+# Paths are repository-relative. Do not put absolute personal paths here.
+
+schema_version: "1.0"
+module: depth-prior
+
+backend:
+  name: video-depth-anything
+  repo_dir: third_party/Video-Depth-Anything
+  commit: "4f5ae23172ba60fd7bc11ef671cca678842c7072"
+  encoder: vitl
+  depth_type: relative  # keep relative; LongSplat alignment expects disparity-like values
+  input_size: 518
+  # 12GB: start at 1024. If VRAM allows, try 1280. Do not use smoke_joint 512 for quality runs.
+  # If OOM: lower max_res (1024 → 896) or split VDA chunks; do not switch to metric.
+  max_res: 1024
+  fp16: true
+  checkpoint: ""
+  allow_custom_checkpoint: false
+
+io:
+  frames_manifest: data/manifests/{video_id}/{run_id}/frames_manifest.json
+  depth_dir: data/depth/{video_id}/{run_id}
+  # Deferred: mask generation / confidence export is not implemented yet.
+  mask_dir: data/masks/{video_id}/{run_id}
+  depth_manifest: data/manifests/{video_id}/{run_id}/depth_manifest.json
+  run_record: outputs/reconstructions/depth_prior/{video_id}/{run_id}/run_record.json
+
+runtime:
+  run_id: vitl
+  target_fps: 5
+  infer_per_segment: true
+  dedupe_identical_timestamps: true
+  overwrite: false
+  # Deferred: the current VDA wrapper does not yet plumb device selection.
+  device: cuda
+  # Deferred: rerun / cache skipping policy is not implemented yet.
+  skip_existing: false

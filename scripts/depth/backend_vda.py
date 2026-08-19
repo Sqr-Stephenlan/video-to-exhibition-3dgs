@@ -299,8 +299,13 @@ def doctor_backend(root: Path, config: dict[str, Any]) -> dict[str, Any]:
                         "allow_custom_checkpoint=true; default SHA-256 pin is skipped."
                     )
         else:
+            ckpt_name = expected_checkpoint_name(
+                str(backend.get("depth_type") or "relative"),
+                str(backend["encoder"]),
+            )
             report["issues"].append(
-                f"Missing checkpoint: {report['checkpoint']}. Download the vitb relative weights."
+                f"Missing checkpoint: {report['checkpoint']}. "
+                f"Download {ckpt_name} into third_party/Video-Depth-Anything/checkpoints/."
             )
     except (OSError, ValueError) as exc:
         report["issues"].append(str(exc))

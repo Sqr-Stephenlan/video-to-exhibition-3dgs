@@ -20,6 +20,16 @@ def test_default_vitb_config_loads() -> None:
     assert config["schema_version"] == "1.0"
 
 
+def test_default_vitl_config_loads() -> None:
+    config = load_config(ROOT / "configs" / "depth" / "default_vitl.yaml")
+    assert config["backend"]["encoder"] == "vitl"
+    assert config["backend"]["depth_type"] == "relative"
+    assert config["backend"]["max_res"] == 1024
+    assert config["backend"]["fp16"] is True
+    assert config["runtime"]["run_id"] == "vitl"
+    assert config["schema_version"] == "1.0"
+
+
 def test_validate_config_rejects_bad_encoder() -> None:
     config = load_config(ROOT / "configs" / "depth" / "default_vitb.yaml")
     config["backend"]["encoder"] = "vitx"

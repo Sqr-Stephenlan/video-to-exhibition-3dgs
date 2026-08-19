@@ -8,8 +8,8 @@ Full prerequisites, input/output schemas, and deferred fields: [`docs/depth_prio
 
 | Item | Value |
 |---|---|
-| Model | Relative **Base** (`vitb`) |
-| Config | `configs/depth/default_vitb.yaml` |
+| Model | Relative **Base** (`vitb`) default; **Large** (`vitl`) for 12GB quality runs |
+| Config | `configs/depth/default_vitb.yaml`; quality: `configs/depth/default_vitl.yaml` |
 | Backend pin | `configs/depth/backend_pin.md` |
 | Sample frames | Not required for `doctor`; required for `run` |
 
@@ -81,6 +81,13 @@ Temp-video assembly passes `-frames:v N` so the ffmpeg concat demuxer’s traili
   data\manifests\<video_id>\frames_manifest.json `
   --run-id baseline
 
+# 12GB laptop quality (vitl, max_res 1024); keep run-id distinct from vitb
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py `
+  --config configs/depth/default_vitl.yaml doctor
+.\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py `
+  --config configs/depth/default_vitl.yaml run --video-id <video_id> --run-id vitl
+
+# 6GB smoke only (not a quality baseline)
 .\.venv\Scripts\python.exe scripts\depth\run_depth_prior.py `
   --config configs/depth/smoke_joint.yaml run --video-id <video_id> --run-id baseline
 ```
