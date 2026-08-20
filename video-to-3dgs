@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+# The product entry point always uses this checkout's route environment.  The
+# legacy VENV_DIR override remains available to ./dev.sh for advanced callers,
+# but a user-facing invocation must not depend on another worktree's venv.
+exec env -u VENV_DIR "$ROOT/dev.sh" python -m scripts.longsplat.one_click "$@"

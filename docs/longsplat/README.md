@@ -3,6 +3,13 @@
 Thin runner for pose-free 3DGS reconstruction of long videos via
 [NVlabs/LongSplat](https://github.com/NVlabs/LongSplat).
 
+For the supported product entry point, start with
+[ONE_CLICK_RECONSTRUCTION.md](ONE_CLICK_RECONSTRUCTION.md):
+
+```bash
+./video-to-3dgs "/path/to/video.mp4"
+```
+
 ## Architecture
 
 ```

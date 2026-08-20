@@ -1,5 +1,9 @@
 # CORE_REQUIRED remediation memo
 
+Productization status: `PRODUCTIZED_CPU_VERIFIED`. The production entry point,
+route environment, immutable public PLY publisher, and CPU contracts are
+implemented and verified. The final real GPU test is deferred to the user.
+
 This memo defines the safety boundary for the default raw-video → external
 fixed-pose → standard 3DGS PLY chain. It is governance/provenance text only;
 it is not a production input and must never be included in a production stage

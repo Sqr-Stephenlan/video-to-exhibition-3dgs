@@ -1,5 +1,9 @@
 # Current handoff pointer
 
+Status: `PRODUCTIZED_CPU_VERIFIED`. The durable product entry point and CPU
+publication contracts are verified; the final manual GPU test is deferred to
+the user.
+
 The current CORE_REQUIRED safety criteria and this remediation slice are
 defined in [CORE_GOAL_MEMO.md](CORE_GOAL_MEMO.md). The canonical handoff
 continues to own run-specific operational facts; this pointer intentionally
