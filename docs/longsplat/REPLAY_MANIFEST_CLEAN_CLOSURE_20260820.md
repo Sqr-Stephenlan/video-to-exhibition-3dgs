@@ -27,12 +27,13 @@ contain its own SHA. Its first closure parent is the root base above.
 
 | path | SHA-256 |
 |---|---|
-| docs/longsplat/REPRODUCTION_RUNBOOK.md | 6fc424986a225e1da48467855964204acfff7e8136a9c06a5e12cf32f6c6d0f2 |
+| docs/longsplat/REPRODUCTION_RUNBOOK.md | 9e0077cec9fb66931462ea5e093b41ce8040e597f5245abe5a040763b6c3b493 |
 | docs/longsplat/patches/0001-longsplat-external-colmap-route.patch | 0f49e2b588167939005b2e9f33ef0087a9e3bef2bbc58ec4362c2012bf75bfdc |
 | docs/longsplat/patches/0002-longsplat-active-pose-contract.patch | 602aff3ed5fce867756381cc20ca580ef4a9a18b8b880c53aeed84e662535897 |
 | docs/longsplat/patches/0003-longsplat-clean-faa6-external-fixed-pose-minimal.patch | 01e897337a6abd93523344c52d8abfd64d4d51e4a1e430064ce01a56d22978a2 |
-| docs/longsplat/CORE_GOAL_MEMO.md | 32b4594a6d5c817e71bc494223fc80c82db9317b605f4353a6dd526eaa476564 |
-| docs/longsplat/HANDOFF_CURRENT_STATUS_20260820.md | 382d30b42dca4c9bb1bbd065441efc24fb8b435b585b93ac3b39e60cb3b07f15 |
+| docs/longsplat/CORE_GOAL_MEMO.md | 88f47d6d4436342bb3146a5a4c31a72f88eb598f1da77c9634fae3ff2a1783ad |
+| docs/longsplat/HANDOFF_CURRENT_STATUS_20260820.md | 26059ed8c75d63cd8d514cd0c5a590e872bd0216f9ace482fcd8528f8bfc3d8b |
+| .gitmodules | bf216b7946ccfdecef47e21a143d0aa07d35c0701ac9ac606b0c9b0167853123 |
 
 The 0003 patch was regenerated from nested faa6e3a to final commit bf766eb.
 It includes the final import-boundary files and no ephemeral artifact path;
@@ -41,6 +42,21 @@ The superseded nested patch SHA
 52f1b93d45d5a923afda476b29f48567051000547dab431b0eafa369e30e057e is not
 used. The reviewed updated remediation SHA is
 f4678269ab6ad01151b1461abe4251bb5e7a961a6825a89db7d8f23697b7913e.
+
+## Nested distribution identity
+
+The root gitlink is distributed from the user-owned fork of the upstream
+repository:
+
+- upstream parent: NVlabs/LongSplat
+- fork: https://github.com/Sqr-Stephenlan/LongSplat
+- fork branch: research/external-fixed-pose-clean-closure
+- published nested commit: bf766eb903c3d9144d64088b8c80b2da67d39411
+- published nested tree: 79f232c42e9128092df0520c5b0209d7ac2b08fd
+- .gitmodules URL: https://github.com/Sqr-Stephenlan/LongSplat.git
+
+The nested fork branch must be published before the root branch. The root
+runner lock and gitlink must remain identical to the published nested commit.
 
 ## Nested closure
 
@@ -122,6 +138,7 @@ Final root production target SHA-256 values:
 - scripts/longsplat/smoke_executor.py: 4ccbdf810661cc492cbf76c6f4bb1ae3a69001571abbbaa9213e3ff962454578
 - scripts/longsplat/conversion_executor.py: 0bc4228639ae9fca5092edf2bea3a560ae4e0768f2f39125fe5dff4971b4f63b
 - tests/unit/test_remediation_contracts.py: f1ba2feb19054b5485cb045a44a9f6300bee31e84f8db09a1263b0227a0d819f
+- tests/unit/test_clean_distribution_contract.py: 489073c4386c68a4dc819b54100a9caed532e601dc3e6a74297635adc7d6d0b8
 
 ## Verification boundary and status
 
@@ -140,6 +157,6 @@ The truthful remediation classifications remain:
 - COMBINED_CPU_VERIFIED
 
 The three CORE_REQUIRED items are therefore not declared globally complete.
-The next authorized stage is one GPU preflight/run after nested content is
-published first and the root gitlink commit is published second. No push or
-GPU execution is part of this local closure.
+The nested fork content is now published; the root branch publication remains
+pending. The next authorized stage after root publication is one GPU
+preflight/run. No GPU execution is part of this local closure.

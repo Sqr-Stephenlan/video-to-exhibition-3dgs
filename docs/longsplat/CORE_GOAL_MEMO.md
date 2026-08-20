@@ -7,8 +7,8 @@ identity.
 
 ## Camera and matcher policy — CORE_REQUIRED
 
-Status this round: CPU contract verified; production clean-head replay remains
-pending. `SIMPLE_RADIAL` + `sequential` remains the versioned default. The
+Status this round: CPU contract and local clean-head CPU replay verified; real
+COLMAP replay remains pending. `SIMPLE_RADIAL` + `sequential` remains the versioned default. The
 existing COLMAP contract also admits `PINHOLE` and `SIMPLE_PINHOLE`, plus
 `exhaustive`; the raw and reconstruct entry points now record and forward the
 selected model and matcher. Unsupported values stop with a structured
@@ -26,8 +26,8 @@ Completion requires all of the following:
 
 ## Tool/backend provider layout — CORE_REQUIRED
 
-Status this round: explicit provider paths and CPU identity fixtures verified;
-GPU/preflight/clean production replay remains pending. The known layout remains
+Status this round: explicit provider paths, CPU identity fixtures, and local
+clean-head CPU replay verified; real provider preflight remains pending. The known layout remains
 the default, while `backend_env`/`backend_python`, COLMAP, ffmpeg, ffprobe, and
 route-python may be supplied explicitly. Provider records preserve requested
 path, resolved target, symlink state, executable state, file SHA/size, and the

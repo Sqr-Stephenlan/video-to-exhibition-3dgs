@@ -212,3 +212,15 @@ outputs/<video>/<run_id>/
 │   └── train_stderr.log
 └── reconstruction_run.json       # Full provenance record
 ```
+
+## Clean nested distribution
+
+The clean-head closure uses the user-owned fork of the upstream nested
+repository. The root .gitmodules entry points to
+https://github.com/Sqr-Stephenlan/LongSplat.git on branch
+research/external-fixed-pose-clean-closure. Its upstream parent is
+NVlabs/LongSplat, and the locked nested commit is
+bf766eb903c3d9144d64088b8c80b2da67d39411 (tree
+79f232c42e9128092df0520c5b0209d7ac2b08fd). Publish that nested branch before
+publishing the root branch; the root gitlink and runner lock must remain
+identical to this commit.

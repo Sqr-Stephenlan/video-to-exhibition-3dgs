@@ -5,6 +5,8 @@ defined in [CORE_GOAL_MEMO.md](CORE_GOAL_MEMO.md). The canonical handoff
 continues to own run-specific operational facts; this pointer intentionally
 contains no video, hash, camera-count, resolution, or evidence-path values.
 
-The remediation artifact is generated outside the repository and must be
-applied only after clean-head review. No commit, push, GPU execution, or
-production evidence mutation is implied by this pointer.
+The clean nested commit is published at
+https://github.com/Sqr-Stephenlan/LongSplat/tree/research/external-fixed-pose-clean-closure
+and remains the exact root gitlink target. The root branch publication is
+separate and must follow the nested push. No GPU execution or production
+evidence mutation is implied by this pointer.
