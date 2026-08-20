@@ -30,7 +30,7 @@ from .pipeline_contract import (
     write_json,
 )
 from .tool_provider import resolve_tool_provider
-from .publisher import PublishError, publish_ply
+from .publisher import PublishError, publish_ply, verify_public_delivery, write_json_once_atomic
 from .reconstruct_validation import validate_existing_run
 from .automated_policy import (
     POLICY_ID as AUTOMATED_POLICY_ID,
@@ -254,6 +254,68 @@ def _write_json_once(path: Path, value: Mapping[str, Any]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(dict(value), indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def _verify_existing_public_delivery(
+    *,
+    ledger: RunLedger,
+    publish_dir: str | Path,
+    delivery_name: str | None,
+) -> None:
+    """Revalidate an already-published PLY before any resume reuse.
+
+    Public delivery is deliberately outside the internal artifact containment
+    root. Its receipt therefore binds the exact configured directory/name and
+    is checked independently on every product resume.
+    """
+
+    receipt_path = ledger.run_dir / "published_ply.json"
+    summary_receipt = ledger.summary.get("published_ply_receipt")
+    summary_published = ledger.summary.get("published_ply")
+    has_summary_delivery = summary_receipt is not None or summary_published is not None
+    if not receipt_path.exists() and not receipt_path.is_symlink():
+        if has_summary_delivery or ledger.summary.get("delivery_reachable") is True:
+            reason = "public delivery receipt is missing while run.json claims delivery"
+            ledger.summary["published_ply"] = None
+            ledger.summary["published_ply_receipt"] = None
+            ledger.mark_blocked(stage="automated-technical-delivery", error=reason, exit_code=2)
+            raise PublishError(reason)
+        return
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        reason = f"public delivery receipt is not a regular file: {receipt_path}"
+        ledger.summary["published_ply"] = None
+        ledger.summary["published_ply_receipt"] = None
+        ledger.mark_blocked(stage="automated-technical-delivery", error=reason, exit_code=2)
+        raise PublishError(reason)
+    try:
+        receipt = _load_json(receipt_path, "published PLY receipt")
+        verify_public_delivery(receipt, output_dir=publish_dir, name=delivery_name)
+    except (
+        PipelineBlocked,
+        PublishError,
+        OSError,
+        TypeError,
+        AttributeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        reason = f"public delivery verification failed on resume: {exc}"
+        ledger.summary["published_ply"] = None
+        ledger.summary["published_ply_receipt"] = None
+        ledger.mark_blocked(stage="automated-technical-delivery", error=reason, exit_code=2)
+        raise PublishError(reason) from exc
+    if summary_receipt is not None and summary_receipt != str(receipt_path):
+        reason = "run.json public receipt path does not bind published_ply.json"
+        ledger.summary["published_ply"] = None
+        ledger.summary["published_ply_receipt"] = None
+        ledger.mark_blocked(stage="automated-technical-delivery", error=reason, exit_code=2)
+        raise PublishError(reason)
+    if summary_published is not None and summary_published != receipt:
+        reason = "run.json public receipt payload differs from published_ply.json"
+        ledger.summary["published_ply"] = None
+        ledger.summary["published_ply_receipt"] = None
+        ledger.mark_blocked(stage="automated-technical-delivery", error=reason, exit_code=2)
+        raise PublishError(reason)
 
 
 def _artifact(path: str | Path) -> dict[str, Any] | None:
@@ -3424,8 +3486,13 @@ def _automated_technical_delivery(
                 output_dir=publish_dir,
                 name=delivery_name,
             )
+            verify_public_delivery(
+                published_ply,
+                output_dir=publish_dir,
+                name=delivery_name,
+            )
             published_ply_receipt = ledger.run_dir / "published_ply.json"
-            _write_json_once(published_ply_receipt, published_ply)
+            write_json_once_atomic(published_ply_receipt, published_ply)
         delivery_artifacts = _artifacts(
             [
                 package["candidate_manifest"],
@@ -4808,7 +4875,7 @@ def run_reconstruction(
     ledger = RunLedger.create_or_resume(output_root=run_output_root, run_id=run_id, identity=ledger_identity)
     if source_metadata is not None:
         source_receipt = ledger.run_dir / "source_receipt.json"
-        _write_json_once(
+        write_json_once_atomic(
             source_receipt,
             {"schema_version": "longsplat-source-receipt-v1", **dict(source_metadata)},
         )
@@ -4824,6 +4891,12 @@ def run_reconstruction(
             raise ResumeMismatchError("reconstruction config differs on resume")
     else:
         _write_json_once(config_path, config)
+    if not plan and publish_dir is not None:
+        _verify_existing_public_delivery(
+            ledger=ledger,
+            publish_dir=publish_dir,
+            delivery_name=delivery_name,
+        )
     if diagnostic_consumer_resume:
         ledger.summary["consumer_diagnostic_resume"] = {
             "schema_version": "consumer-diagnostic-resume-v1",
