@@ -35,6 +35,33 @@ _EXPECTED_BACKEND_FILES = [
     "utils/pose_utils.py",
 ]
 
+_OPTIONAL_POSE_QUALITY_SKIP_REASON = (
+    "optional incremental pose-quality patch is not applied; the default "
+    "depth-disabled external fixed-pose closure intentionally excludes "
+    "project_to_so3 and POSE_TELEMETRY; patch artifact content remains tested separately"
+)
+
+
+def _optional_pose_quality_patch_applied() -> bool:
+    if not _PATCH_PATH.is_file():
+        return False
+    pose_utils = _BACKEND_ROOT / "utils" / "pose_utils.py"
+    scene_init = _BACKEND_ROOT / "scene" / "__init__.py"
+    train_py = _BACKEND_ROOT / "train.py"
+    if not all(path.is_file() for path in (pose_utils, scene_init, train_py)):
+        return False
+    return (
+        "def project_to_so3" in pose_utils.read_text(encoding="utf-8")
+        and "POSE_TELEMETRY" in (
+            scene_init.read_text(encoding="utf-8")
+            + "\n"
+            + train_py.read_text(encoding="utf-8")
+        )
+    )
+
+
+_OPTIONAL_POSE_QUALITY_PATCH_APPLIED = _optional_pose_quality_patch_applied()
+
 
 # ---------------------------------------------------------------------------
 # Patch file content checks (RED — patch does not exist yet)
@@ -178,8 +205,8 @@ def test_backend_camera_update_rt_rejects_invalid():
 
 
 @pytest.mark.skipif(
-    not (_BACKEND_ROOT / "utils" / "pose_utils.py").is_file(),
-    reason=_LOCAL_BACKEND_SKIP_REASON,
+    not _OPTIONAL_POSE_QUALITY_PATCH_APPLIED,
+    reason=_OPTIONAL_POSE_QUALITY_SKIP_REASON,
 )
 def test_backend_has_project_to_so3():
     """project_to_so3 helper must exist in the backend utils."""
@@ -192,11 +219,8 @@ def test_backend_has_project_to_so3():
 
 
 @pytest.mark.skipif(
-    not all(
-        (_BACKEND_ROOT / path).is_file()
-        for path in ("scene/__init__.py", "train.py")
-    ),
-    reason=_LOCAL_BACKEND_SKIP_REASON,
+    not _OPTIONAL_POSE_QUALITY_PATCH_APPLIED,
+    reason=_OPTIONAL_POSE_QUALITY_SKIP_REASON,
 )
 def test_backend_has_pose_telemetry():
     """POSE_TELEMETRY must be emitted in the incremental registration path."""

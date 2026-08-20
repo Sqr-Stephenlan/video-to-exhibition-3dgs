@@ -91,6 +91,11 @@ def _probe(rotation: int = 0, *, sar: str = "1:1", width: int = 640, height: int
     return {"streams": [stream], "format": {"duration": "2.0", "format_name": "synthetic"}}
 
 
+def _fixture_version_probe_runner(argv, **kwargs):
+    """Return a harmless version result without executing any external tool."""
+    return subprocess.CompletedProcess(argv, 0, stdout="fixture-tool 1.0\n", stderr="")
+
+
 def _formatted_display_matrix_payload(*, matrix: str, rotation: int) -> dict:
     payload = _probe(width=1920, height=1080, sar="1:1")
     payload["streams"][0]["side_data_list"] = [
@@ -909,10 +914,11 @@ def test_cli_preflight_stop_does_not_touch_training(tmp_path):
         tool_paths={
             "route_python": sys.executable,
             "backend_python": sys.executable,
-            "ffmpeg": "/home/stephenlan/workspaces/video-to-exhibition-3dgs/backend-envs/media-tools/bin/ffmpeg",
-            "ffprobe": "/home/stephenlan/workspaces/video-to-exhibition-3dgs/backend-envs/media-tools/bin/ffprobe",
-            "colmap": "/usr/bin/colmap",
+            "ffmpeg": sys.executable,
+            "ffprobe": sys.executable,
+            "colmap": sys.executable,
         },
+        runner=_fixture_version_probe_runner,
         code_identity_override={"fixture": True},
     )
     assert result["status"] == "stopped"
@@ -957,10 +963,11 @@ def test_pipeline_probe_stop_records_dynamic_canonical_probe_without_training(tm
         tool_paths={
             "route_python": sys.executable,
             "backend_python": sys.executable,
-            "ffmpeg": "/home/stephenlan/workspaces/video-to-exhibition-3dgs/backend-envs/media-tools/bin/ffmpeg",
-            "ffprobe": "/home/stephenlan/workspaces/video-to-exhibition-3dgs/backend-envs/media-tools/bin/ffprobe",
-            "colmap": "/usr/bin/colmap",
+            "ffmpeg": sys.executable,
+            "ffprobe": sys.executable,
+            "colmap": sys.executable,
         },
+        runner=_fixture_version_probe_runner,
         code_identity_override={"fixture": True},
     )
     assert result["status"] == "stopped"
@@ -989,10 +996,11 @@ def test_probe_contract_failure_keeps_blocked_attempt_record(tmp_path):
         tool_paths={
             "route_python": sys.executable,
             "backend_python": sys.executable,
-            "ffmpeg": "/home/stephenlan/workspaces/video-to-exhibition-3dgs/backend-envs/media-tools/bin/ffmpeg",
-            "ffprobe": "/home/stephenlan/workspaces/video-to-exhibition-3dgs/backend-envs/media-tools/bin/ffprobe",
-            "colmap": "/usr/bin/colmap",
+            "ffmpeg": sys.executable,
+            "ffprobe": sys.executable,
+            "colmap": sys.executable,
         },
+        runner=_fixture_version_probe_runner,
         code_identity_override={"fixture": True},
     )
     assert result["status"] == "blocked"

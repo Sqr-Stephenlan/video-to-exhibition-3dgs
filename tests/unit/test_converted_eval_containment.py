@@ -96,15 +96,16 @@ def test_evcp_main_rejects_external_manifest_without_containment_root(tmp_path: 
 def test_evcp_main_real_containment_root_accepts_manifest(tmp_path: Path) -> None:
     """Direct real-loader proof: the external manifest validates under
     containment_root=<run root> and is rejected under the worktree route_root."""
-    _manifest, manifest_path, route = _fixture(tmp_path, "cp-real", camera_names=["a", "b"], width=16, height=12)
+    _manifest, manifest_path, _route = _fixture(tmp_path, "cp-real", camera_names=["a", "b"], width=16, height=12)
     run_root = manifest_path.parent
     # containment_root accepts it (all bound artifacts under run root)
     ok = am.load_authority_manifest(manifest_path, containment_root=run_root)
     assert ok["manifest_path"] == str(manifest_path.resolve())
     # worktree route_root still rejects an external manifest (safety preserved)
-    worktree = Path("/home/stephenlan/workspaces/video-to-exhibition-3dgs/worktrees/longsplat-route")
+    foreign_route = tmp_path / "foreign-route"
+    foreign_route.mkdir()
     with pytest.raises(am.AuthorityManifestError, match="outside route root"):
-        am.load_authority_manifest(manifest_path, route_root=worktree)
+        am.load_authority_manifest(manifest_path, route_root=foreign_route)
 
 
 def test_execute_evaluation_dry_run_adds_containment_root_to_argv(tmp_path: Path) -> None:

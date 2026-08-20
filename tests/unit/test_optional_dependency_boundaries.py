@@ -1,23 +1,19 @@
 from __future__ import annotations
 
 import ast
-import os
 import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 NESTED = ROOT / "third_party" / "LongSplat"
-BACKEND = Path("/home/stephenlan/workspaces/video-to-exhibition-3dgs/backend-envs/longsplat-cu128")
 
 
 def _backend_python(code: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["VENV_DIR"] = str(BACKEND)
     return subprocess.run(
-        ["./dev.sh", "python", "-c", code],
+        [sys.executable, "-c", code],
         cwd=ROOT,
-        env=env,
         text=True,
         capture_output=True,
         check=False,
@@ -53,6 +49,7 @@ def test_production_modules_do_not_have_unconditional_dust3r_imports():
 
 def test_render_camera_text_helpers_keep_contract_without_optional_packages():
     code = r'''
+import ast
 import importlib.util
 import os
 import tempfile
@@ -62,8 +59,29 @@ os.chdir("third_party/LongSplat")
 assert importlib.util.find_spec("mast3r") is None
 assert importlib.util.find_spec("dust3r") is None
 
-from utils.colmap_utils import get_pc, save_cameras, save_imagestxt
 import numpy as np
+
+loader_source = Path("scene/colmap_loader.py").read_text()
+loader_tree = ast.parse(loader_source)
+rotmat_node = next(node for node in loader_tree.body if getattr(node, "name", None) == "rotmat2qvec")
+loader_namespace = {"np": np}
+loader_module = ast.fix_missing_locations(ast.Module(body=[rotmat_node], type_ignores=[]))
+exec(compile(loader_module, "scene/colmap_loader.py", "exec"), loader_namespace)
+rotmat2qvec = loader_namespace["rotmat2qvec"]
+
+source = Path("utils/colmap_utils.py").read_text()
+tree = ast.parse(source)
+wanted = {"_require_dust3r_to_numpy", "save_cameras", "save_imagestxt", "get_pc"}
+selected = [
+    node for node in tree.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted
+]
+namespace = {"np": np, "Path": Path, "rotmat2qvec": rotmat2qvec}
+module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
+exec(compile(module, "utils/colmap_utils.py", "exec"), namespace)
+get_pc = namespace["get_pc"]
+save_cameras = namespace["save_cameras"]
+save_imagestxt = namespace["save_imagestxt"]
 
 with tempfile.TemporaryDirectory() as tmp:
     focals = np.asarray([[10.0]], dtype=float)
