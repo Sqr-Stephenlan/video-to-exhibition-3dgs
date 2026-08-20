@@ -9,7 +9,9 @@ and records full provenance.
 from __future__ import annotations
 
 import json
+import math
 import os as _os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,7 +23,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 LONGSPLAT_REPO_URL = "https://github.com/NVlabs/LongSplat"
-LONGSPLAT_COMMIT = "19750775a9d19f30aa05a8333c4c6c231b2d5f4a"
+LONGSPLAT_COMMIT = "bf766eb903c3d9144d64088b8c80b2da67d39411"
 
 # Submodules expected at the locked commit, with their pinned gitlink SHAs.
 _LONGSPLAT_SUBMODULE_LINKS = {
@@ -71,6 +73,11 @@ _RESERVED_PARAMS = frozenset(
 
 # Valid backend_mode values.
 _BACKEND_MODES = frozenset({"locked_clean", "research_local"})
+
+# Passthrough keys become ``--<key>`` argv entries.  Keep the accepted grammar
+# deliberately narrow so spellings such as ``model_path=/tmp/escape`` cannot
+# smuggle a second representation of a reserved argparse option.
+_EXTRA_PARAM_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +141,8 @@ class LongSplatConfig:
     # Converter settings
     convert_iteration: int = 30_000
     convert_prune_ratio: float = 0.6
+    convert_anisotropy_reg_weight: float = 0.01
+    convert_anisotropy_soft_limit: float = 30.0
     # Quality gate configuration (off by default for backward compatibility).
     quality_gates: Any = None  # QualityGateConfig | None
     # Expected native checkpoint iteration — if set, training must produce
@@ -188,6 +197,26 @@ def _validate_config(config: LongSplatConfig) -> None:
         raise BackendValidationError(
             f"convert_prune_ratio must be in [0.0, 1.0], got {config.convert_prune_ratio}"
         )
+    if (
+        isinstance(config.convert_anisotropy_reg_weight, bool)
+        or not isinstance(config.convert_anisotropy_reg_weight, (int, float))
+        or not math.isfinite(float(config.convert_anisotropy_reg_weight))
+        or config.convert_anisotropy_reg_weight < 0.0
+    ):
+        raise BackendValidationError(
+            "convert_anisotropy_reg_weight must be a finite non-negative number, "
+            f"got {config.convert_anisotropy_reg_weight!r}"
+        )
+    if (
+        isinstance(config.convert_anisotropy_soft_limit, bool)
+        or not isinstance(config.convert_anisotropy_soft_limit, (int, float))
+        or not math.isfinite(float(config.convert_anisotropy_soft_limit))
+        or config.convert_anisotropy_soft_limit <= 0.0
+    ):
+        raise BackendValidationError(
+            "convert_anisotropy_soft_limit must be a finite positive number, "
+            f"got {config.convert_anisotropy_soft_limit!r}"
+        )
     # Validate expected_native_checkpoint_iteration if set
     if config.expected_native_checkpoint_iteration is not None:
         if (
@@ -198,11 +227,58 @@ def _validate_config(config: LongSplatConfig) -> None:
                 "expected_native_checkpoint_iteration must be a positive int, "
                 f"got {config.expected_native_checkpoint_iteration!r}"
             )
-    # Gate-owned params must not appear in extra_train_args
-    gate_conflicts = _GATE_OWNED_PARAMS & set(config.extra_train_args)
+    _validate_extra_train_args(config.extra_train_args)
+
+
+def _validate_extra_train_args(extra_train_args: Any) -> None:
+    """Validate passthrough argv without permitting option injection."""
+    if not isinstance(extra_train_args, dict):
+        raise BackendValidationError(
+            "extra_train_args must be a dict, got "
+            f"{type(extra_train_args).__name__}"
+        )
+
+    gate_conflicts: list[str] = []
+    for key, value in extra_train_args.items():
+        if not isinstance(key, str) or _EXTRA_PARAM_RE.fullmatch(key) is None:
+            raise BackendValidationError(
+                f"invalid passthrough parameter name: {key!r}"
+            )
+        if key in _RESERVED_PARAMS:
+            raise BackendValidationError(
+                f"extra_train_args must not override reserved param: {key}"
+            )
+        if key in _GATE_OWNED_PARAMS:
+            gate_conflicts.append(key)
+        protected_abbreviations = sorted(
+            name
+            for name in (_RESERVED_PARAMS | _GATE_OWNED_PARAMS)
+            if name != key and name.startswith(key)
+        )
+        if protected_abbreviations:
+            raise BackendValidationError(
+                f"passthrough parameter {key!r} abbreviates protected params: "
+                f"{protected_abbreviations}"
+            )
+        if isinstance(value, str) and value.startswith("-"):
+            raise BackendValidationError(
+                f"extra_train_args[{key!r}] contains option-like value: {value!r}"
+            )
+        if isinstance(value, list):
+            injected = [
+                item
+                for item in value
+                if isinstance(item, str) and item.startswith("-")
+            ]
+            if injected:
+                raise BackendValidationError(
+                    f"extra_train_args[{key!r}] contains option-like list value: "
+                    f"{injected[0]!r}"
+                )
+
     if gate_conflicts:
         raise BackendValidationError(
-            f"extra_train_args must not contain gate-owned params: "
+            "extra_train_args must not contain gate-owned params: "
             f"{sorted(gate_conflicts)}. Use quality_gates config instead."
         )
 
@@ -336,13 +412,6 @@ def build_train_command(
         config.mode,
     ]
 
-    # Reject reserved parameter overrides
-    for key in config.extra_train_args:
-        if key in _RESERVED_PARAMS:
-            raise BackendValidationError(
-                f"extra_train_args must not override reserved param: {key}"
-            )
-
     # Append extra passthrough args with correct bool handling.
     for key, value in config.extra_train_args.items():
         flag = f"--{key}"
@@ -412,6 +481,12 @@ def build_convert_command(
         str(config.convert_iteration),
         "--prune_ratio",
         str(config.convert_prune_ratio),
+        "--seed",
+        str(config.seed),
+        "--anisotropy_reg_weight",
+        str(config.convert_anisotropy_reg_weight),
+        "--anisotropy_soft_limit",
+        str(config.convert_anisotropy_soft_limit),
     ]
 
 
@@ -546,21 +621,7 @@ def load_config(path: str | Path) -> LongSplatConfig:
 
     # Validate extra_train_args if present
     if "extra_train_args" in data:
-        if not isinstance(data["extra_train_args"], dict):
-            raise BackendValidationError(
-                f"extra_train_args must be a dict, got "
-                f"{type(data['extra_train_args']).__name__}"
-            )
-        for key in data["extra_train_args"]:
-            if key in _RESERVED_PARAMS:
-                raise BackendValidationError(
-                    f"Config extra_train_args must not override reserved param: {key}"
-                )
-            if key in _GATE_OWNED_PARAMS:
-                raise BackendValidationError(
-                    f"Config extra_train_args must not contain gate-owned param: {key}. "
-                    f"Use quality_gates config instead."
-                )
+        _validate_extra_train_args(data["extra_train_args"])
 
     # Parse quality_gates if present
     quality_gates = None
