@@ -1,0 +1,7 @@
+{
+  "exit_code": 0,
+  "gpu_invoked": true,
+  "stage": "training",
+  "model_path": "__MODEL_PATH__",
+  "exit_signal": 0
+}
