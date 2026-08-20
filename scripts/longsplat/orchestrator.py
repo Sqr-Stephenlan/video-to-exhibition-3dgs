@@ -59,6 +59,7 @@ from .runner import (
     build_effective_commands,
     config_to_dict,
 )
+from .backend_identity import BackendIdentityError, resolve_backend_identity
 from .validate_input import validate_manifest
 
 _RUN_ID_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$")
@@ -929,172 +930,15 @@ def _sanitise_run_id(run_id: str) -> str:
 
 
 def _resolve_backend_identity(repo_root: Path, *, backend_mode: str) -> dict[str, Any]:
-    """Query the actual backend identity: commit, dirty flag, submodule SHAs,
-    and in research_local mode a SHA-256 of ``git diff --binary HEAD``.
+    """Compatibility wrapper around the dependency-light provider."""
 
-    CR-T123-07: submodule diffs are hashed recursively so the run record
-    can distinguish different local patches at the same HEAD.
-    CR-T123-09: all git query failures are fail-closed — a non-zero exit
-    code or missing output is a ``BackendValidationError``, never a
-    silent default to clean / empty.
-    """
-    commit_result = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-    )
-    if commit_result.returncode != 0:
-        raise BackendValidationError(
-            f"Failed to get backend HEAD commit: exit {commit_result.returncode}"
-        )
-    commit = commit_result.stdout.strip()
-    if not _SHA_RE.match(commit):
-        raise BackendValidationError(f"Backend commit is not a valid SHA: {commit!r}")
-
-    # ---- dirty check: fail closed (CR-T123-09) ----
-    dirty_result = subprocess.run(
-        ["git", "-C", str(repo_root), "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-    )
-    if dirty_result.returncode != 0:
-        raise BackendValidationError(
-            f"git status failed with exit {dirty_result.returncode}: "
-            f"{dirty_result.stderr.strip()[:500]}"
-        )
-    dirty = bool(dirty_result.stdout.strip())
-
-    # ---- discover submodules recursively ----
-    # $displaypath is relative to the top-level superproject, unlike $sm_path
-    # which is relative to the immediate parent (FV-02).
-    sub_list_result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "submodule",
-            "foreach",
-            "--recursive",
-            "--quiet",
-            "echo $displaypath",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if sub_list_result.returncode != 0:
-        raise BackendValidationError(
-            f"git submodule foreach failed with exit "
-            f"{sub_list_result.returncode}: "
-            f"{sub_list_result.stderr.strip()[:500]}"
-        )
-    sub_paths = [
-        p.strip() for p in sub_list_result.stdout.strip().splitlines() if p.strip()
-    ]
-
-    canonical_root = repo_root.resolve()
-
-    submodules: dict[str, str] = {}
-    resolved_sub_paths: dict[str, Path] = {}  # saved for diff loop (RC-FV-F05)
-    for sub_path in sub_paths:
-        sp = (canonical_root / sub_path).resolve()
-        # Containment: resolved path must be inside the canonical repo root
-        try:
-            sp.relative_to(canonical_root)
-        except ValueError:
-            raise BackendValidationError(
-                f"Submodule path {sub_path} resolves outside repo root "
-                f"{canonical_root}: {sp}"
-            )
-        if not sp.is_dir():
-            # Fail closed: if git foreach reported a path it must exist (FV-02)
-            raise BackendValidationError(
-                f"Submodule path reported by git foreach does not exist: {sub_path}"
-            )
-        sha_result = subprocess.run(
-            ["git", "-C", str(sp), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-        )
-        if sha_result.returncode != 0:
-            # CR-T123-09: fail closed instead of silent omit
-            raise BackendValidationError(
-                f"Failed to get HEAD for submodule {sub_path}: "
-                f"exit {sha_result.returncode} — "
-                f"{sha_result.stderr.strip()[:500]}"
-            )
-        sha = sha_result.stdout.strip()
-        if not _SHA_RE.match(sha):
-            raise BackendValidationError(
-                f"Submodule {sub_path} HEAD is not a valid SHA: {sha!r}"
-            )
-        submodules[sub_path] = sha
-        resolved_sub_paths[sub_path] = sp
-
-    # Fingerprint local patches in research_local mode
-    diff_sha256: str | None = None
-    submodule_diffs: dict[str, str | None] = {}
-    if backend_mode == "research_local":
-        diff_result = subprocess.run(
-            ["git", "-C", str(canonical_root), "diff", "--binary", "HEAD", "--"],
-            capture_output=True,
-        )
-        if diff_result.returncode != 0:
-            raise BackendValidationError("Failed to fingerprint backend diff")
-        diff_sha256 = (
-            hashlib.sha256(diff_result.stdout).hexdigest()
-            if diff_result.stdout
-            else None
-        )
-        if dirty and diff_sha256 is None:
-            raise BackendValidationError(
-                "research_local backend is dirty but git diff produced no output"
-            )
-
-        # ---- recursive submodule diffs (CR-T123-07) ----
-        for sub_path in sub_paths:
-            # Re-resolve and re-validate containment before each diff query
-            # (LATEST-FV-03): the path could have been replaced with a symlink
-            # or junction pointing outside the repo after the HEAD loop.
-            expected = resolved_sub_paths[sub_path]
-            current = (canonical_root / sub_path).resolve()
-            try:
-                current.relative_to(canonical_root)
-            except ValueError as exc:
-                raise BackendValidationError(
-                    f"Submodule path {sub_path} resolves outside repo root "
-                    f"during diff query: {current}"
-                ) from exc
-            if current != expected:
-                raise BackendValidationError(
-                    f"Submodule path {sub_path} changed between HEAD and diff "
-                    f"queries: was {expected}, now {current}"
-                )
-            if not current.is_dir():
-                raise BackendValidationError(
-                    f"Submodule path vanished between HEAD and diff queries: {sub_path}"
-                )
-            sd_result = subprocess.run(
-                ["git", "-C", str(current), "diff", "--binary", "HEAD", "--"],
-                capture_output=True,
-            )
-            if sd_result.returncode != 0:
-                raise BackendValidationError(
-                    f"Failed to fingerprint submodule diff for {sub_path}"
-                )
-            submodule_diffs[sub_path] = (
-                hashlib.sha256(sd_result.stdout).hexdigest()
-                if sd_result.stdout
-                else None
-            )
-
-    return {
-        "commit": commit,
-        "dirty": dirty,
-        "submodules": submodules,
-        "mode": backend_mode,
-        "diff_sha256": diff_sha256,
-        "submodule_diffs": submodule_diffs,
-    }
+    try:
+        return resolve_backend_identity(repo_root, backend_mode=backend_mode)
+    except BackendIdentityError as exc:
+        # Preserve the public legacy exception type for orchestrator callers
+        # and existing contract tests without making the provider import the
+        # legacy orchestrator or runner.
+        raise BackendValidationError(str(exc)) from exc
 
 
 def _write_failed_safe(

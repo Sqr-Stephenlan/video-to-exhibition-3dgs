@@ -147,11 +147,19 @@ def _manifest_paths(authority: Mapping[str, Any], route: Path) -> dict[str, Path
     if nested_raw.is_symlink():
         _fail(f"nested LongSplat is symlinked: {nested_raw}")
     nested = nested_raw.resolve()
-    backend = os.environ.get("LONGSPLAT_BACKEND_PYTHON", "")
+    provider = manifest.get("tool_provider")
+    backend_value = None
+    if isinstance(provider, Mapping):
+        effective = provider.get("effective")
+        if isinstance(effective, Mapping) and isinstance(effective.get("backend_python"), str):
+            backend_value = effective["backend_python"]
+    backend = backend_value or os.environ.get("LONGSPLAT_BACKEND_PYTHON", "")
     if backend:
         backend_python = Path(backend).resolve()
     else:
         backend_python = (route.parent.parent / "backend-envs/longsplat-cu128/bin/python").resolve()
+    if provider is not None and (not backend_python.is_file() or not os.access(backend_python, os.X_OK)):
+        _fail(f"declared backend provider is missing or not executable: {backend_python}")
     for label, path in (("training model", model), ("training input", training_input), ("nested LongSplat", nested)):
         if not path.is_dir() or path.is_symlink():
             _fail(f"{label} is missing or symlinked: {path}")

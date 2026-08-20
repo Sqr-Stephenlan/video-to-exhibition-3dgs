@@ -290,6 +290,7 @@ def _run_capture(
             text=True,
             timeout=10,
             check=False,
+            shell=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return 127, "", str(exc)
@@ -415,6 +416,12 @@ def preflight_dependencies(
             "size_bytes": None,
             "sha256": None,
         }
+        if requested_text is not None and _resolve_requested(requested_path, executable_names[name]) is not None:
+            requested_candidate = Path(requested_text)
+            if any(separator in requested_text for separator in {os.sep, "\\"}):
+                entry["symlink"] = requested_candidate.is_symlink()
+        else:
+            entry["symlink"] = False
         if executable and resolved:
             executable_identity = _executable_identity(resolved)
             entry["executable_identity"] = executable_identity

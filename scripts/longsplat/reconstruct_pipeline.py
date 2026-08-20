@@ -29,6 +29,7 @@ from .pipeline_contract import (
     validate_run_id,
     write_json,
 )
+from .tool_provider import resolve_tool_provider
 from .reconstruct_validation import validate_existing_run
 from .automated_policy import (
     POLICY_ID as AUTOMATED_POLICY_ID,
@@ -36,6 +37,7 @@ from .automated_policy import (
     evaluate_formal_gate,
     policy_descriptor,
 )
+from .colmap_contract import SUPPORTED_CAMERA_MODELS, SUPPORTED_MATCHING_MODES
 from .gate_schema import normalize_gate_evidence
 from .render_postcheck import normalize_postcheck_evidence
 
@@ -136,6 +138,8 @@ _PRODUCER_CODE_PATHS = frozenset(
         "scripts/longsplat/colmap_contract.py",
         "scripts/longsplat/camera_staging.py",
         "scripts/longsplat/longsplat_input.py",
+        "scripts/longsplat/pipeline_contract.py",
+        "scripts/longsplat/tool_provider.py",
         "scripts/longsplat/validate_external_colmap_contract.py",
         "nested/train.py",
         "nested/render.py",
@@ -2978,6 +2982,9 @@ def _formal_input(
     route: Path,
     ledger: RunLedger,
     camera_run_dir: Path,
+    camera_model: str = "SIMPLE_RADIAL",
+    matching: str = "sequential",
+    tool_paths: Mapping[str, str | Path] | None = None,
 ) -> dict[str, Any]:
     """Create the formal profile input only after the smoke gate passes."""
 
@@ -3076,6 +3083,9 @@ def _formal_input(
         containment_root=ledger.run_dir,
         route_root=route,
         depth_source="disabled",
+        camera_model=camera_model,
+        matching=matching,
+        tool_paths=tool_paths,
         stop_after="longsplat-input",
         future_smoke_profile=_FORMAL_PROFILE,
     )
@@ -3104,6 +3114,7 @@ def _authority_stage(
     supplied_manifest: str | Path | None,
     plan: bool,
     native_postcheck: Mapping[str, Any] | None = None,
+    tool_provider: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     if plan:
         result = _stage_result(stage="authority-manifest", status="planned", computed_pass=False, reason="authority manifest planned", plan=True)
@@ -3147,6 +3158,7 @@ def _authority_stage(
                 native_render_root=render_root,
                 conversion_profile_id="standard30000-v1",
                 status={"training_views_only": True, "held_out": False, "accepted": False, "supersplat": False},
+                tool_provider=tool_provider,
             )
             manifest_path = write_manifest_once(attempt / "authority_manifest-v1.json", manifest)
             authority = load_authority_manifest(manifest_path, route_root=route, containment_root=ledger.run_dir)
@@ -3449,6 +3461,10 @@ def _run_default_formal_delivery(
     stop_after: str,
     execute_gpu: bool,
     authority_manifest: str | Path | None,
+    camera_model: str,
+    matching: str,
+    tool_paths: Mapping[str, str | Path] | None,
+    tool_provider: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Continue a passed automated early gate through technical delivery."""
 
@@ -3458,7 +3474,15 @@ def _run_default_formal_delivery(
         try:
             if camera_run_dir is None:
                 raise PipelineBlocked("formal profile input requires the passed dynamic camera-staging run")
-            created = _formal_input(source=source, route=route, ledger=ledger, camera_run_dir=camera_run_dir)
+            created = _formal_input(
+                source=source,
+                route=route,
+                ledger=ledger,
+                camera_run_dir=camera_run_dir,
+                camera_model=camera_model,
+                matching=matching,
+                tool_paths=tool_paths,
+            )
             formal_input = created
             formal_profile_input = _profile_input(created["payload"], _FORMAL_PROFILE)
             formal_profile_input.update({"source_path": created["source_path"], "raw_run_dir": created["raw_run_dir"]})
@@ -3611,6 +3635,7 @@ def _run_default_formal_delivery(
             supplied_manifest=authority_manifest,
             plan=False,
             native_postcheck=native_postcheck,
+            tool_provider=tool_provider,
         )
         results["authority-manifest"] = authority_result
         if status != "passed":
@@ -3969,6 +3994,29 @@ def _resume_identity_contract_allowed(
     if not isinstance(existing_code, Mapping) or not isinstance(current_code, Mapping):
         return False
     return _scoped_code_identity(existing_code, "producer")["identity_sha256"] == _scoped_code_identity(current_code, "producer")["identity_sha256"]
+
+
+def _producer_resume_allowed(
+    *,
+    existing_identity: Mapping[str, Any],
+    current_identity: Mapping[str, Any],
+    existing_config: Mapping[str, Any],
+    current_config: Mapping[str, Any],
+) -> bool:
+    """Allow unrelated documentation/test/legacy churn without reuse drift.
+
+    The broad source-tree digest remains provenance in ``identity.json``.
+    Reuse is governed by the exact producer configuration and the narrowed
+    production code scope; provider, source, camera, and output bindings stay
+    immutable.  Schema changes are intentionally not silently migrated here.
+    """
+
+    return _resume_identity_contract_allowed(
+        existing_identity=existing_identity,
+        current_identity=current_identity,
+        existing_config=existing_config,
+        current_config=current_config,
+    )
 
 
 def _stage_summary_entries(summary: Mapping[str, Any], stage: str) -> list[Any] | None:
@@ -4536,6 +4584,9 @@ def run_reconstruction(
     diagnostic_profile: str | None = None,
     pipeline_profile: str | None = None,
     acceptance_policy: str | None = None,
+    camera_model: str = "SIMPLE_RADIAL",
+    matching: str = "sequential",
+    tool_paths: Mapping[str, str | Path] | None = None,
 ) -> dict[str, Any]:
     """Advance one generic reconstruction run through the real adapters."""
 
@@ -4547,6 +4598,20 @@ def run_reconstruction(
         raise ValueError("a restricted GPU retry must stop after the authorized stage")
     if depth_source != "disabled":
         raise PipelineBlocked("the first one-click chain supports only --depth-source disabled")
+    if camera_model not in SUPPORTED_CAMERA_MODELS:
+        raise PipelineBlocked(
+            f"unsupported camera model {camera_model!r}; supported models are "
+            f"{sorted(SUPPORTED_CAMERA_MODELS)}"
+        )
+    if matching not in SUPPORTED_MATCHING_MODES:
+        raise PipelineBlocked(
+            f"unsupported matcher {matching!r}; supported matchers are "
+            f"{sorted(SUPPORTED_MATCHING_MODES)}"
+        )
+    provider_tools, tool_provider = resolve_tool_provider(
+        route_root or Path(__file__).resolve().parents[2], tool_paths
+    )
+    del provider_tools
     run_id = _safe_run_id(run_id)
     source = Path(input_video).resolve()
     if source.is_symlink() or not source.is_file():
@@ -4612,12 +4677,15 @@ def run_reconstruction(
         "output_root_input": str(output_root),
         "output_root_resolved": str(run_output_root),
         "run_root_resolved": str(run_root),
+        "camera_model": camera_model,
+        "matching": matching,
+        "tool_provider": tool_provider,
     }
     code = code_identity_override if code_identity_override is not None else code_identity(route)
     identity = build_run_identity(
         source_video_sha256=sha256_file(source),
         canonical_config_sha256=stable_sha256(config),
-        tool_identity_sha256=stable_sha256({"route": str(route), "tooling": "external ffmpeg/ffprobe/COLMAP/backend preflight"}),
+        tool_identity_sha256=tool_provider["provider_identity_sha256"],
         code_identity_value=code,
         source_video_path=source,
         source_video_size_bytes=source.stat().st_size,
@@ -4683,6 +4751,19 @@ def run_reconstruction(
             # plan and stage artifacts instead of rerunning producers.
             ledger_identity = existing_identity
             diagnostic_consumer_resume = True
+    if (
+        existing_identity_path.is_file()
+        and isinstance(existing_config, Mapping)
+        and ledger_identity is identity
+    ):
+        existing_identity = _load_json(existing_identity_path, "existing reconstruction identity")
+        if _producer_resume_allowed(
+            existing_identity=existing_identity,
+            current_identity=identity,
+            existing_config=existing_config,
+            current_config=config,
+        ):
+            ledger_identity = existing_identity
     ledger = RunLedger.create_or_resume(output_root=run_output_root, run_id=run_id, identity=ledger_identity)
     config_path = ledger.run_dir / "config.json"
     if config_path.exists():
@@ -4824,6 +4905,9 @@ def run_reconstruction(
             depth_source=depth_source,
             stop_after=STAGES[cpu_target] if cpu_target <= STAGE_INDEX["camera-staging"] else "camera-staging",
             future_smoke_profile=_SMOKE_PROFILE,
+            camera_model=camera_model,
+            matching=matching,
+            tool_paths=tool_paths,
         )
         camera_run_dir = Path(str(raw_summary.get("run_dir", raw_camera_root / "camera"))).resolve()
     if camera_run_dir is not None:
@@ -4867,6 +4951,9 @@ def run_reconstruction(
                 depth_source=depth_source,
                 stop_after="longsplat-input",
                 future_smoke_profile=_SMOKE_PROFILE,
+                camera_model=camera_model,
+                matching=matching,
+                tool_paths=tool_paths,
             )
             smoke_input_run_dir = Path(str(raw_input_summary.get("run_dir", raw_input_root / "smoke-input"))).resolve()
             adapted = _adapt_raw_stage(stage="longsplat-input", raw_run_dir=smoke_input_run_dir, plan=False)
@@ -4930,6 +5017,10 @@ def run_reconstruction(
             stop_after=stop_after,
             execute_gpu=execute_gpu,
             authority_manifest=authority_manifest,
+            camera_model=camera_model,
+            matching=matching,
+            tool_paths=tool_paths,
+            tool_provider=tool_provider,
         )
 
     smoke_input = _profile_input(results["longsplat-input"].get("raw_result", results["longsplat-input"]), _SMOKE_PROFILE)
@@ -5282,7 +5373,15 @@ def run_reconstruction(
     formal = _stage_reusable(ledger, "formal-training")
     if formal is None:
         try:
-            formal_input = _formal_input(source=source, route=route, ledger=ledger, camera_run_dir=camera_run_dir or Path())
+            formal_input = _formal_input(
+                source=source,
+                route=route,
+                ledger=ledger,
+                camera_run_dir=camera_run_dir or Path(),
+                camera_model=camera_model,
+                matching=matching,
+                tool_paths=tool_paths,
+            )
             formal_profile_input = _profile_input(formal_input["payload"], _FORMAL_PROFILE)
             formal_profile_input.update({"source_path": formal_input["source_path"], "raw_run_dir": formal_input["raw_run_dir"]})
         except Exception as exc:
@@ -5332,7 +5431,16 @@ def run_reconstruction(
 
     authority_result = _stage_reusable(ledger, "authority-manifest")
     if authority_result is None:
-        authority_result, status = _authority_stage(ledger=ledger, route=route, source=source, formal=formal_profile_input, native=native, supplied_manifest=authority_manifest, plan=False)
+        authority_result, status = _authority_stage(
+            ledger=ledger,
+            route=route,
+            source=source,
+            formal=formal_profile_input,
+            native=native,
+            supplied_manifest=authority_manifest,
+            plan=False,
+            tool_provider=tool_provider,
+        )
         results["authority-manifest"] = authority_result
         if status != "passed":
             _finish_summary(ledger, results, status="blocked", reason=authority_result["reason"])
@@ -5649,6 +5757,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-failed-stage", choices=("smoke100-training",), help="one explicitly authorized append-only executor retry")
     parser.add_argument("--depth-source", choices=("disabled",), default="disabled")
     parser.add_argument("--route-root")
+    parser.add_argument("--camera-model", default="SIMPLE_RADIAL")
+    parser.add_argument("--matching", choices=("sequential", "exhaustive"), default="sequential")
+    parser.add_argument("--backend-env", help="explicit backend environment root containing bin/python")
+    parser.add_argument("--backend-python", help="explicit backend Python executable")
+    parser.add_argument("--ffmpeg", help="explicit ffmpeg executable")
+    parser.add_argument("--ffprobe", help="explicit ffprobe executable")
+    parser.add_argument("--colmap", help="explicit COLMAP executable")
+    parser.add_argument("--route-python", help="explicit route Python executable")
     parser.add_argument("--authority-manifest")
     parser.add_argument("--acceptance-token")
     parser.add_argument("--coverage-visual-token", help="explicit human coverage-smoke visual decision JSON; never inferred from structural metrics")
@@ -5692,6 +5808,20 @@ def main(argv: list[str] | None = None) -> int:
             diagnostic_profile=args.diagnostic_profile,
             pipeline_profile=args.pipeline_profile,
             acceptance_policy=args.acceptance_policy,
+            camera_model=args.camera_model,
+            matching=args.matching,
+            tool_paths={
+                key: value
+                for key, value in {
+                    "backend_env": args.backend_env,
+                    "backend_python": args.backend_python,
+                    "ffmpeg": args.ffmpeg,
+                    "ffprobe": args.ffprobe,
+                    "colmap": args.colmap,
+                    "route_python": args.route_python,
+                }.items()
+                if value is not None
+            },
         )
     except ResumeMismatchError as exc:
         print(json.dumps({"status": "blocked", "error": str(exc)}, indent=2), file=sys.stderr)

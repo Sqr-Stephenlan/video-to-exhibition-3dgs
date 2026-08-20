@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .coverage_smoke import validate_sampling_telemetry
+from .sampling_telemetry import validate_sampling_telemetry
 from .pipeline_contract import PipelineBlocked, sha256_file
 
 

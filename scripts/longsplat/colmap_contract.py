@@ -15,6 +15,7 @@ from .pipeline_contract import PipelineBlocked, sha256_file, stable_sha256, writ
 COLMAP_CONTRACT_SCHEMA = "colmap-contract-v1"
 INTRINSICS_EVIDENCE_SCHEMA = "intrinsics-evidence-v1"
 SUPPORTED_CAMERA_MODELS = {"SIMPLE_PINHOLE", "SIMPLE_RADIAL", "PINHOLE"}
+SUPPORTED_MATCHING_MODES = {"sequential", "exhaustive"}
 _IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 _POSITIVE_INTEGER = re.compile(r"^[1-9][0-9]*$")
 
@@ -402,6 +403,7 @@ def run_colmap_command(
             capture_output=True,
             text=True,
             check=False,
+            shell=False,
         )
         exit_code = int(getattr(result, "returncode", 1))
         stdout = str(getattr(result, "stdout", "") or "")

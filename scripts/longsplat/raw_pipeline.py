@@ -29,6 +29,8 @@ from .colmap_contract import (
     load_camera_prior,
     require_single_model_component,
     run_colmap_command,
+    SUPPORTED_CAMERA_MODELS,
+    SUPPORTED_MATCHING_MODES,
     validate_camera_prior_for_canonical,
 )
 from .frame_contract import FrameMetric, FrameSelectionConfig, select_frames
@@ -47,6 +49,7 @@ from .pipeline_contract import (
     stable_sha256,
     write_json_once,
 )
+from .tool_provider import default_tool_paths, resolve_tool_provider
 from .video_contract import (
     build_ffprobe_command,
     build_frame_extract_command,
@@ -88,6 +91,7 @@ def _run_process(
             capture_output=True,
             text=True,
             check=False,
+            shell=False,
         )
         return {
             "argv": list(argv),
@@ -193,14 +197,7 @@ def _frame_stage_once(
 
 
 def _default_tools(route_root: Path) -> dict[str, str]:
-    workspace_root = route_root.parent.parent
-    return {
-        "ffmpeg": str(workspace_root / "backend-envs/media-tools/bin/ffmpeg"),
-        "ffprobe": str(workspace_root / "backend-envs/media-tools/bin/ffprobe"),
-        "colmap": "colmap",
-        "backend_python": str(workspace_root / "backend-envs/longsplat-cu128/bin/python"),
-        "route_python": sys.executable,
-    }
+    return default_tool_paths(route_root)
 
 
 def _derive_image_metrics(
@@ -612,17 +609,23 @@ def _run_longsplat_input_from_parent(
 
     if depth_source != "disabled":
         raise PipelineBlocked("LongSplat input packaging requires depth_source=disabled")
-    if camera_model != "SIMPLE_RADIAL" or matching != "sequential":
-        raise PipelineBlocked("LongSplat input packaging supports SIMPLE_RADIAL/sequential COLMAP only")
+    if camera_model not in SUPPORTED_CAMERA_MODELS:
+        raise PipelineBlocked(
+            f"unsupported camera model {camera_model!r}; supported models are "
+            f"{sorted(SUPPORTED_CAMERA_MODELS)}"
+        )
+    if matching not in SUPPORTED_MATCHING_MODES:
+        raise PipelineBlocked(
+            f"unsupported matcher {matching!r}; supported matchers are "
+            f"{sorted(SUPPORTED_MATCHING_MODES)}"
+        )
     future_workload_profile(future_smoke_profile)
     source = Path(input_video).resolve()
     if not source.is_file():
         raise PipelineBlocked(f"input video does not exist: {source}")
     source_sha = sha256_file(source)
     route = Path(route_root or Path(__file__).resolve().parents[2]).resolve()
-    tools = _default_tools(route)
-    if tool_paths:
-        tools.update({key: str(value) for key, value in tool_paths.items()})
+    tools, tool_provider = resolve_tool_provider(route, tool_paths)
     code = code_identity_override if code_identity_override is not None else code_identity(route)
     preflight = preflight_dependencies(
         route_python=tools.get("route_python"),
@@ -657,6 +660,7 @@ def _run_longsplat_input_from_parent(
         "observation_rewrite": True,
         "conversion": "CPU COLMAP model_converter TXT->BIN->TXT",
         "future_smoke_profile": future_smoke_profile,
+        "tool_provider": tool_provider,
     }
     if parent_binding_error is not None:
         config["parent_binding_error"] = parent_binding_error
@@ -666,6 +670,8 @@ def _run_longsplat_input_from_parent(
         canonical_config_sha256=config_sha,
         tool_identity_sha256=preflight["tool_identity_sha256"],
         code_identity_value=code,
+        source_video_path=source,
+        source_video_size_bytes=source.stat().st_size,
     )
     default_run_id = f"raw_video_{source_sha[:16]}_longsplat_input_{identity['run_identity_sha256'][:8]}"
     actual_run_id = _safe_run_id(run_id or default_run_id)
@@ -800,6 +806,16 @@ def run_raw_video_pipeline(
         raise PipelineBlocked("--parent-run is only valid with stop-after longsplat-input")
     if depth_source != "disabled":
         raise PipelineBlocked("the first raw-video slice supports only --depth-source disabled")
+    if camera_model not in SUPPORTED_CAMERA_MODELS:
+        raise PipelineBlocked(
+            f"unsupported camera model {camera_model!r}; supported models are "
+            f"{sorted(SUPPORTED_CAMERA_MODELS)}"
+        )
+    if matching not in SUPPORTED_MATCHING_MODES:
+        raise PipelineBlocked(
+            f"unsupported matcher {matching!r}; supported matchers are "
+            f"{sorted(SUPPORTED_MATCHING_MODES)}"
+        )
     if preprocess_manifest is not None:
         raise PipelineBlocked(
             "--preprocess-manifest is disabled until a strict source/canonical/pixel adapter exists"
@@ -809,9 +825,7 @@ def run_raw_video_pipeline(
         raise PipelineBlocked(f"input video does not exist: {source}")
     source_sha = sha256_file(source)
     route = Path(route_root or Path(__file__).resolve().parents[2]).resolve()
-    tools = _default_tools(route)
-    if tool_paths:
-        tools.update({key: str(value) for key, value in tool_paths.items()})
+    tools, tool_provider = resolve_tool_provider(route, tool_paths)
     prior = _load_prior(camera_prior, source_sha)
     selection = selection_config or FrameSelectionConfig()
     config = {
@@ -823,6 +837,7 @@ def run_raw_video_pipeline(
         "camera_prior": None if prior is None else prior.to_dict(),
         "preprocess_manifest": None,
         "preprocess_manifest_status": "disabled_strict_adapter_pending",
+        "tool_provider": tool_provider,
     }
     config_sha = stable_sha256(config)
     code = code_identity_override if code_identity_override is not None else code_identity(route)
@@ -839,6 +854,8 @@ def run_raw_video_pipeline(
         canonical_config_sha256=config_sha,
         tool_identity_sha256=preflight["tool_identity_sha256"],
         code_identity_value=code,
+        source_video_path=source,
+        source_video_size_bytes=source.stat().st_size,
     )
     default_run_id = f"raw_{source_sha[:16]}_{config_sha[:8]}_{identity['run_identity_sha256'][:8]}"
     actual_run_id = _safe_run_id(run_id or default_run_id)
@@ -1289,6 +1306,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan", action="store_true", help="record commands without executing ffprobe/ffmpeg/COLMAP")
     parser.add_argument("--camera-model", default="SIMPLE_RADIAL")
     parser.add_argument("--matching", choices=("sequential", "exhaustive"), default="sequential")
+    parser.add_argument("--backend-env", help="explicit backend environment root containing bin/python")
+    parser.add_argument("--backend-python", help="explicit backend Python executable")
+    parser.add_argument("--ffmpeg", help="explicit ffmpeg executable")
+    parser.add_argument("--ffprobe", help="explicit ffprobe executable")
+    parser.add_argument("--colmap", help="explicit COLMAP executable")
+    parser.add_argument("--route-python", help="explicit route Python executable")
     parser.add_argument(
         "--future-smoke-profile",
         choices=("smoke100", "smoke100-v1", "formal30000", "formal30000-v1"),
@@ -1326,6 +1349,18 @@ def main(argv: list[str] | None = None) -> int:
                 max_frames=args.max_frames,
             ),
             future_smoke_profile=args.future_smoke_profile,
+            tool_paths={
+                key: value
+                for key, value in {
+                    "backend_env": args.backend_env,
+                    "backend_python": args.backend_python,
+                    "ffmpeg": args.ffmpeg,
+                    "ffprobe": args.ffprobe,
+                    "colmap": args.colmap,
+                    "route_python": args.route_python,
+                }.items()
+                if value is not None
+            },
         )
     except (PipelineBlocked, ValueError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"status": "blocked", "error": str(exc)}, indent=2), file=sys.stderr)

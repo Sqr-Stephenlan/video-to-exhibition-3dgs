@@ -32,7 +32,7 @@ try:
         resolve_future_workload_profile,
         validate_future_smoke_plan,
     )
-    from .coverage_smoke import CoverageSmokeBlocked, validate_coverage_smoke_plan, validate_sampling_telemetry
+    from .sampling_telemetry import SamplingTelemetryBlocked, validate_sampling_telemetry
     from .pipeline_contract import (
         PipelineBlocked,
         code_identity,
@@ -48,7 +48,7 @@ except ImportError:  # direct ``dev.sh python scripts/...`` invocation
         resolve_future_workload_profile,
         validate_future_smoke_plan,
     )
-    from scripts.longsplat.coverage_smoke import CoverageSmokeBlocked, validate_coverage_smoke_plan, validate_sampling_telemetry  # type: ignore
+    from scripts.longsplat.sampling_telemetry import SamplingTelemetryBlocked, validate_sampling_telemetry  # type: ignore
     from scripts.longsplat.pipeline_contract import (  # type: ignore
         PipelineBlocked,
         code_identity,
@@ -449,9 +449,13 @@ def _verify_static_input(
         if coverage_path.is_symlink() or not coverage_path.is_file() or sha256_file(coverage_path) != coverage_sha:
             _fail("coverage-smoke plan binding SHA failed")
         try:
+            try:
+                from .coverage_smoke import validate_coverage_smoke_plan
+            except ImportError:
+                from scripts.longsplat.coverage_smoke import validate_coverage_smoke_plan  # type: ignore
             coverage_plan = _load_json(coverage_path, "coverage-smoke plan")
             coverage_validation = validate_coverage_smoke_plan(coverage_plan)
-        except (SmokeExecutorBlocked, CoverageSmokeBlocked) as exc:
+        except (SmokeExecutorBlocked, PipelineBlocked) as exc:
             _fail(f"coverage-smoke plan validation failed: {exc}")
         if coverage_validation.get("computed_pass") is not True:
             _fail("coverage-smoke plan is not computed_pass")
@@ -1797,7 +1801,7 @@ def execute_stage(
             )
             if stage == "render" and snapshot_manifest_path is not None:
                 _verify_snapshot_manifest(snapshot_manifest_path, containment_root=containment_root)
-        except (SmokeExecutorBlocked, CoverageSmokeBlocked) as exc:
+        except (SmokeExecutorBlocked, PipelineBlocked) as exc:
             result["structural"] = {"structural_pass": False, "reason": str(exc)}
     else:
         result["structural"] = {"structural_pass": False, "reason": "child process returned nonzero"}

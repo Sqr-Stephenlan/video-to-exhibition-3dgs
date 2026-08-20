@@ -15,6 +15,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .pipeline_contract import PipelineBlocked
+
 
 SCHEMA_VERSION = "longsplat-authority-manifest-v1"
 
@@ -268,6 +270,14 @@ def validate_authority_manifest(
         _fail(f"authority manifest schema must be {SCHEMA_VERSION}")
     profile_id = manifest.get("conversion_profile_id")
     profile = validate_profile(profile_id, manifest.get("conversion_profile"))
+    provider = manifest.get("tool_provider")
+    if provider is not None:
+        try:
+            from .tool_provider import verify_tool_provider
+
+            verify_tool_provider(provider)
+        except (AuthorityManifestError, PipelineBlocked, ValueError, TypeError) as exc:
+            _fail(f"tool provider identity is invalid or drifted: {exc}")
 
     run_root: Path | None = None
     if containment_root is not None:
@@ -428,6 +438,7 @@ def build_authority_manifest(
     conversion_profile_id: str = "standard30000-v1",
     test_cameras: str | Path | None = None,
     status: Mapping[str, Any] | None = None,
+    tool_provider: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a manifest from current run artifacts and validate it immediately."""
 
@@ -475,6 +486,7 @@ def build_authority_manifest(
             "dimensions": {"width": dimensions[0], "height": dimensions[1]},
         },
         "pose_contract": _identity_for_build(pose_contract, "pose_contract"),
+        "tool_provider": None if tool_provider is None else dict(tool_provider),
         "native_render_evidence": {
             "result": _identity_for_build(native_result, "native result"),
             "postcheck": _identity_for_build(native_postcheck, "native postcheck"),

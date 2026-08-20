@@ -121,7 +121,7 @@ Final root production target SHA-256 values:
 - scripts/longsplat/convergence_smoke.py: 9ddc5e533f2b02331272a1faff217e2215cc84f34bbbc8f07a9b2586dcb54b4c
 - scripts/longsplat/smoke_executor.py: 4ccbdf810661cc492cbf76c6f4bb1ae3a69001571abbbaa9213e3ff962454578
 - scripts/longsplat/conversion_executor.py: 0bc4228639ae9fca5092edf2bea3a560ae4e0768f2f39125fe5dff4971b4f63b
-- tests/unit/test_remediation_contracts.py: c4d65a29bfc7f555bb1d2427f933cc4a8fe3d4468318953aa980f7273dc66fac
+- tests/unit/test_remediation_contracts.py: f1ba2feb19054b5485cb045a44a9f6300bee31e84f8db09a1263b0227a0d819f
 
 ## Verification boundary and status
 
