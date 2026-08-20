@@ -59,6 +59,13 @@ with `ffprobe` before the canonical pipeline starts. Only a sanitized URL
 origin is recorded; credentials, query strings, and fragments are never put
 in logs or manifests.
 
+The download guard defaults to 8 GiB and checks both `Content-Length` and the
+actual streamed byte count. It can be lowered or raised (up to the built-in
+64 GiB ceiling) with `--max-download-bytes N` or
+`LONGSPLAT_MAX_DOWNLOAD_BYTES=N`. A redirect whose final scheme is not
+`http`/`https`, an over-limit response, or a byte-count mismatch is rejected
+and its `.part` file is removed.
+
 A webpage URL is not silently parsed. It fails with a message that a webpage
 needs an optional `yt-dlp` adapter; that adapter is not part of the core
 dependency closure.
@@ -71,6 +78,17 @@ Useful options:
 ./video-to-3dgs --output-dir outputs/review "/path/to/video.mp4"
 ./video-to-3dgs --plan "/path/to/video.mp4"
 ```
+
+For a fresh remote checkout, the CPU workflow materializes the root LongSplat
+fork and exactly the four direct locked inner gitlinks with:
+
+```bash
+./dev.sh python -m scripts.longsplat.verify_remote_distribution --root . --json
+```
+
+This command uses the GitHub remotes recorded in `.gitmodules`, verifies the
+locked SHAs and origin URLs, and does not recursively initialize optional
+MASt3R/DUSt3R descendants.
 
 `--plan` is a CPU-only contract check. It does not run `nvidia-smi`, CUDA,
 training, rendering, conversion, or evaluation.
@@ -92,7 +110,11 @@ Published names are sanitized and include the final PLY SHA-256 prefix. A
 same-name, same-SHA file is safely reused; any different-content collision
 stops without overwriting the existing delivery. The receipt records source
 technical PLY path, SHA/size/vertex count, published path, SHA/size/vertex
-count, and the atomic-copy policy.
+count, nlink, and the atomic-copy policy. Publication uses a same-directory
+temporary file plus Linux `renameat2(RENAME_NOREPLACE)`, fsyncs the file and
+directory, and blocks if the strict no-replace primitive is unavailable. A
+resume rechecks the canonical public path, receipt, SHA/size/vertices, and
+`st_nlink == 1` before reusing a completed delivery.
 
 The CPU product contract and focused tests are verified. The final real GPU
 execution remains a manual user step; no GPU E2E is implied by the CPU checks.

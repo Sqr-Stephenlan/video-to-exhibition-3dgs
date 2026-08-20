@@ -22,7 +22,7 @@ from typing import Any
 # Locked backend identity
 # ---------------------------------------------------------------------------
 
-LONGSPLAT_REPO_URL = "https://github.com/NVlabs/LongSplat"
+LONGSPLAT_REPO_URL = "https://github.com/Sqr-Stephenlan/LongSplat"
 LONGSPLAT_COMMIT = "bf766eb903c3d9144d64088b8c80b2da67d39411"
 
 # Submodules expected at the locked commit, with their pinned gitlink SHAs.
