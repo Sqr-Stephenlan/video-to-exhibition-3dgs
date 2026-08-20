@@ -51,6 +51,7 @@ from scripts.longsplat.pipeline_contract import (
     PipelineBlocked,
     ResumeMismatchError,
     RunLedger,
+    stable_sha256,
     build_run_identity,
     preflight_dependencies,
     code_identity,
@@ -1316,10 +1317,20 @@ def _write_synthetic_colmap_binary(model: ColmapModel, root: Path) -> None:
                 handle.write(struct.pack("<ii", image_id, point2d_idx))
 
 
-def _make_parent_binding_fixture(root: Path, *, source_sha: str, frame_count: int, width: int, height: int) -> dict:
+def _make_parent_binding_fixture(
+    root: Path,
+    *,
+    source_sha: str,
+    frame_count: int,
+    width: int,
+    height: int,
+    fresh_identity: bool = True,
+) -> dict:
     import cv2
 
     root.mkdir(parents=True)
+    source_video_path = root / "fixture.mp4"
+    source_video_path.write_bytes(b"fresh parent source")
     names = [f"capture_{index:03d}.png" for index in range(frame_count)]
     image_dir = root / "stages" / "camera-staging" / "attempt-0002" / "camera_staging" / "canonical_images"
     image_dir.mkdir(parents=True)
@@ -1442,11 +1453,21 @@ def _make_parent_binding_fixture(root: Path, *, source_sha: str, frame_count: in
     }
 
     config = {"depth_source": "disabled", "camera_model": "SIMPLE_RADIAL", "matching": "sequential", "camera_prior": None}
+    identity_kwargs = {}
+    if fresh_identity:
+        identity_kwargs = {
+            "source_video_path": source_video_path,
+            "source_video_size_bytes": source_video_path.stat().st_size,
+            "output_root_input": root / "output-input",
+            "output_root_resolved": root / "output-resolved",
+            "run_root_resolved": root / "run-root",
+        }
     identity = build_run_identity(
         source_video_sha256=source_sha,
         canonical_config_sha256=stable_sha256(config),
         tool_identity_sha256=stable_sha256({"fixture": tool_sha}),
         code_identity_value={"code_identity_sha256": _sha("i")},
+        **identity_kwargs,
     )
     (root / "identity.json").write_text(json.dumps(identity, sort_keys=True), encoding="utf-8")
     (root / "config.json").write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
@@ -1467,7 +1488,33 @@ def _make_parent_binding_fixture(root: Path, *, source_sha: str, frame_count: in
     failed_colmap = stage_record("colmap", "attempt-0004", "blocked", {"reason": "newer fixture failure", "artifacts": []})
     run = {"status": "stopped", "computed_pass": True, "identity": identity, "stages": {"camera-staging": [failed_camera, passed_camera], "colmap": [passed_colmap, failed_colmap]}}
     (root / "run.json").write_text(json.dumps(run, sort_keys=True), encoding="utf-8")
-    return {"source_sha": source_sha, "tool_sha": tool_sha, "names": names, "contract": contract, "contract_path": contract_path}
+    return {
+        "source_sha": source_sha,
+        "tool_sha": tool_sha,
+        "names": names,
+        "contract": contract,
+        "contract_path": contract_path,
+        "identity": identity,
+        "identity_path": root / "identity.json",
+        "run_path": root / "run.json",
+        "result_paths": [
+            root / "stages" / "camera-staging" / "attempt-0001" / "result.json",
+            root / "stages" / "camera-staging" / "attempt-0002" / "result.json",
+            root / "stages" / "colmap" / "attempt-0003" / "result.json",
+            root / "stages" / "colmap" / "attempt-0004" / "result.json",
+        ],
+    }
+
+
+def _rewrite_parent_identity(fixture: dict, identity: dict) -> None:
+    fixture["identity_path"].write_text(json.dumps(identity, sort_keys=True), encoding="utf-8")
+    run = json.loads(fixture["run_path"].read_text(encoding="utf-8"))
+    run["identity"] = identity
+    fixture["run_path"].write_text(json.dumps(run, sort_keys=True), encoding="utf-8")
+    for result_path in fixture["result_paths"]:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["identity"] = identity
+        result_path.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
 
 
 def test_parent_binding_is_dynamic_and_uses_latest_reusable_attempt(tmp_path):
@@ -1486,6 +1533,95 @@ def test_parent_binding_is_dynamic_and_uses_latest_reusable_attempt(tmp_path):
     assert first_evidence["parent_binding_sha256"] != second_evidence["parent_binding_sha256"]
     assert first_evidence["parent_binding"]["final_camera"]["width"] == 8
     assert second_evidence["parent_binding"]["final_camera"]["width"] == 10
+    assert first["identity"]["source_video_path"] == str((tmp_path / "parent-a" / "fixture.mp4").resolve())
+    assert first["identity"]["source_video_size_bytes"] == len(b"fresh parent source")
+    assert first["identity"]["output_root_input"] == str(tmp_path / "parent-a" / "output-input")
+    assert first["identity"]["output_root_resolved"] == str((tmp_path / "parent-a" / "output-resolved").resolve())
+    assert first["identity"]["run_root_resolved"] == str((tmp_path / "parent-a" / "run-root").resolve())
+
+
+def test_parent_binding_accepts_legacy_run_identity_payload(tmp_path):
+    fixture = _make_parent_binding_fixture(
+        tmp_path / "legacy-parent",
+        source_sha=_sha("a"),
+        frame_count=2,
+        width=8,
+        height=6,
+        fresh_identity=False,
+    )
+    evidence = load_parent_camera_staging_evidence(
+        tmp_path / "legacy-parent",
+        expected_source_video_sha256=_sha("a"),
+        current_colmap_identity={"sha256": fixture["tool_sha"]},
+    )
+    assert set(fixture["identity"]) == {
+        "schema_version",
+        "source_video_sha256",
+        "canonical_config_sha256",
+        "tool_identity_sha256",
+        "code_identity",
+        "run_identity_sha256",
+    }
+    assert evidence["identity"] == fixture["identity"]
+
+
+def test_parent_binding_rejects_run_identity_extension_tamper(tmp_path):
+    fixture = _make_parent_binding_fixture(tmp_path / "tampered-parent", source_sha=_sha("a"), frame_count=2, width=8, height=6)
+    tampered = dict(fixture["identity"])
+    tampered["source_video_size_bytes"] += 1
+    _rewrite_parent_identity(fixture, tampered)
+    with pytest.raises(LongSplatInputBlocked, match="parent run identity stable SHA"):
+        load_parent_camera_staging_evidence(
+            tmp_path / "tampered-parent",
+            expected_source_video_sha256=_sha("a"),
+            current_colmap_identity={"sha256": fixture["tool_sha"]},
+        )
+
+
+def test_parent_binding_rejects_missing_run_identity_base_field(tmp_path):
+    fixture = _make_parent_binding_fixture(tmp_path / "missing-base-parent", source_sha=_sha("a"), frame_count=2, width=8, height=6)
+    tampered = dict(fixture["identity"])
+    tampered.pop("canonical_config_sha256")
+    unsigned = dict(tampered)
+    unsigned.pop("schema_version", None)
+    unsigned.pop("run_identity_sha256", None)
+    tampered["run_identity_sha256"] = stable_sha256(unsigned)
+    _rewrite_parent_identity(fixture, tampered)
+    with pytest.raises(LongSplatInputBlocked, match="parent run identity is missing canonical_config_sha256"):
+        load_parent_camera_staging_evidence(
+            tmp_path / "missing-base-parent",
+            expected_source_video_sha256=_sha("a"),
+            current_colmap_identity={"sha256": fixture["tool_sha"]},
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("digest", "parent run identity stable SHA"),
+        ("missing", "parent run identity SHA is required"),
+        ("digest_type", "parent run identity SHA is required"),
+        ("schema", "parent run identity schema"),
+    ],
+)
+def test_parent_binding_rejects_run_identity_digest_contract(tmp_path, mutation, message):
+    fixture = _make_parent_binding_fixture(tmp_path / f"invalid-{mutation}", source_sha=_sha("a"), frame_count=2, width=8, height=6)
+    tampered = dict(fixture["identity"])
+    if mutation == "digest":
+        tampered["run_identity_sha256"] = _sha("z")
+    elif mutation == "missing":
+        tampered.pop("run_identity_sha256")
+    elif mutation == "digest_type":
+        tampered["run_identity_sha256"] = ["not-a-digest"]
+    else:
+        tampered["schema_version"] = "run-identity-legacy"
+    _rewrite_parent_identity(fixture, tampered)
+    with pytest.raises(LongSplatInputBlocked, match=message):
+        load_parent_camera_staging_evidence(
+            tmp_path / f"invalid-{mutation}",
+            expected_source_video_sha256=_sha("a"),
+            current_colmap_identity={"sha256": fixture["tool_sha"]},
+        )
 
 
 def test_parent_binding_rejects_source_pixel_path_and_tool_drift(tmp_path):

@@ -24,6 +24,7 @@ from .camera_staging import CameraParameters
 from .colmap_contract import ColmapCommand, parse_colmap_image_pose_records, run_colmap_command
 from .pipeline_contract import (
     PipelineBlocked,
+    RUN_IDENTITY_SCHEMA,
     resolve_contained_path,
     resolve_containment_root,
     sha256_file,
@@ -1387,18 +1388,35 @@ def load_parent_camera_staging_evidence(
     identity = json.loads(identity_path.read_text(encoding="utf-8"))
     run = json.loads(run_path.read_text(encoding="utf-8"))
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(identity, Mapping):
+        _fail("parent identity payload is malformed")
     if run.get("identity") != identity:
         _fail("parent run ledger identity differs from identity.json")
+    required_identity_fields = (
+        "source_video_sha256",
+        "canonical_config_sha256",
+        "tool_identity_sha256",
+        "code_identity",
+    )
+    missing_identity_fields = [field for field in required_identity_fields if field not in identity]
+    if missing_identity_fields:
+        _fail("parent run identity is missing " + ", ".join(missing_identity_fields))
+    for field in ("source_video_sha256", "canonical_config_sha256", "tool_identity_sha256"):
+        if not isinstance(identity.get(field), str):
+            _fail(f"parent run identity field must be a string: {field}")
+    if not isinstance(identity.get("code_identity"), (str, Mapping)):
+        _fail("parent run identity field must be a string or object: code_identity")
     if identity.get("source_video_sha256") != expected_source_video_sha256:
         _fail("parent source video SHA does not match current input")
-    if identity.get("run_identity_sha256") != stable_sha256(
-        {
-            "source_video_sha256": identity.get("source_video_sha256"),
-            "canonical_config_sha256": identity.get("canonical_config_sha256"),
-            "tool_identity_sha256": identity.get("tool_identity_sha256"),
-            "code_identity": identity.get("code_identity"),
-        }
-    ):
+    if identity.get("schema_version") != RUN_IDENTITY_SCHEMA:
+        _fail(f"parent run identity schema must be {RUN_IDENTITY_SCHEMA}")
+    declared_run_identity = identity.get("run_identity_sha256")
+    if not isinstance(declared_run_identity, str):
+        _fail("parent run identity SHA is required")
+    unsigned_identity = dict(identity)
+    unsigned_identity.pop("schema_version", None)
+    unsigned_identity.pop("run_identity_sha256", None)
+    if stable_sha256(unsigned_identity) != declared_run_identity:
         _fail("parent run identity stable SHA failed")
     if run.get("computed_pass") is not True:
         _fail("parent run is not a computed-pass CPU reference")
