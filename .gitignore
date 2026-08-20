@@ -112,8 +112,12 @@ tensorboard/
 
 # Experiment outputs and scratch space
 outputs/
+.runtime/
 tmp/
 *.pth.part
+
+# Portable local provider overrides
+configs/provider.local.json
 
 # Third-party repositories are managed as external dependencies.
 # Track only documentation or manifests placed directly under third_party/.

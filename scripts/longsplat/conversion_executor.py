@@ -157,7 +157,9 @@ def _manifest_paths(authority: Mapping[str, Any], route: Path) -> dict[str, Path
     if backend:
         backend_python = Path(backend).resolve()
     else:
-        backend_python = (route.parent.parent / "backend-envs/longsplat-cu128/bin/python").resolve()
+        from .tool_provider import default_tool_paths
+
+        backend_python = Path(default_tool_paths(route)["backend_python"]).resolve()
     if provider is not None and (not backend_python.is_file() or not os.access(backend_python, os.X_OK)):
         _fail(f"declared backend provider is missing or not executable: {backend_python}")
     for label, path in (("training model", model), ("training input", training_input), ("nested LongSplat", nested)):

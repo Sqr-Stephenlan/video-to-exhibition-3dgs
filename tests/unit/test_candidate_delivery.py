@@ -133,7 +133,11 @@ def _automated_delivery_deps(tmp_path: Path):
     conversion_root.mkdir(parents=True)
     (conversion_root / "conversion_result.json").write_text(json.dumps({"stage": "conversion"}), encoding="utf-8")
     ply = run_dir / "point_cloud.ply"
-    ply.write_bytes(b"technical-ply")
+    ply.write_bytes(
+        b"ply\nformat ascii 1.0\nelement vertex 1\n"
+        b"property float x\nproperty float y\nproperty float z\n"
+        b"end_header\n0 0 0\n"
+    )
     eval_root = run_dir / "eval"
     eval_root.mkdir(parents=True)
     comparison_png = run_dir / "comparison.png"
@@ -198,3 +202,48 @@ def test_automated_technical_delivery_artifacts_consume_comparison_sheet_path(tm
     artifact_paths = [a["path"] for a in result.get("artifacts", [])]
     assert str(comparison_png.resolve()) in artifact_paths
 
+
+def test_automated_technical_delivery_publishes_and_receipts_final_ply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (run_dir, ledger, authority, conversion, evaluation, postprocess, early_gate, formal_gate, native_postcheck, ply, comparison_png) = _automated_delivery_deps(tmp_path)
+
+    def fake_create(**kwargs):
+        manifest_path = run_dir / "candidate_manifest.json"
+        provenance = run_dir / "PROVENANCE.json"
+        report = run_dir / "CANDIDATE_REPORT.md"
+        sums = run_dir / "SHA256SUMS.txt"
+        for file_path in (manifest_path, provenance, report, sums):
+            file_path.write_text("x", encoding="utf-8")
+        return {
+            "root": str(run_dir / "delivery_root"),
+            "point_cloud": {"path": str(ply.resolve()), "sha256": "unused", "size_bytes": ply.stat().st_size, "vertices": 1},
+            "vertices": 1,
+            "candidate_manifest": str(manifest_path.resolve()),
+            "provenance": str(provenance.resolve()),
+            "report": str(report.resolve()),
+            "comparison_sheet": {"path": str(comparison_png.resolve()), "sha256": "unused", "size_bytes": comparison_png.stat().st_size},
+            "sha256sums": {"path": str(sums.resolve()), "file_count": 1, "verified": True},
+            "accepted": False,
+            "supersplat": False,
+        }
+
+    monkeypatch.setattr("scripts.longsplat.acceptance_delivery.create_candidate_delivery", fake_create)
+    result, status = _automated_technical_delivery(
+        ledger=ledger,
+        route=run_dir / "route",
+        authority=authority,
+        conversion=conversion,
+        evaluation=evaluation,
+        postprocess=postprocess,
+        early_gate=early_gate,
+        formal_gate=formal_gate,
+        native_postcheck=native_postcheck,
+        plan=False,
+        publish_dir=tmp_path / "public",
+        delivery_name="gallery",
+    )
+    assert status == "passed"
+    published = result["published_ply"]
+    published_path = Path(published["published"]["path"])
+    assert published_path.is_file()
+    assert result["published_ply_receipt"] == str(run_dir / "published_ply.json")
+    assert json.loads((run_dir / "published_ply.json").read_text(encoding="utf-8"))["published"]["path"] == str(published_path)

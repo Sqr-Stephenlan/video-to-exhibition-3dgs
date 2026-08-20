@@ -1912,8 +1912,10 @@ def _conversion_paths(
     nested = route / "third_party/LongSplat"
     if nested.is_symlink():
         raise SmokeExecutorBlocked(f"nested LongSplat is symlinked: {nested}")
+    from .tool_provider import default_tool_paths
+
     backend_value = os.environ.get("LONGSPLAT_BACKEND_PYTHON")
-    backend = Path(backend_value) if backend_value else route.parent.parent / "backend-envs/longsplat-cu128/bin/python"
+    backend = Path(backend_value) if backend_value else Path(default_tool_paths(route)["backend_python"])
     return {
         "route": route,
         "source": source,

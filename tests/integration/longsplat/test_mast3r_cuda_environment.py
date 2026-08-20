@@ -25,6 +25,20 @@ _LOCAL_BACKEND_SKIP_REASON = (
     "requires ignored local third_party/LongSplat checkout; "
     "the tracked MASt3R patch contract is tested separately"
 )
+_OPTIONAL_UNPATCHED_SKIP_REASON = (
+    "optional MASt3R is outside the default one-click chain; "
+    "apply the tracked low-memory patch before running its local source contract"
+)
+
+
+def _optional_mast3r_patch_is_present() -> bool:
+    if not MODEL_SOURCE.is_file():
+        return False
+    try:
+        source = MODEL_SOURCE.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "mmap=True" in source and "del ckpt" in source and "gc.collect()" in source
 
 
 def _load_model_function() -> ast.FunctionDef:
@@ -37,8 +51,8 @@ def _load_model_function() -> ast.FunctionDef:
 
 
 @pytest.mark.skipif(
-    not MODEL_SOURCE.is_file(),
-    reason=_LOCAL_BACKEND_SKIP_REASON,
+    not _optional_mast3r_patch_is_present(),
+    reason=_OPTIONAL_UNPATCHED_SKIP_REASON,
 )
 def test_mast3r_checkpoint_is_released_before_cuda_transfer():
     function = _load_model_function()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -13,20 +14,79 @@ from .pipeline_contract import PipelineBlocked, sha256_file
 
 TOOL_PROVIDER_SCHEMA = "tool-provider-config-v1"
 TOOL_NAMES = ("ffmpeg", "ffprobe", "colmap", "backend_python", "route_python")
+PROVIDER_CONFIG_KEYS = frozenset(TOOL_NAMES) | {"backend_env"}
+
+
+def discover_workspace_root(route_root: str | Path) -> Path | None:
+    """Find a workspace ancestor that carries the optional backend envs."""
+
+    route = Path(route_root).resolve()
+    for candidate in (route, *route.parents):
+        if (candidate / "backend-envs").is_dir():
+            return candidate
+    return None
+
+
+_discover_workspace_root = discover_workspace_root
+
+
+def _prefer_layout_or_path(layout_path: Path, command: str) -> str:
+    if layout_path.is_file():
+        return str(layout_path)
+    return shutil.which(command) or command
 
 
 def default_tool_paths(route_root: str | Path) -> dict[str, str]:
-    """Return the historical known layout without making it mandatory."""
+    """Discover portable workspace providers, then fall back to ``PATH``.
 
-    route = Path(route_root).resolve()
-    workspace_root = route.parent.parent
+    The production route normally lives below the workspace containing
+    ``backend-envs/media-tools`` and ``backend-envs/longsplat-cu128``.  A
+    separate clone can instead provide explicit values through the local
+    provider config or the existing CLI overrides; no user-specific absolute
+    path is part of the tracked default.
+    """
+
+    workspace_root = discover_workspace_root(route_root)
+    media_root = None if workspace_root is None else workspace_root / "backend-envs/media-tools/bin"
+    longsplat_root = None if workspace_root is None else workspace_root / "backend-envs/longsplat-cu128/bin"
+    backend_override = os.environ.get("LONGSPLAT_BACKEND_PYTHON")
     return {
-        "ffmpeg": str(workspace_root / "backend-envs/media-tools/bin/ffmpeg"),
-        "ffprobe": str(workspace_root / "backend-envs/media-tools/bin/ffprobe"),
-        "colmap": "colmap",
-        "backend_python": str(workspace_root / "backend-envs/longsplat-cu128/bin/python"),
+        "ffmpeg": _prefer_layout_or_path(
+            media_root / "ffmpeg" if media_root is not None else Path("ffmpeg"),
+            "ffmpeg",
+        ),
+        "ffprobe": _prefer_layout_or_path(
+            media_root / "ffprobe" if media_root is not None else Path("ffprobe"),
+            "ffprobe",
+        ),
+        "colmap": shutil.which("colmap") or "colmap",
+        "backend_python": (
+            backend_override
+            or _prefer_layout_or_path(
+                longsplat_root / "python" if longsplat_root is not None else Path("python3"),
+                "python3",
+            )
+        ),
         "route_python": sys.executable,
     }
+
+
+def load_provider_config(path: str | Path) -> dict[str, str]:
+    """Load a small ignored JSON provider override file."""
+
+    config_path = Path(path)
+    try:
+        value = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PipelineBlocked(f"provider config is not valid JSON: {config_path}: {exc}") from exc
+    if not isinstance(value, Mapping):
+        raise PipelineBlocked("provider config must be a JSON object")
+    unknown = set(value) - PROVIDER_CONFIG_KEYS
+    if unknown:
+        raise PipelineBlocked(f"unsupported provider config keys: {sorted(unknown)}")
+    if any(not isinstance(item, str) for item in value.values()):
+        raise PipelineBlocked("provider config values must be strings")
+    return {str(key): str(item) for key, item in value.items()}
 
 
 def _is_path_value(value: str) -> bool:
@@ -84,7 +144,7 @@ def resolve_tool_provider(
 
     effective = default_tool_paths(route_root)
     requested = dict(overrides or {})
-    unknown = set(requested) - set(TOOL_NAMES) - {"backend_env"}
+    unknown = set(requested) - PROVIDER_CONFIG_KEYS
     if unknown:
         raise PipelineBlocked(f"unsupported tool provider keys: {sorted(unknown)}")
     backend_env = requested.pop("backend_env", None)
@@ -101,8 +161,13 @@ def resolve_tool_provider(
     }
     config: dict[str, Any] = {
         "schema_version": TOOL_PROVIDER_SCHEMA,
-        "source": "explicit" if overrides else "known_layout",
+        "source": "explicit" if overrides else "discovered_layout_or_path",
         "backend_env": None if backend_env is None else str(Path(backend_env).absolute()),
+        "workspace_root": (
+            str(_discover_workspace_root(route_root))
+            if _discover_workspace_root(route_root) is not None
+            else None
+        ),
         "requested": {
             key: str(value) for key, value in sorted((overrides or {}).items()) if value is not None
         },

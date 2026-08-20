@@ -30,6 +30,7 @@ from .pipeline_contract import (
     write_json,
 )
 from .tool_provider import resolve_tool_provider
+from .publisher import PublishError, publish_ply
 from .reconstruct_validation import validate_existing_run
 from .automated_policy import (
     POLICY_ID as AUTOMATED_POLICY_ID,
@@ -122,6 +123,7 @@ _CONVERGENCE_CONSUMER_CODE_PATHS = frozenset(
         "scripts/longsplat/pipeline_contract.py",
         "scripts/longsplat/automated_policy.py",
         "scripts/longsplat/acceptance_delivery.py",
+        "scripts/longsplat/publisher.py",
         "scripts/longsplat/authority_manifest.py",
         "scripts/longsplat/converted_eval_postprocess.py",
         "scripts/longsplat/convergence_smoke.py",
@@ -3304,6 +3306,8 @@ def _automated_technical_delivery(
     formal_gate: Mapping[str, Any],
     native_postcheck: Mapping[str, Any],
     plan: bool,
+    publish_dir: str | Path | None = None,
+    delivery_name: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Seal a technical PLY without fabricating SuperSplat verification."""
 
@@ -3412,13 +3416,34 @@ def _automated_technical_delivery(
                 ],
             },
         )
+        published_ply = None
+        published_ply_receipt: Path | None = None
+        if publish_dir is not None:
+            published_ply = publish_ply(
+                source_ply=package["point_cloud"]["path"],
+                output_dir=publish_dir,
+                name=delivery_name,
+            )
+            published_ply_receipt = ledger.run_dir / "published_ply.json"
+            _write_json_once(published_ply_receipt, published_ply)
+        delivery_artifacts = _artifacts(
+            [
+                package["candidate_manifest"],
+                package["provenance"],
+                package["report"],
+                package["point_cloud"]["path"],
+                package["sha256sums"]["path"],
+                package["comparison_sheet"]["path"],
+            ]
+            + ([] if published_ply_receipt is None else [published_ply_receipt])
+        )
         result = _stage_result(
             stage=stage_name,
             status="passed",
             computed_pass=True,
             reason="standard 3DGS technical delivery sealed by automated-technical-v1",
             plan=False,
-            artifacts=_artifacts([package["candidate_manifest"], package["provenance"], package["report"], package["point_cloud"]["path"], package["sha256sums"]["path"], package["comparison_sheet"]["path"]]),
+            artifacts=delivery_artifacts,
             automated_technical_gate=True,
             automated_policy_id=AUTOMATED_POLICY_ID,
             accepted_by_automated_policy=True,
@@ -3433,10 +3458,12 @@ def _automated_technical_delivery(
             technical_ply=package["point_cloud"],
             vertices=package["vertices"],
             sha256sums=package["sha256sums"],
+            published_ply=published_ply,
+            published_ply_receipt=None if published_ply_receipt is None else str(published_ply_receipt),
         )
         ledger.finish_attempt(stage=stage_name, attempt=attempt, status="passed", result=result)
         return result, "passed"
-    except (PipelineBlocked, OSError, ValueError, AcceptanceDeliveryError) as exc:
+    except (PipelineBlocked, OSError, ValueError, AcceptanceDeliveryError, PublishError) as exc:
         result = _stage_result(
             stage=stage_name,
             status="blocked",
@@ -3465,6 +3492,8 @@ def _run_default_formal_delivery(
     matching: str,
     tool_paths: Mapping[str, str | Path] | None,
     tool_provider: Mapping[str, Any] | None,
+    publish_dir: str | Path | None = None,
+    delivery_name: str | None = None,
 ) -> dict[str, Any]:
     """Continue a passed automated early gate through technical delivery."""
 
@@ -3738,6 +3767,8 @@ def _run_default_formal_delivery(
             formal_gate=formal_gate,
             native_postcheck=native_postcheck,
             plan=False,
+            publish_dir=publish_dir,
+            delivery_name=delivery_name,
         )
         results["automated-technical-delivery"] = delivery
         if status != "passed":
@@ -4587,6 +4618,9 @@ def run_reconstruction(
     camera_model: str = "SIMPLE_RADIAL",
     matching: str = "sequential",
     tool_paths: Mapping[str, str | Path] | None = None,
+    publish_dir: str | Path | None = None,
+    delivery_name: str | None = None,
+    source_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Advance one generic reconstruction run through the real adapters."""
 
@@ -4596,6 +4630,8 @@ def run_reconstruction(
         raise ValueError("retry-failed-stage currently supports only smoke100-training")
     if retry_failed_stage is not None and stop_after != retry_failed_stage:
         raise ValueError("a restricted GPU retry must stop after the authorized stage")
+    if delivery_name is not None and publish_dir is None:
+        raise ValueError("delivery-name requires publish-dir")
     if depth_source != "disabled":
         raise PipelineBlocked("the first one-click chain supports only --depth-source disabled")
     if camera_model not in SUPPORTED_CAMERA_MODELS:
@@ -4681,6 +4717,11 @@ def run_reconstruction(
         "matching": matching,
         "tool_provider": tool_provider,
     }
+    if publish_dir is not None:
+        config["publish_dir"] = str(Path(publish_dir).resolve())
+        config["delivery_name"] = delivery_name
+    if source_metadata is not None:
+        config["source_metadata"] = dict(source_metadata)
     code = code_identity_override if code_identity_override is not None else code_identity(route)
     identity = build_run_identity(
         source_video_sha256=sha256_file(source),
@@ -4765,6 +4806,14 @@ def run_reconstruction(
         ):
             ledger_identity = existing_identity
     ledger = RunLedger.create_or_resume(output_root=run_output_root, run_id=run_id, identity=ledger_identity)
+    if source_metadata is not None:
+        source_receipt = ledger.run_dir / "source_receipt.json"
+        _write_json_once(
+            source_receipt,
+            {"schema_version": "longsplat-source-receipt-v1", **dict(source_metadata)},
+        )
+        ledger.summary["source_receipt"] = str(source_receipt)
+        ledger._write_summary()
     config_path = ledger.run_dir / "config.json"
     if config_path.exists():
         existing_config = _load_json(config_path, "reconstruction config")
@@ -5021,6 +5070,8 @@ def run_reconstruction(
             matching=matching,
             tool_paths=tool_paths,
             tool_provider=tool_provider,
+            publish_dir=publish_dir,
+            delivery_name=delivery_name,
         )
 
     smoke_input = _profile_input(results["longsplat-input"].get("raw_result", results["longsplat-input"]), _SMOKE_PROFILE)
@@ -5659,6 +5710,8 @@ def _finish_summary(ledger: RunLedger, results: Mapping[str, Any], *, status: st
     ledger.summary["manual_visual_review"] = bool(delivery_result.get("manual_visual_review")) if isinstance(delivery_result, Mapping) else False
     ledger.summary["supersplat_runtime_verified"] = bool(delivery_result.get("supersplat_runtime_verified")) if isinstance(delivery_result, Mapping) else False
     ledger.summary["technical_delivery_root"] = delivery_result.get("technical_delivery_root") if isinstance(delivery_result, Mapping) else None
+    ledger.summary["published_ply"] = delivery_result.get("published_ply") if isinstance(delivery_result, Mapping) else None
+    ledger.summary["published_ply_receipt"] = delivery_result.get("published_ply_receipt") if isinstance(delivery_result, Mapping) else None
     ledger.summary["acceptance"] = {
         "accepted": ledger.summary["accepted"],
         "reason": reason,
@@ -5738,6 +5791,8 @@ def _run_result(ledger: RunLedger, results: Mapping[str, Any], *, stop_after: st
         "manual_visual_review": ledger.summary.get("manual_visual_review", False),
         "supersplat_runtime_verified": ledger.summary.get("supersplat_runtime_verified", False),
         "technical_delivery_root": ledger.summary.get("technical_delivery_root"),
+        "published_ply": ledger.summary.get("published_ply"),
+        "published_ply_receipt": ledger.summary.get("published_ply_receipt"),
         "gpu_invoked": ledger.summary["gpu_invoked"],
         "stop_after": stop_after,
         "plan": plan,
@@ -5765,6 +5820,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffprobe", help="explicit ffprobe executable")
     parser.add_argument("--colmap", help="explicit COLMAP executable")
     parser.add_argument("--route-python", help="explicit route Python executable")
+    parser.add_argument("--publish-dir", help="optional separate public PLY directory; legacy direct calls omit it")
+    parser.add_argument("--delivery-name", help="safe public PLY stem used with --publish-dir")
     parser.add_argument("--authority-manifest")
     parser.add_argument("--acceptance-token")
     parser.add_argument("--coverage-visual-token", help="explicit human coverage-smoke visual decision JSON; never inferred from structural metrics")
@@ -5810,6 +5867,8 @@ def main(argv: list[str] | None = None) -> int:
             acceptance_policy=args.acceptance_policy,
             camera_model=args.camera_model,
             matching=args.matching,
+            publish_dir=args.publish_dir,
+            delivery_name=args.delivery_name,
             tool_paths={
                 key: value
                 for key, value in {
