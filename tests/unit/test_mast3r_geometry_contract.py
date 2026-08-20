@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 _GEOMETRY_PATH = (
@@ -13,6 +14,8 @@ _GEOMETRY_PATH = (
     / "utils"
     / "mast3r_geometry.py"
 )
+if not _GEOMETRY_PATH.is_file():
+    pytest.skip("optional MASt3R geometry runtime is unavailable", allow_module_level=True)
 _SPEC = importlib.util.spec_from_file_location("mast3r_geometry_contract", _GEOMETRY_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)

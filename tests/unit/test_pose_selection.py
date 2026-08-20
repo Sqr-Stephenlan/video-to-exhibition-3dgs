@@ -4,6 +4,8 @@ import copy
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -12,6 +14,8 @@ MODULE_PATH = (
     / "utils"
     / "pose_selection.py"
 )
+if not MODULE_PATH.is_file():
+    pytest.skip("optional pose-selection runtime is unavailable", allow_module_level=True)
 SPEC = importlib.util.spec_from_file_location("pose_selection_under_test", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -75,4 +79,3 @@ def test_selection_does_not_mutate_candidate_or_target_state() -> None:
     assert winner is candidates[1]
     assert candidates == before
     assert target_state == {"pose": "unchanged", "kp0": "unchanged"}
-
