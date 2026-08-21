@@ -18,11 +18,8 @@ def _stamp(seconds: int) -> str:
     return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
 
 
-def _make_run(tmp_path: Path, *, stage: str = "conversion", status: str = "running") -> Path:
-    run_dir = tmp_path / "run"
-    attempt = run_dir / "stages" / stage / "attempt-0001"
-    (attempt / "executor").mkdir(parents=True)
-    stage_order = [
+def _stage_order() -> list[str]:
+    return [
         "preflight",
         "probe",
         "frames",
@@ -44,6 +41,13 @@ def _make_run(tmp_path: Path, *, stage: str = "conversion", status: str = "runni
         "converted-eval-postprocess",
         "automated-technical-delivery",
     ]
+
+
+def _make_run(tmp_path: Path, *, stage: str = "conversion", status: str = "running") -> Path:
+    run_dir = tmp_path / "run"
+    attempt = run_dir / "stages" / stage / "attempt-0001"
+    (attempt / "executor").mkdir(parents=True)
+    stage_order = _stage_order()
     (run_dir / "config.json").write_text(
         json.dumps({"stage_order": stage_order}),
         encoding="utf-8",
@@ -86,6 +90,103 @@ def _make_run(tmp_path: Path, *, stage: str = "conversion", status: str = "runni
     return run_dir
 
 
+def _activate_stage(run_dir: Path, stage: str, *, attempt: str = "attempt-0001", started: int = 101) -> None:
+    attempt_dir = run_dir / "stages" / stage / attempt
+    (attempt_dir / "executor").mkdir(parents=True, exist_ok=True)
+    (attempt_dir / "request.json").write_text(
+        json.dumps({"started_at": _stamp(started)}),
+        encoding="utf-8",
+    )
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "created_at": _stamp(0),
+                "updated_at": _stamp(started),
+                "status": "running",
+                "active_stage": stage,
+                "active_attempt": attempt,
+                "stages": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _make_raw_camera_run(tmp_path: Path, *, raw_stage: str = "colmap") -> Path:
+    run_dir = tmp_path / "run"
+    raw_dir = run_dir / "raw-camera" / "camera"
+    attempt = raw_dir / "stages" / raw_stage / "attempt-0002"
+    (attempt / "executor").mkdir(parents=True)
+    (attempt / "request.json").write_text(
+        json.dumps({"started_at": _stamp(100)}),
+        encoding="utf-8",
+    )
+    (run_dir / "config.json").write_text(
+        json.dumps({"stage_order": _stage_order()}),
+        encoding="utf-8",
+    )
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "created_at": _stamp(0),
+                "updated_at": _stamp(100),
+                "status": "running",
+                "stages": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (raw_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "created_at": _stamp(0),
+                "updated_at": _stamp(100),
+                "status": "running",
+                "active_stage": raw_stage,
+                "active_attempt": "attempt-0002",
+                "stages": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def _write_sampling_events(model: Path, iterations: int) -> None:
+    model.mkdir(parents=True, exist_ok=True)
+    model.joinpath("camera_sampling_telemetry-v1.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "schema_version": "camera-sampling-telemetry-v1",
+                    "iteration": iteration,
+                }
+            )
+            + "\n"
+            for iteration in range(1, iterations + 1)
+        ),
+        encoding="utf-8",
+    )
+
+
+def _make_training_run(tmp_path: Path, *, stage: str = "convergence-smoke-training") -> Path:
+    run_dir = _make_run(tmp_path, stage=stage)
+    attempt = run_dir / "stages" / stage / "attempt-0001"
+    model = attempt / "model"
+    (attempt / "executor" / "request.json").write_text(
+        json.dumps(
+            {
+                "stage": "training",
+                "iterations": 1000,
+                "model_path": str(model),
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_sampling_events(model, 3)
+    return run_dir
+
+
 def test_conversion_marker_render_and_stale_warning(tmp_path: Path) -> None:
     run_dir = _make_run(tmp_path)
     sidecar = run_dir / "stages" / "conversion" / "attempt-0001" / "executor" / "conversion-progress-v1.jsonl"
@@ -122,7 +223,7 @@ def test_conversion_marker_render_and_stale_warning(tmp_path: Path) -> None:
     assert snapshot is not None
     assert snapshot.conversion.iteration == 14000
     assert "conversion 14000/30000" in line
-    assert "17/20" in line
+    assert line.startswith("[")
     assert "WARNING: no observed iteration heartbeat" in line
     assert "阶段 00:16:40" in line
     assert "总计 00:18:20" in line
@@ -193,7 +294,157 @@ def test_blocked_and_failed_statuses_are_displayed_without_changing_stage_progre
 
         assert snapshot is not None
         assert f"| {status}" in line
-        assert "17/20" in line
+        assert not line.startswith("[")
+
+
+def test_raw_camera_reports_actual_colmap_and_current_attempt_timer(tmp_path: Path) -> None:
+    run_dir = _make_raw_camera_run(tmp_path, raw_stage="colmap")
+
+    snapshot = read_progress_snapshot(run_dir, now=200)
+    line = render_progress_line(snapshot, now=200)
+
+    assert snapshot is not None
+    assert snapshot.stage == "colmap"
+    assert snapshot.stage_active is True
+    assert snapshot.stage_started == 100
+    assert "colmap |" in line
+    assert "camera staging" not in line
+    assert "4/20" not in line
+    assert not line.startswith("[")
+    assert "阶段 00:01:40" in line
+
+
+def test_current_stage_refreshes_in_place_on_tty(tmp_path: Path) -> None:
+    run_dir = _make_run(tmp_path, stage="colmap")
+
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    clock = [110.0]
+    stream = TTY()
+    reporter = TerminalProgress("auto", stream=stream, env={"TERM": "x"}, now_fn=lambda: clock[0])
+    reporter.bind_run(run_dir)
+    reporter.poll_once(force=True)
+    clock[0] = 111.0
+    reporter.poll_once()
+
+    assert "\n" not in stream.getvalue()
+    assert stream.getvalue().count("\r") == 2
+    reporter.close()
+
+
+def test_stage_switch_freezes_completion_and_starts_new_tty_line(tmp_path: Path) -> None:
+    run_dir = _make_run(tmp_path, stage="colmap")
+
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    stream = TTY()
+    reporter = TerminalProgress("auto", stream=stream, env={"TERM": "x"})
+    reporter.bind_run(run_dir)
+    reporter.poll_once(force=True)
+    _activate_stage(run_dir, "formal-training")
+    reporter.poll_once()
+
+    output = stream.getvalue()
+    assert "完成" in output
+    assert "\nformal training" in output
+    reporter.close()
+
+
+def test_plain_stage_switch_is_low_noise_but_keeps_completion_line(tmp_path: Path) -> None:
+    run_dir = _make_run(tmp_path, stage="colmap")
+    clock = [100.0]
+    stream = io.StringIO()
+    reporter = TerminalProgress("plain", stream=stream, env={"TERM": "x"}, now_fn=lambda: clock[0])
+    reporter.bind_run(run_dir)
+    reporter.poll_once(force=True)
+    first = stream.getvalue()
+    reporter.poll_once()
+    assert stream.getvalue() == first
+
+    _activate_stage(run_dir, "formal-training")
+    clock[0] = 101.0
+    reporter.poll_once()
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 3
+    assert "完成" in lines[1]
+    assert "formal training" in lines[2]
+
+    clock[0] = 162.0
+    reporter.poll_once()
+    assert len(stream.getvalue().splitlines()) == 4
+
+
+def test_training_sampling_telemetry_is_real_iteration_not_quality_progress(tmp_path: Path) -> None:
+    run_dir = _make_training_run(tmp_path)
+
+    snapshot = read_progress_snapshot(run_dir, now=110)
+    line = render_progress_line(snapshot, now=110)
+
+    assert snapshot is not None
+    assert snapshot.training.iteration == 3
+    assert snapshot.training.total == 1000
+    assert "camera sampling 3/1000" in line
+    assert "quality" not in line
+    assert line.startswith("[")
+
+
+def test_training_telemetry_fails_closed_for_malformed_symlink_outside_and_old_attempt(
+    tmp_path: Path,
+) -> None:
+    malformed = _make_training_run(tmp_path / "malformed")
+    malformed_events = malformed / "stages" / "convergence-smoke-training" / "attempt-0001" / "model" / "camera_sampling_telemetry-v1.jsonl"
+    malformed_events.write_text("not-json\n", encoding="utf-8")
+    assert read_progress_snapshot(malformed).training.iteration is None
+
+    symlinked = _make_training_run(tmp_path / "symlinked")
+    symlinked_model = symlinked / "stages" / "convergence-smoke-training" / "attempt-0001" / "model"
+    symlinked_events = symlinked_model / "camera_sampling_telemetry-v1.jsonl"
+    outside_events = tmp_path / "symlinked-events.jsonl"
+    outside_events.write_text("{}\n", encoding="utf-8")
+    symlinked_events.unlink()
+    symlinked_events.symlink_to(outside_events)
+    assert read_progress_snapshot(symlinked).training.iteration is None
+
+    outside = _make_training_run(tmp_path / "outside")
+    outside_attempt = outside / "stages" / "convergence-smoke-training" / "attempt-0001"
+    outside_model = tmp_path / "outside-model"
+    _write_sampling_events(outside_model, 1)
+    (outside_attempt / "executor" / "request.json").write_text(
+        json.dumps({"stage": "training", "iterations": 1000, "model_path": str(outside_model)}),
+        encoding="utf-8",
+    )
+    assert read_progress_snapshot(outside).training.iteration is None
+
+    old_attempt = _make_training_run(tmp_path / "old-attempt")
+    current_attempt = old_attempt / "stages" / "convergence-smoke-training" / "attempt-0002"
+    current_model = current_attempt / "model"
+    (current_attempt / "executor").mkdir(parents=True)
+    (current_attempt / "executor" / "request.json").write_text(
+        json.dumps({"stage": "training", "iterations": 1000, "model_path": str(current_model)}),
+        encoding="utf-8",
+    )
+    (old_attempt / "run.json").write_text(
+        json.dumps(
+            {
+                "created_at": _stamp(0),
+                "updated_at": _stamp(110),
+                "status": "running",
+                "active_stage": "convergence-smoke-training",
+                "active_attempt": "attempt-0002",
+                "stages": {
+                    "convergence-smoke-training": [
+                        {"attempt": "attempt-0001", "status": "blocked"},
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert read_progress_snapshot(old_attempt).training.iteration is None
 
 
 def test_atomic_json_transient_read_error_keeps_last_good_snapshot(tmp_path: Path) -> None:
@@ -263,7 +514,7 @@ def test_tty_plain_off_no_color_and_stage_change_heartbeat_behavior(tmp_path: Pa
     assert "formal training" in heartbeat_stream.getvalue()
     clock[0] = 162.0
     plain.poll_once()
-    assert heartbeat_stream.getvalue().count("\n") == 3
+    assert heartbeat_stream.getvalue().count("\n") == 4
 
 
 def test_download_callback_reports_only_sizes_without_url(tmp_path: Path) -> None:
