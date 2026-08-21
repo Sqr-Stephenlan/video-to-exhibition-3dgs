@@ -90,6 +90,81 @@ def _latest_file(run_root: Path, stage: str, relative: str) -> Path | None:
     return None
 
 
+def _latest_declared_artifact(run_root: Path, stage: str, field: str) -> Path | None:
+    """Read one artifact only through the latest passed ledger declaration.
+
+    A stage helper may write evidence below its pre-created attempt directory,
+    so validate-only must not infer a path from a historical filename.  The
+    canonical stage result declares the exact path and its artifact SHA; a
+    blocked/failed latest attempt is never reused.
+    """
+
+    summary_path = run_root / "run.json"
+    if summary_path.is_symlink() or not summary_path.is_file():
+        return None
+    summary = _load_json(summary_path, "existing run ledger")
+    entries = summary.get("stages", {}).get(stage, [])
+    if not isinstance(entries, list) or not entries:
+        return None
+    entry = entries[-1]
+    if not isinstance(entry, Mapping) or not isinstance(entry.get("result_path"), str):
+        _fail(f"{stage} ledger entry does not declare its canonical result path")
+    if entry.get("status") != "passed":
+        return None
+    canonical_path = Path(str(entry["result_path"]))
+    if not canonical_path.is_absolute():
+        canonical_path = run_root / canonical_path
+    _reject_symlink_components(canonical_path, f"{stage} canonical result")
+    try:
+        canonical_path.resolve(strict=False).relative_to(run_root.resolve())
+    except ValueError:
+        _fail(f"{stage} canonical result escapes the run: {canonical_path}")
+    attempt = canonical_path.parent
+    if attempt.parent.name != stage or _attempt_number(attempt) < 0:
+        _fail(f"{stage} canonical result is not below an attempt directory: {canonical_path}")
+    if entry.get("attempt") != attempt.name:
+        _fail(f"{stage} ledger attempt identity differs from its result path")
+    if canonical_path.is_symlink() or not canonical_path.is_file():
+        return None
+    canonical = _load_json(canonical_path, f"{stage} canonical result")
+    if canonical.get("stage") != stage:
+        _fail(f"{stage} canonical result declares a different stage")
+    if canonical.get("status") != "passed":
+        return None
+    result = canonical.get("result")
+    if not isinstance(result, Mapping) or result.get("computed_pass") is not True:
+        _fail(f"{stage} canonical result is not a passed reusable record")
+    value = result.get(field)
+    if not isinstance(value, str):
+        _fail(f"{stage} canonical result does not declare {field}")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        _fail(f"{stage} declared {field} must be absolute: {candidate}")
+    _reject_symlink_components(candidate, f"{stage} declared {field}")
+    try:
+        candidate.resolve(strict=False).relative_to(attempt.resolve())
+    except ValueError:
+        _fail(f"{stage} declared {field} escapes its attempt: {candidate}")
+    if candidate.is_symlink() or not candidate.is_file():
+        _fail(f"{stage} declared {field} is missing or symlinked: {candidate}")
+    actual_sha = sha256_file(candidate)
+    artifacts = result.get("artifacts")
+    if not isinstance(artifacts, list):
+        _fail(f"{stage} canonical result has no artifact inventory")
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        artifact_path = artifact.get("path")
+        artifact_sha = artifact.get("sha256")
+        if not isinstance(artifact_path, str) or not isinstance(artifact_sha, str):
+            continue
+        declared = Path(artifact_path)
+        _reject_symlink_components(declared, f"{stage} artifact inventory")
+        if declared.resolve(strict=False) == candidate.resolve(strict=False) and artifact_sha == actual_sha:
+            return candidate
+    _fail(f"{stage} declared {field} is not bound to a matching artifact SHA")
+
+
 def _stage(
     name: str,
     status: str,
@@ -448,7 +523,11 @@ def validate_existing_run(
     else:
         stage_results["converted-eval"] = _stage("converted-eval", "unavailable", False, "no converted evaluator result was found")
 
-    postprocess_path = _latest_file(run, "converted-eval-postprocess", "postprocess_result.json")
+    postprocess_path = _latest_declared_artifact(
+        run,
+        "converted-eval-postprocess",
+        "postprocess_result_path",
+    )
     if postprocess_path is not None:
         postprocess = _load_json(postprocess_path, "CPU postprocess result")
         # CPU recovery is a technical contract.  Manual/rough visual review

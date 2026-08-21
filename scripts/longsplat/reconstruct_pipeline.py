@@ -3336,12 +3336,13 @@ def _converted_eval_postprocess_stage(
 
         conversion_result_path = Path(conversion_root) / "conversion_result.json"
         converted_ply = _conversion_ply_from_result(conversion)
+        evidence_root = attempt / "evidence"
         result = run_postprocess(
             authority_manifest_path=authority_path,
             conversion_result_path=conversion_result_path,
             converted_ply_path=converted_ply,
             failed_evaluation_root=executor_root,
-            output_root=attempt,
+            output_root=evidence_root,
             route_root=route,
             containment_root=ledger.run_dir,
         )
@@ -3363,11 +3364,11 @@ def _converted_eval_postprocess_stage(
             computed_pass=normalized["STRUCTURAL_EVALUATION_PASS"] is True,
             reason="CPU streaming postprocess passed structural validation" if normalized["STRUCTURAL_EVALUATION_PASS"] is True else "CPU streaming postprocess has no usable structural candidate",
             plan=False,
-            artifacts=_artifacts([attempt / "postprocess_result.json", attempt / "metrics.json", attempt / "png_hashes.json", attempt / "fixed_gt_native_converted_contact_sheet.png"]),
+            artifacts=_artifacts([evidence_root / "postprocess_result.json", evidence_root / "metrics.json", evidence_root / "png_hashes.json", evidence_root / "fixed_gt_native_converted_contact_sheet.png"]),
             gpu_invoked=False,
             render_reused=True,
             cuda_rerun=False,
-            postprocess_result_path=str(attempt / "postprocess_result.json"),
+            postprocess_result_path=str(evidence_root / "postprocess_result.json"),
             postprocess_result=result,
             visual_quality_pass=normalized["visual_quality_pass"],
             legacy_compatibility_warnings=normalized["legacy_compatibility_warnings"],

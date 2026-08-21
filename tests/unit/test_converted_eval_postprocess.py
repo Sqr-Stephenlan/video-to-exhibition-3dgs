@@ -15,6 +15,7 @@ from scripts.longsplat.converted_eval_postprocess import (
     create_candidate_from_postprocess,
     run_postprocess,
 )
+from scripts.longsplat.pipeline_contract import RunLedger
 from tests.unit.test_authority_manifest import _fixture
 
 
@@ -39,6 +40,46 @@ def _write_reused_eval_evidence(route: Path, name: str, camera_names: list[str],
     (root / "stdout.log").write_text("", encoding="utf-8")
     (root / "stderr.log").write_text("", encoding="utf-8")
     return root, gt_root, converted_root
+
+
+def _postprocess_inputs(
+    tmp_path: Path,
+    name: str,
+    camera_names: list[str],
+    width: int,
+    height: int,
+) -> tuple[Path, Path, Path, Path, Path]:
+    _manifest, authority_path, route = _fixture(
+        tmp_path,
+        name,
+        camera_names=camera_names,
+        width=width,
+        height=height,
+    )
+    failed_root, _gt_root, _converted_root = _write_reused_eval_evidence(
+        route, name, camera_names, width, height
+    )
+    conversion_root = route / "outputs" / name / "conversion"
+    conversion_root.mkdir(parents=True)
+    ply = conversion_root / "point_cloud.ply"
+    ply.write_bytes(b"technical-ply")
+    conversion_result = conversion_root / "conversion_result.json"
+    conversion_result.write_text(
+        json.dumps(
+            {
+                "STRUCTURAL_CONVERSION_PASS": True,
+                "structural_pass": True,
+                "structural": {
+                    "path": str(ply),
+                    "sha256": hashlib.sha256(ply.read_bytes()).hexdigest(),
+                    "file_size": ply.stat().st_size,
+                    "vertex_count": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return authority_path, route, failed_root, ply, conversion_result
 
 
 def test_streaming_postprocess_uses_dynamic_order_and_marks_cpu_reuse(tmp_path: Path) -> None:
@@ -75,13 +116,19 @@ def test_streaming_postprocess_uses_dynamic_order_and_marks_cpu_reuse(tmp_path: 
         encoding="utf-8",
     )
 
+    run_dir = route / "outputs" / "streaming"
+    ledger = RunLedger(run_dir, identity={}, resumed=False)
+    attempt = ledger.begin_attempt("converted-eval-postprocess", {"fixture": True})
+    evidence_root = attempt / "evidence"
+
     result = run_postprocess(
         authority_manifest_path=authority_path,
         conversion_result_path=conversion_result,
         converted_ply_path=ply,
         failed_evaluation_root=failed_root,
-        output_root=route / "outputs" / "streaming" / "converted-eval-postprocess" / "attempt-0001",
+        output_root=evidence_root,
         route_root=route,
+        containment_root=run_dir,
     )
 
     assert result["STRUCTURAL_EVALUATION_PASS"] is True
@@ -98,7 +145,32 @@ def test_streaming_postprocess_uses_dynamic_order_and_marks_cpu_reuse(tmp_path: 
     # theoretical full-resolution-frame estimate is reported.
     assert result["full_stream_validation"]["resident_full_resolution_frame_max"] is None
     assert result["metrics"]["path"].endswith("/metrics.json")
+    assert Path(result["metrics"]["path"]).parent == evidence_root
+    assert Path(result["png_hashes"]["path"]).parent == evidence_root
     assert Path(result["contact_sheet"]["path"]).is_file()
+    postprocess_path = evidence_root / "postprocess_result.json"
+    assert postprocess_path.is_file()
+    assert not (attempt / "result.json").exists()
+    ledger.finish_attempt(
+        stage="converted-eval-postprocess",
+        attempt=attempt,
+        status="passed",
+        result={
+            "computed_pass": True,
+            "postprocess_result_path": str(postprocess_path.resolve()),
+            "artifacts": [
+                {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in (
+                    postprocess_path,
+                    evidence_root / "metrics.json",
+                    evidence_root / "png_hashes.json",
+                    evidence_root / "fixed_gt_native_converted_contact_sheet.png",
+                )
+            ],
+        },
+    )
+    assert (attempt / "result.json").is_file()
+    assert ledger.latest_result("converted-eval-postprocess") is not None
     rows = json.loads((Path(result["metrics"]["path"])).read_text(encoding="utf-8"))["per_view"]
     assert [row["camera_name"] for row in rows] == camera_names
 
@@ -230,9 +302,33 @@ def test_postprocess_attempt_is_append_only(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    output = route / "outputs" / "fresh" / "converted-eval-postprocess" / "attempt-0001"
+    output = route / "outputs" / "fresh" / "converted-eval-postprocess" / "attempt-0001" / "evidence"
     output.mkdir(parents=True)
     with pytest.raises(ConvertedEvalPostprocessError, match="fresh and append-only"):
+        run_postprocess(
+            authority_manifest_path=authority_path,
+            conversion_result_path=conversion_result,
+            converted_ply_path=ply,
+            failed_evaluation_root=failed_root,
+            output_root=output,
+            route_root=route,
+        )
+
+
+@pytest.mark.parametrize("kind", ["symlink", "escape"])
+def test_postprocess_child_symlink_or_escape_is_blocked(tmp_path: Path, kind: str) -> None:
+    authority_path, route, failed_root, ply, conversion_result = _postprocess_inputs(
+        tmp_path, f"unsafe-{kind}", ["only"], 13, 9
+    )
+    if kind == "symlink":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        output = route / "outputs" / f"unsafe-{kind}" / "converted-eval-postprocess" / "attempt-0001" / "evidence"
+        output.parent.mkdir(parents=True)
+        output.symlink_to(outside, target_is_directory=True)
+    else:
+        output = tmp_path / "outside" / "converted-eval-postprocess" / "attempt-0001"
+    with pytest.raises(ConvertedEvalPostprocessError, match="symlink|below route outputs|escapes"):
         run_postprocess(
             authority_manifest_path=authority_path,
             conversion_result_path=conversion_result,

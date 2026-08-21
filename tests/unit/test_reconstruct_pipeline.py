@@ -17,6 +17,7 @@ from scripts.longsplat.reconstruct_pipeline import (
     _convergence_consumer_binding,
     _compare_convergence_binding,
     _convergence_plan_matches_consumer,
+    _converted_eval_postprocess_stage,
     _diagnostic_consumer_resume_allowed,
     _input_video_identity,
     _formal_input,
@@ -29,7 +30,11 @@ from scripts.longsplat.reconstruct_pipeline import (
     _visual_decision_valid,
     run_reconstruction,
 )
-from scripts.longsplat.reconstruct_validation import validate_existing_run
+from scripts.longsplat.reconstruct_validation import (
+    ExistingRunValidationError,
+    _latest_declared_artifact,
+    validate_existing_run,
+)
 
 
 def _source(tmp_path: Path) -> Path:
@@ -365,6 +370,133 @@ def test_run_ledger_canonical_result_remains_exclusive(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         ledger.finish_attempt(stage="coverage-smoke-plan", attempt=attempt, status="passed", result={"changed": True})
     assert (attempt / "result.json").read_text(encoding="utf-8") == original
+
+
+def test_converted_postprocess_binds_fresh_evidence_child_and_does_not_reuse_failed_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import scripts.longsplat.conversion_evidence_schema as evidence_schema
+
+    route = tmp_path / "route"
+    run_dir = route / "outputs" / "run"
+    run_dir.mkdir(parents=True)
+    authority_path = run_dir / "authority.json"
+    authority_path.write_text("{}\n", encoding="utf-8")
+    conversion_root = run_dir / "conversion"
+    conversion_root.mkdir()
+    ply = conversion_root / "point_cloud.ply"
+    ply.write_bytes(b"ply")
+    evaluation_root = run_dir / "evaluation"
+    evaluation_root.mkdir()
+    ledger = RunLedger(run_dir, identity={}, resumed=False)
+    observed: dict[str, Path] = {}
+
+    def fake_run_postprocess(**kwargs: object) -> dict[str, object]:
+        output = Path(str(kwargs["output_root"]))
+        observed["output"] = output
+        assert output.name == "evidence"
+        assert output.parent.name == "attempt-0001"
+        output.mkdir()
+        for name in (
+            "postprocess_result.json",
+            "metrics.json",
+            "png_hashes.json",
+            "fixed_gt_native_converted_contact_sheet.png",
+        ):
+            (output / name).write_bytes(name.encode("ascii"))
+        return {
+            "STRUCTURAL_EVALUATION_PASS": True,
+            "FULL_STREAM_VALIDATION_PASS": True,
+            "visual_quality_pass": True,
+        }
+
+    monkeypatch.setattr(
+        "scripts.longsplat.converted_eval_postprocess.run_postprocess",
+        fake_run_postprocess,
+    )
+    monkeypatch.setattr(
+        evidence_schema,
+        "normalize_converted_evaluation",
+        lambda *_args, **_kwargs: {
+            "STRUCTURAL_EVALUATION_PASS": True,
+            "visual_quality_pass": True,
+            "legacy_compatibility_warnings": [],
+        },
+    )
+
+    stage, status = _converted_eval_postprocess_stage(
+        ledger=ledger,
+        route=route,
+        authority={
+            "authority_manifest_path": str(authority_path),
+            "camera_count": 2,
+            "camera_order": ["left", "right"],
+            "camera_dimensions": {"width": 32, "height": 24},
+        },
+        conversion={
+            "executor_root": str(conversion_root),
+            "executor_result": {"structural": {"path": str(ply)}},
+        },
+        evaluation={"executor_root": str(evaluation_root)},
+        plan=False,
+    )
+
+    assert status == "passed"
+    assert stage["postprocess_result_path"] == str((observed["output"] / "postprocess_result.json"))
+    attempt = observed["output"].parent
+    canonical = json.loads((attempt / "result.json").read_text(encoding="utf-8"))
+    assert canonical["schema_version"] == "stage-attempt-result-v1"
+    assert canonical["result"]["postprocess_result_path"] == stage["postprocess_result_path"]
+    assert all(Path(item["path"]).parent == observed["output"] for item in canonical["result"]["artifacts"])
+    assert not (attempt / "postprocess_result.json").exists()
+
+    failed_attempt = ledger.begin_attempt("converted-eval-postprocess", {"fixture": "failed"})
+    ledger.finish_attempt(
+        stage="converted-eval-postprocess",
+        attempt=failed_attempt,
+        status="blocked",
+        result={"computed_pass": False, "artifacts": []},
+    )
+    fresh_attempt = ledger.begin_attempt("converted-eval-postprocess", {"fixture": "retry"})
+    assert fresh_attempt != failed_attempt
+    assert ledger.latest_result("converted-eval-postprocess") is None
+
+
+def test_validate_only_requires_declared_postprocess_sha_and_latest_passed_attempt(tmp_path: Path) -> None:
+    run_dir = tmp_path / "outputs" / "run"
+    run_dir.mkdir(parents=True)
+    ledger = RunLedger(run_dir, identity={}, resumed=False)
+    attempt = ledger.begin_attempt("converted-eval-postprocess", {"fixture": True})
+    evidence = attempt / "evidence"
+    evidence.mkdir()
+    postprocess = evidence / "postprocess_result.json"
+    postprocess.write_text("{\"pass\": true}\n", encoding="utf-8")
+    ledger.finish_attempt(
+        stage="converted-eval-postprocess",
+        attempt=attempt,
+        status="passed",
+        result={
+            "computed_pass": True,
+            "postprocess_result_path": str(postprocess.resolve()),
+            "artifacts": [{
+                "path": str(postprocess.resolve()),
+                "sha256": hashlib.sha256(postprocess.read_bytes()).hexdigest(),
+            }],
+        },
+    )
+    assert _latest_declared_artifact(run_dir, "converted-eval-postprocess", "postprocess_result_path") == postprocess
+    postprocess.write_text("{\"pass\": false}\n", encoding="utf-8")
+    with pytest.raises(ExistingRunValidationError, match="matching artifact SHA"):
+        _latest_declared_artifact(run_dir, "converted-eval-postprocess", "postprocess_result_path")
+
+    failed_attempt = ledger.begin_attempt("converted-eval-postprocess", {"fixture": "failed"})
+    ledger.finish_attempt(
+        stage="converted-eval-postprocess",
+        attempt=failed_attempt,
+        status="blocked",
+        result={"computed_pass": False, "artifacts": []},
+    )
+    assert _latest_declared_artifact(run_dir, "converted-eval-postprocess", "postprocess_result_path") is None
 
 
 def test_coverage_helper_exception_marks_authoritative_run_blocked(tmp_path: Path) -> None:
@@ -950,7 +1082,10 @@ def test_validate_only_reuses_dynamic_authority_candidate_and_cpu_recovery(tmp_p
     (conversion_stage / "conversion_result.json").write_text(json.dumps(conversion), encoding="utf-8")
     post_stage = run_root / "stages" / "converted-eval-postprocess" / "attempt-0001"
     post_stage.mkdir(parents=True)
-    (post_stage / "postprocess_result.json").write_text(
+    postprocess_evidence = post_stage / "evidence"
+    postprocess_evidence.mkdir()
+    postprocess_path = postprocess_evidence / "postprocess_result.json"
+    postprocess_path.write_text(
         json.dumps(
             {
                 "STRUCTURAL_EVALUATION_PASS": True,
@@ -960,6 +1095,39 @@ def test_validate_only_reuses_dynamic_authority_candidate_and_cpu_recovery(tmp_p
                 "render_reused": True,
                 "cuda_rerun": False,
                 "full_stream_validation": {"resident_full_resolution_frame_max": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+    postprocess_sha = hashlib.sha256(postprocess_path.read_bytes()).hexdigest()
+    (post_stage / "result.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage-attempt-result-v1",
+                "stage": "converted-eval-postprocess",
+                "status": "passed",
+                "result": {
+                    "computed_pass": True,
+                    "postprocess_result_path": str(postprocess_path.resolve()),
+                    "artifacts": [{"path": str(postprocess_path.resolve()), "sha256": postprocess_sha}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_root / "run.json").write_text(
+        json.dumps(
+            {
+                "stages": {
+                    "converted-eval-postprocess": [
+                        {
+                            "attempt": "attempt-0001",
+                            "status": "passed",
+                            "result_path": str((post_stage / "result.json").relative_to(run_root)),
+                        }
+                    ]
+                },
+                "gpu_invoked": True,
             }
         ),
         encoding="utf-8",
