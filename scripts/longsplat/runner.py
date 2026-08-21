@@ -8,14 +8,25 @@ and records full provenance.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os as _os
 import re
+import selectors
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .conversion_observability import (
+    AppendOnlyProgress,
+    ConversionStreamCapture,
+    ObservabilityPathError,
+    open_exclusive_binary,
+    validate_observability_file,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +125,210 @@ def backend_subprocess_env(repo_root: str | Path) -> dict[str, str]:
     previous = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = root if not previous else root + _os.pathsep + previous
     return env
+
+
+def _reap_child(process: subprocess.Popen[bytes], *, terminate: bool) -> None:
+    """Reap one child, terminating only that child when requested."""
+
+    if terminate and process.poll() is None:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait(timeout=5.0)
+
+
+def _observability_paths(
+    *,
+    observability_root: str | Path | None,
+    live_stdout_path: str | Path | None,
+    live_stderr_path: str | Path | None,
+    progress_path: str | Path | None,
+) -> tuple[Path | None, Path | None, Path | None]:
+    paths = (live_stdout_path, live_stderr_path, progress_path)
+    if not any(path is not None for path in paths):
+        return None, None, None
+    if observability_root is None:
+        raise BackendValidationError(
+            "conversion observability paths require an observability root"
+        )
+    resolved: list[Path | None] = []
+    labels = ("live stdout log", "live stderr log", "conversion progress sidecar")
+    try:
+        for path, label in zip(paths, labels):
+            resolved.append(
+                None
+                if path is None
+                else validate_observability_file(path, root=observability_root, label=label)
+            )
+    except ObservabilityPathError as exc:
+        raise BackendValidationError(str(exc)) from exc
+    concrete = [path for path in resolved if path is not None]
+    if len({str(path) for path in concrete}) != len(concrete):
+        raise BackendValidationError("conversion observability paths must be distinct")
+    return tuple(resolved)  # type: ignore[return-value]
+
+
+def _run_conversion_streaming(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    total: int,
+    observability_root: str | Path | None,
+    live_stdout_path: str | Path | None,
+    live_stderr_path: str | Path | None,
+    progress_path: str | Path | None,
+) -> subprocess.CompletedProcess[str]:
+    """Run conversion with deadlock-safe byte drains and bounded text tails."""
+
+    stdout_path, stderr_path, sidecar_path = _observability_paths(
+        observability_root=observability_root,
+        live_stdout_path=live_stdout_path,
+        live_stderr_path=live_stderr_path,
+        progress_path=progress_path,
+    )
+    started = time.monotonic()
+    stdout_live = None
+    stderr_live = None
+    progress = None
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
+    captures: dict[str, ConversionStreamCapture] = {}
+
+    def elapsed() -> float:
+        return time.monotonic() - started
+
+    def on_marker(stream: str, raw_marker: str, fields: dict[str, Any]) -> None:
+        if progress is not None:
+            progress.append_marker(
+                stream=stream,
+                raw_marker=raw_marker,
+                fields=fields,
+                elapsed=elapsed(),
+            )
+
+    try:
+        if stdout_path is not None:
+            stdout_live = open_exclusive_binary(
+                stdout_path,
+                label="conversion live stdout log",
+                append=True,
+            )
+        if stderr_path is not None:
+            stderr_live = open_exclusive_binary(
+                stderr_path,
+                label="conversion live stderr log",
+                append=True,
+            )
+        if sidecar_path is not None:
+            progress = AppendOnlyProgress(
+                sidecar_path,
+                total=total,
+                started_monotonic=started,
+            )
+
+        child_env = dict(env)
+        # This is the only child-environment addition.  CUDA, random, and
+        # algorithm-related variables remain inherited unchanged.
+        child_env["PYTHONUNBUFFERED"] = "1"
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=child_env,
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        if progress is not None:
+            progress.append_started(pid=int(process.pid), elapsed=elapsed())
+
+        if process.stdout is None or process.stderr is None:
+            raise OSError("conversion child pipes were not created")
+        captures = {
+            "stdout": ConversionStreamCapture(stream="stdout", on_marker=on_marker),
+            "stderr": ConversionStreamCapture(stream="stderr", on_marker=on_marker),
+        }
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        live_handles = {"stdout": stdout_live, "stderr": stderr_live}
+
+        while selector.get_map():
+            for key, _ in selector.select(timeout=0.25):
+                stream = str(key.data)
+                try:
+                    data = _os.read(key.fileobj.fileno(), 64 * 1024)
+                except OSError as exc:
+                    if exc.errno in {errno.EIO, errno.EBADF}:
+                        data = b""
+                    else:
+                        raise
+                if not data:
+                    try:
+                        selector.unregister(key.fileobj)
+                    except (KeyError, ValueError):
+                        pass
+                    captures[stream].finish()
+                    continue
+                live_handle = live_handles[stream]
+                if live_handle is not None:
+                    live_handle.write(data)
+                    live_handle.flush()
+                captures[stream].feed(data)
+
+        returncode = int(process.wait())
+        captures["stdout"].finish()
+        captures["stderr"].finish()
+        if progress is not None:
+            progress.append_exited(returncode=returncode, elapsed=elapsed())
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            stdout=captures["stdout"].tail,
+            stderr=captures["stderr"].tail,
+        )
+    except BaseException as exc:
+        if progress is not None:
+            try:
+                progress.append_parent_error(
+                    error_type=type(exc).__name__,
+                    elapsed=elapsed(),
+                )
+            except BaseException:
+                pass
+        if process is not None and process.poll() is None:
+            _reap_child(process, terminate=True)
+        raise
+    finally:
+        if process is not None and process.poll() is None:
+            _reap_child(process, terminate=True)
+        if selector is not None:
+            for key in list(selector.get_map().values()):
+                try:
+                    selector.unregister(key.fileobj)
+                except (KeyError, ValueError):
+                    pass
+            selector.close()
+        if process is not None:
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+        for handle in (stdout_live, stderr_live):
+            if handle is not None:
+                handle.flush()
+                _os.fsync(handle.fileno())
+                handle.close()
+        if progress is not None:
+            progress.close()
 
 
 # ---------------------------------------------------------------------------
@@ -533,8 +748,13 @@ def run_conversion(
     config: LongSplatConfig,
     python_exe: str = "python",
     commands: EffectiveCommands | None = None,
+    *,
+    observability_root: str | Path | None = None,
+    live_stdout_path: str | Path | None = None,
+    live_stderr_path: str | Path | None = None,
+    progress_path: str | Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Execute LongSplat convert_3dgs.  Blocks until completion."""
+    """Execute LongSplat convert_3dgs with optional live observation files."""
     validated = _check_repo(repo_root, backend_mode=config.backend_mode)
     _check_python(python_exe)
     _validate_config(config)
@@ -548,12 +768,15 @@ def run_conversion(
             python_exe,
         )
     )
-    return subprocess.run(
+    return _run_conversion_streaming(
         cmd,
-        capture_output=True,
-        text=True,
         cwd=str(validated),
         env=backend_subprocess_env(validated),
+        total=config.iterations,
+        observability_root=observability_root,
+        live_stdout_path=live_stdout_path,
+        live_stderr_path=live_stderr_path,
+        progress_path=progress_path,
     )
 
 

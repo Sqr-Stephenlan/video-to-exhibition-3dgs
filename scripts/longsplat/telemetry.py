@@ -6,6 +6,7 @@ import json
 import math
 import re
 from numbers import Real
+from pathlib import Path
 from typing import Any
 
 
@@ -131,10 +132,8 @@ def summarize_vda_telemetry(stdout: str) -> dict[str, Any]:
     }
 
 
-def summarize_conversion_telemetry(stdout: str) -> dict[str, Any]:
-    """Report whether every emitted conversion record has finite scales."""
-    records = parse_json_markers(stdout, "CONVERSION_TELEMETRY")
-
+def _conversion_telemetry_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the existing conversion telemetry summary from parsed records."""
     def _all_record_scales_finite(record: dict[str, Any]) -> bool:
         point_count = _finite_number(record.get("point_count"))
         finite_count = _finite_number(record.get("finite_scale_count"))
@@ -150,6 +149,20 @@ def summarize_conversion_telemetry(stdout: str) -> dict[str, Any]:
         and all(_all_record_scales_finite(record) for record in records),
         "records": records,
     }
+
+
+def summarize_conversion_telemetry(stdout: str) -> dict[str, Any]:
+    """Report whether every emitted conversion record has finite scales."""
+    return _conversion_telemetry_summary(parse_json_markers(stdout, "CONVERSION_TELEMETRY"))
+
+
+def summarize_conversion_telemetry_file(path: str | Path) -> dict[str, Any]:
+    """Summarize the complete live stdout log without loading it all at once."""
+    records: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            records.extend(parse_json_markers(line, "CONVERSION_TELEMETRY"))
+    return _conversion_telemetry_summary(records)
 
 
 def summarize_loss_telemetry(stdout: str) -> dict[str, Any]:

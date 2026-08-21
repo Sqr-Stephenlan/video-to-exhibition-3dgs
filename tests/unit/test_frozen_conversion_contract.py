@@ -114,6 +114,14 @@ def test_conversion_argv_freezes_all_authorized_parameters(tmp_path: Path) -> No
     assert command[0:4] == [str(paths["route"] / "dev.sh"), "python", "-m", "scripts.longsplat.reconvert_existing"]
     assert nested[1] == str(paths["nested"] / "convert_3dgs.py")
     for flag, value in (
+        ("--conversion-observability-root", str(evidence)),
+        ("--conversion-live-stdout", str(evidence / "conversion-stdout-live.log")),
+        ("--conversion-live-stderr", str(evidence / "conversion-stderr-live.log")),
+        ("--conversion-progress", str(evidence / "conversion-progress-v1.jsonl")),
+    ):
+        index = command.index(flag)
+        assert command[index + 1] == value
+    for flag, value in (
         ("--iteration", "30000"),
         ("--prune_ratio", "0.6"),
         ("--seed", "0"),

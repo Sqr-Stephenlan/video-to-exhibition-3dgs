@@ -49,6 +49,53 @@ def _sha256_hex(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _reject_observability_symlinks(path: Path, label: str) -> None:
+    probe = Path(path.anchor)
+    for component in path.parts[1:]:
+        probe /= component
+        if probe.is_symlink():
+            raise ValueError(f"{label} traverses a symlink: {probe}")
+
+
+def _validate_observability_paths(
+    *,
+    root: Path,
+    output_record: Path,
+    live_stdout: Path,
+    live_stderr: Path,
+    progress: Path,
+) -> tuple[Path, Path, Path, Path]:
+    """Bind live files to this exact fresh conversion evidence directory."""
+
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"conversion observability root is missing or symlinked: {root}")
+    if root.resolve() != output_record.parent.resolve():
+        raise ValueError(
+            "conversion observability root must equal output-record parent: "
+            f"{root} != {output_record.parent.resolve()}"
+        )
+    paths = (live_stdout, live_stderr, progress)
+    if len({str(path) for path in paths}) != len(paths):
+        raise ValueError("conversion observability paths must be distinct")
+    root_resolved = root.resolve(strict=True)
+    for path, label in zip(
+        paths,
+        ("conversion live stdout log", "conversion live stderr log", "conversion progress sidecar"),
+    ):
+        if not path.is_absolute():
+            raise ValueError(f"{label} must be absolute: {path}")
+        _reject_observability_symlinks(path, label)
+        if path.exists() or path.is_symlink():
+            raise ValueError(f"{label} must be fresh: {path}")
+        if not path.parent.is_dir() or path.parent.is_symlink():
+            raise ValueError(f"{label} parent is missing or symlinked: {path.parent}")
+        try:
+            path.parent.resolve(strict=True).relative_to(root_resolved)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{label} is outside conversion evidence root: {path}") from exc
+    return root, live_stdout, live_stderr, progress
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -173,6 +220,10 @@ def _argparser() -> argparse.ArgumentParser:
     parser.add_argument("--anisotropy-soft-limit", default=30.0, type=float)
     parser.add_argument("--backend-mode", default="research_local", type=str)
     parser.add_argument("--output-record", required=True, type=Path)
+    parser.add_argument("--conversion-observability-root", type=Path)
+    parser.add_argument("--conversion-live-stdout", type=Path)
+    parser.add_argument("--conversion-live-stderr", type=Path)
+    parser.add_argument("--conversion-progress", type=Path)
     parser.add_argument(
         "--precreated-snapshot",
         action="store_true",
@@ -244,6 +295,41 @@ def main(argv: list[str] | None = None) -> None:
         backend_mode = str(args.backend_mode)
     destination_model = args.destination_model.resolve()
     output_record = args.output_record.resolve()
+
+    observability_root: Path | None = None
+    live_stdout_path: Path | None = None
+    live_stderr_path: Path | None = None
+    progress_path: Path | None = None
+    observation_values = (
+        args.conversion_observability_root,
+        args.conversion_live_stdout,
+        args.conversion_live_stderr,
+        args.conversion_progress,
+    )
+    if any(value is not None for value in observation_values):
+        if not all(value is not None for value in observation_values):
+            print(
+                "ERROR: conversion observability root, live stdout, live stderr, "
+                "and progress paths must be supplied together",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        observability_root = Path(args.conversion_observability_root).absolute()
+        live_stdout_path = Path(args.conversion_live_stdout).absolute()
+        live_stderr_path = Path(args.conversion_live_stderr).absolute()
+        progress_path = Path(args.conversion_progress).absolute()
+        if not args.dry_run:
+            try:
+                _validate_observability_paths(
+                    root=observability_root,
+                    output_record=output_record,
+                    live_stdout=live_stdout_path,
+                    live_stderr=live_stderr_path,
+                    progress=progress_path,
+                )
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                sys.exit(1)
 
     if output_record.exists():
         print(f"ERROR: output record already exists: {output_record}", file=sys.stderr)
@@ -346,6 +432,10 @@ def main(argv: list[str] | None = None) -> None:
             repo_root_resolved,
             config,
             str(args.backend_python),
+            observability_root=observability_root,
+            live_stdout_path=live_stdout_path,
+            live_stderr_path=live_stderr_path,
+            progress_path=progress_path,
         )
     except (BackendIdentityError, BackendValidationError, OSError) as exc:
         record["status"] = "failed"
@@ -363,6 +453,12 @@ def main(argv: list[str] | None = None) -> None:
         "stdout_last_2000": result.stdout[-2000:] if result.stdout else "",
         "stderr_last_2000": result.stderr[-2000:] if result.stderr else "",
     }
+    if live_stdout_path is not None:
+        record["conversion"]["live_stdout_path"] = str(live_stdout_path)
+    if live_stderr_path is not None:
+        record["conversion"]["live_stderr_path"] = str(live_stderr_path)
+    if progress_path is not None:
+        record["conversion"]["progress_path"] = str(progress_path)
 
     # Step 4: validate output PLY
     failure_code = result.returncode
@@ -378,9 +474,14 @@ def main(argv: list[str] | None = None) -> None:
                 record["validation_error"] = str(exc)
                 failure_code = 1
 
-            from scripts.longsplat.telemetry import summarize_conversion_telemetry
+            if live_stdout_path is not None and live_stdout_path.is_file():
+                from scripts.longsplat.telemetry import summarize_conversion_telemetry_file
 
-            telemetry = summarize_conversion_telemetry(result.stdout)
+                telemetry = summarize_conversion_telemetry_file(live_stdout_path)
+            else:
+                from scripts.longsplat.telemetry import summarize_conversion_telemetry
+
+                telemetry = summarize_conversion_telemetry(result.stdout)
             record["conversion_telemetry"] = telemetry
         else:
             record["conversion_error"] = "converted PLY not found"

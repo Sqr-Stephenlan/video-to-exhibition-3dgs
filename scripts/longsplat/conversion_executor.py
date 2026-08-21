@@ -231,6 +231,14 @@ def _build_conversion_argv(
         "--output-record",
         str(record_path),
         "--precreated-snapshot",
+        "--conversion-observability-root",
+        str(evidence_root),
+        "--conversion-live-stdout",
+        str(evidence_root / "conversion-stdout-live.log"),
+        "--conversion-live-stderr",
+        str(evidence_root / "conversion-stderr-live.log"),
+        "--conversion-progress",
+        str(evidence_root / "conversion-progress-v1.jsonl"),
     ]
     return argv, nested_argv
 
@@ -297,6 +305,14 @@ def build_conversion_argv_for_paths(
         "--output-record",
         str(evidence_root / "conversion_record.json"),
         "--precreated-snapshot",
+        "--conversion-observability-root",
+        str(evidence_root),
+        "--conversion-live-stdout",
+        str(evidence_root / "conversion-stdout-live.log"),
+        "--conversion-live-stderr",
+        str(evidence_root / "conversion-stderr-live.log"),
+        "--conversion-progress",
+        str(evidence_root / "conversion-progress-v1.jsonl"),
     ]
     return argv, nested_argv
 

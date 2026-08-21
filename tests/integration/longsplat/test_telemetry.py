@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from scripts.longsplat.telemetry import (
     parse_json_markers,
     summarize_conversion_telemetry,
+    summarize_conversion_telemetry_file,
     summarize_pose_telemetry,
     summarize_vda_telemetry,
 )
@@ -112,3 +115,17 @@ def test_numeric_summaries_ignore_booleans_strings_and_missing_values():
 
 def test_conversion_without_valid_marker_is_not_reported_finite():
     assert summarize_conversion_telemetry("")["all_scales_finite"] is False
+
+
+def test_conversion_file_summary_reads_complete_live_stdout(tmp_path: Path):
+    path = tmp_path / "conversion-stdout-live.log"
+    lines = [
+        f'CONVERSION_TELEMETRY {{"finite_scale_count":40,"point_count":40,"index":{index}}}\n'
+        for index in range(35)
+    ]
+    path.write_text("".join(lines), encoding="utf-8")
+
+    summary = summarize_conversion_telemetry_file(path)
+
+    assert len(summary["records"]) == 35
+    assert summary["all_scales_finite"] is True

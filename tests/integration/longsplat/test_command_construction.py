@@ -344,12 +344,12 @@ def test_run_conversion_fake_subprocess(tmp_path, smoke_config):
 
     with mock.patch("scripts.longsplat.runner._check_repo", return_value=resolved):
         with mock.patch("scripts.longsplat.runner._check_python"):
-            with mock.patch("subprocess.run") as mock_run:
-                mock_run.return_value = mock.MagicMock(
-                    returncode=0,
-                    stdout="ok",
-                    stderr="",
-                )
+            with mock.patch(
+                "scripts.longsplat.runner._run_conversion_streaming",
+                return_value=_real_CompletedProcess(
+                    ["python"], 0, stdout="ok", stderr=""
+                ),
+            ) as mock_run:
                 run_conversion(str(backend), smoke_config, python_exe="python")
 
     mock_run.assert_called_once()
