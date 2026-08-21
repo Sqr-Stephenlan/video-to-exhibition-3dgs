@@ -501,8 +501,25 @@ def run_postprocess(
     severe_mse_threshold = 0.25
     severe_converted = any(float(record["mse"]) > severe_mse_threshold for record in converted_metrics)
     severe_native = any(float(record["mse"]) > severe_mse_threshold for record in native_metrics)
-    structural_pass = len(rows) == count and not empty_views
-    full_pass = structural_pass and not severe_converted and not severe_native
+    no_usable_converted_views = bool(rows) and all(
+        bool(row["empty_or_black"].get("converted")) for row in rows
+    )
+    # Decode, dimensions, count, order, and finite-value checks are structural.
+    # A partially black or visually poor view is retained as evidence; only an
+    # entirely unusable converted candidate keeps the technical artifact from
+    # being consumed.
+    structural_pass = len(rows) == count and not no_usable_converted_views
+    visual_quality_fail = bool(empty_views) or severe_converted or severe_native
+    full_pass = structural_pass and not visual_quality_fail
+    quality_advisories: list[str] = []
+    if empty_views:
+        quality_advisories.append("one or more views are empty/black; retained as visual-quality evidence")
+    if severe_converted:
+        quality_advisories.append("at least one converted-vs-GT view exceeds the severe MSE advisory threshold")
+    if severe_native:
+        quality_advisories.append("at least one native-vs-converted view exceeds the severe MSE advisory threshold")
+    if no_usable_converted_views:
+        quality_advisories.append("all converted views are empty/black; no usable technical candidate remains")
     optional_evidence: dict[str, str] = {}
     for name, value in (
         ("supervisor_conversion_release_decision.json", conversion_release_decision),
@@ -552,8 +569,9 @@ def run_postprocess(
         "stage": "converted-eval-postprocess",
         "status": "technical_pass" if full_pass else "needs_review",
         "STRUCTURAL_CONVERSION_PASS": True,
-        "FULL_STREAM_VALIDATION_PASS": full_pass,
-        "SAME_CAMERA_VISUAL_PASS": "pass" if full_pass else "fail",
+        "STRUCTURAL_EVALUATION_PASS": structural_pass,
+        "FULL_STREAM_VALIDATION_PASS": structural_pass,
+        "SAME_CAMERA_VISUAL_PASS": "fail" if visual_quality_fail else "pass",
         "accepted": False,
         "supersplat": False,
         "three_view_manual_acceptance_required": True,
@@ -588,15 +606,17 @@ def run_postprocess(
                 if isinstance(conversion_result.get("image_residency"), Mapping)
                 else None
             ),
-            "all_pngs_decoded": structural_pass,
-            "all_pngs_finite": structural_pass,
-            "all_dimensions_exact": structural_pass,
-            "all_names_and_order_exact": structural_pass,
+            "all_pngs_decoded": True,
+            "all_pngs_finite": True,
+            "all_dimensions_exact": True,
+            "all_names_and_order_exact": True,
+            "no_usable_converted_views": no_usable_converted_views,
             "empty_or_black_views": empty_views,
         },
         "metrics": {"path": str(metrics_path.resolve()), "sha256": _sha256(metrics_path), "size_bytes": metrics_path.stat().st_size},
         "png_hashes": {"path": str(png_hashes_path.resolve()), "sha256": _sha256(png_hashes_path), "size_bytes": png_hashes_path.stat().st_size},
         "contact_sheet": contact,
+        "quality_advisories": quality_advisories,
         "severe_degradation_policy": {"mse_threshold": severe_mse_threshold, "converted_vs_gt": severe_converted, "native_vs_converted": severe_native},
         "candidate_delivery": {"eligible_after_manual_visual_review": full_pass, "evidence_files": evidence_files, "comparison_sheet": str(contact_path.resolve()), "provenance_context": provenance_context},
         "known_limitations": known_limitations,

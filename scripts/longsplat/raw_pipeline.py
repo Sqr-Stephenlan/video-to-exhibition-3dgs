@@ -290,82 +290,100 @@ def _component_image_names(component: Path) -> list[str]:
             model = parse_colmap_model_binary(component)
             return [str(item["name"]) for item in model.images.values()]
         except Exception:
+            # Binary components can be valid mapper outputs whose names are
+            # intentionally deferred to the strict model-converter TXT proof;
+            # the selected component is still checked before consumption.
             return []
     return [str(record["name"]) for record in parse_colmap_image_pose_records(path)]
+
+
+class MapperComponentSelectionBlocked(PipelineBlocked):
+    """No safe mapper component remained after the complete inventory scan."""
+
+    def __init__(self, message: str, *, inventory: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.inventory = None if inventory is None else dict(inventory)
 
 
 def _select_mapper_component(
     components: Sequence[Path],
     selected_records: Sequence[Mapping[str, Any]],
 ) -> tuple[Path, list[str], dict[str, Any]]:
-    """Choose one unambiguous temporally contiguous COLMAP component.
+    """Choose one real COLMAP component after a complete candidate inventory.
 
-    The mapper inventory remains authoritative.  Every component is inspected
-    before selection or conflict checks are applied.  A component whose
-    registered-name set is a strict subset of another component is retained in
-    the inventory as a dominated/redundant model, but it cannot create a
-    conflict or win selection.  No component is merged and no count is
-    rewritten.
+    Every component is inspected before selection.  Component overlap, subset,
+    and repeated-model relationships are evidence only: the winner is one
+    complete mapper model, never a merge.  A malformed or otherwise unusable
+    component is eliminated locally; it blocks only when no usable candidate
+    remains.
     """
 
     if len(components) == 1:
         only = components[0].resolve()
-        names = _component_image_names(only)
-        if not names:
-            # A valid binary model may be inspected by the downstream
-            # model-converter TXT contract only after bundle adjustment.  The
-            # one-component fact is still truthful here; names are explicitly
-            # marked deferred rather than guessed or synthesized.
+        try:
+            names = _component_image_names(only)
+        except (PipelineBlocked, OSError, ValueError):
+            # Binary-only components may legitimately defer their image-name
+            # proof to the downstream strict TXT model-converter contract.
+            # A text-side parse failure is not deferred and is inventoried as
+            # an invalid selected candidate below.
+            names = []
+        if (
+            names == []
+            and not (only / "images.txt").is_file()
+            and (only / "images.bin").is_file()
+        ):
+            # A valid binary model may be inspected by the downstream strict
+            # TXT contract only after bundle adjustment.  Preserve the
+            # one-component/deferred behavior without inventing names.
             return only, [], {
                 "schema_version": "colmap-component-inventory-v1",
                 "mapper_component_count": 1,
                 "active_model_component_count": 1,
+                "active_candidate_component_count": 1,
                 "components": [
                     {
                         "component_name": only.name,
                         "component_path": str(only),
                         "registered_image_names": None,
                         "registered_image_names_source": "deferred_to_model_converter_txt",
+                        "selection_status": "selected",
+                        "exclusion_reasons": [],
+                        "dominated_by_components": [],
+                        "relationships": [],
+                        "selection_advisories": ["registered_names_deferred_to_strict_txt_evidence"],
                     }
                 ],
                 "selected_component_name": only.name,
                 "selected_component_path": str(only),
+                "selection_confidence": "high",
+                "selection_advisories": ["registered_names_deferred_to_strict_txt_evidence"],
                 "selection_rule": "exactly one mapper component; registered names deferred to strict TXT evidence",
             }
 
     inventory: list[dict[str, Any]] = []
     name_sets: list[set[str]] = []
-    parse_errors: list[PipelineBlocked] = []
-    invalid_components: list[Path] = []
     for component in components:
         resolved_component = component.resolve()
+        source = (
+            "images.txt"
+            if (resolved_component / "images.txt").is_file()
+            else "images.bin"
+            if (resolved_component / "images.bin").is_file()
+            else "unavailable"
+        )
+        parse_error: str | None = None
         try:
             names = _component_image_names(resolved_component)
-        except PipelineBlocked as exc:
-            # Continue inventory construction so a malformed component cannot
-            # prevent the other mapper outputs from being recorded.  The
-            # original parser error remains a hard stop after the scan.
-            parse_errors.append(exc)
-            inventory.append(
-                {
-                    "component_name": resolved_component.name,
-                    "component_path": str(resolved_component),
-                    "registered_image_names": None,
-                    "registered_image_names_source": "parse_error",
-                    "selection_status": "invalid",
-                    "exclusion_reasons": ["registered_name_parse_error"],
-                    "dominated_by_components": [],
-                }
-            )
-            name_sets.append(set())
-            continue
+        except (PipelineBlocked, OSError, ValueError) as exc:
+            names = []
+            parse_error = str(exc)
         unique_names = len(names) == len(set(names))
-        if not names or not unique_names:
-            invalid_components.append(resolved_component)
+        name_set = set(names)
         positions = [
             index
             for index, record in enumerate(selected_records)
-            if str(record.get("staged_name")) in set(names)
+            if str(record.get("staged_name")) in name_set
         ]
         runs: list[list[int]] = []
         current: list[int] = []
@@ -378,20 +396,23 @@ def _select_mapper_component(
             runs.append(current)
         longest = max((len(run) for run in runs), default=0)
         best_runs = [run for run in runs if len(run) == longest and longest > 0]
-        name_set = set(names)
+        reasons: list[str] = []
+        if parse_error is not None:
+            reasons.append("registered_name_parse_error")
+        if not names:
+            reasons.append("no_registered_image_names")
+        if not unique_names or (parse_error is not None and "duplicate" in parse_error.lower()):
+            reasons.append("duplicate_registered_image_names")
+        if names and unique_names and longest <= 0:
+            reasons.append("no_registered_name_in_selected_frame_contract")
+        status = "candidate" if names and unique_names and longest > 0 else "invalid"
         inventory.append(
             {
                 "component_name": resolved_component.name,
                 "component_path": str(resolved_component),
-                "registered_image_names": names,
+                "registered_image_names": names if names else None,
                 "registered_image_count": len(names),
-                "registered_image_names_source": (
-                    "images.txt"
-                    if (resolved_component / "images.txt").is_file()
-                    else "images.bin"
-                    if (resolved_component / "images.bin").is_file()
-                    else "unavailable"
-                ),
+                "registered_image_names_source": "parse_error" if parse_error is not None else source,
                 "selected_frame_positions": positions,
                 "candidate_contiguous_runs": [
                     {"start_index": run[0], "end_index": run[-1], "count": len(run)}
@@ -399,77 +420,181 @@ def _select_mapper_component(
                 ],
                 "longest_contiguous_run_count": longest,
                 "longest_contiguous_run_count_tie": len(best_runs) > 1,
-                "selection_status": "candidate" if names and unique_names else "invalid",
-                "exclusion_reasons": [],
+                "coverage_ratio": (len(positions) / len(selected_records)) if selected_records else 0.0,
+                "selection_status": status,
+                "exclusion_reasons": reasons,
                 "dominated_by_components": [],
+                "relationships": [],
+                "selection_advisories": [],
+                "parse_error": parse_error,
             }
         )
         name_sets.append(name_set)
-    if parse_errors:
-        raise parse_errors[0]
-    if invalid_components:
-        raise PipelineBlocked(
-            "COLMAP component has missing or duplicate registered names: "
-            f"{invalid_components[0]}"
-        )
 
     # Classify strict registered-name subsets only after every component has
-    # been inventoried.  This intentionally lets a small redundant component
-    # have ambiguous internal runs without blocking its clearly larger parent.
+    # been inventoried.  Invalid components have no trustworthy set and are
+    # intentionally excluded from set relationships.
     for index, current_names in enumerate(name_sets):
+        current = inventory[index]
+        if current["selection_status"] not in {"candidate", "invalid"} or not current_names:
+            continue
         dominating = sorted(
             inventory[other_index]["component_name"]
             for other_index, other_names in enumerate(name_sets)
-            if index != other_index and current_names < other_names
+            if index != other_index
+            and inventory[other_index]["selection_status"] == "candidate"
+            and other_names
+            and current_names < other_names
         )
         if dominating:
-            inventory[index]["selection_status"] = "dominated"
-            inventory[index]["dominated_by_components"] = dominating
-            inventory[index]["exclusion_reasons"] = [
-                "registered_name_set_strict_subset_of_other_component"
-            ]
+            current["selection_status"] = "dominated"
+            current["dominated_by_components"] = dominating
+            current["exclusion_reasons"] = ["registered_name_set_strict_subset_of_other_component"]
+
+    # Record every relation among valid components.  Relations are evidence,
+    # not a reason to merge models or reject a usable winner.
+    for left_index, left_names in enumerate(name_sets):
+        if not left_names or inventory[left_index]["selection_status"] == "invalid":
+            continue
+        for right_index in range(left_index + 1, len(name_sets)):
+            right_names = name_sets[right_index]
+            if not right_names or inventory[right_index]["selection_status"] == "invalid":
+                continue
+            overlap = sorted(left_names & right_names)
+            if left_names == right_names:
+                relation = "equal_registered_name_set"
+            elif left_names < right_names:
+                relation = "strict_subset"
+            elif right_names < left_names:
+                relation = "strict_superset"
+            elif overlap:
+                relation = "non_subset_overlap"
+            else:
+                relation = "disjoint"
+            inventory[left_index]["relationships"].append(
+                {
+                    "relation": relation,
+                    "other_component": inventory[right_index]["component_name"],
+                    "overlap_count": len(overlap),
+                    "overlap_names": overlap,
+                }
+            )
+            reverse_relation = {
+                "relation": (
+                    "strict_superset"
+                    if relation == "strict_subset"
+                    else "strict_subset"
+                    if relation == "strict_superset"
+                    else relation
+                ),
+                "other_component": inventory[left_index]["component_name"],
+                "overlap_count": len(overlap),
+                "overlap_names": overlap,
+            }
+            inventory[right_index]["relationships"].append(reverse_relation)
+            if relation == "non_subset_overlap":
+                inventory[left_index]["selection_advisories"].append(
+                    f"non_subset_overlap_with:{inventory[right_index]['component_name']}"
+                )
+                inventory[right_index]["selection_advisories"].append(
+                    f"non_subset_overlap_with:{inventory[left_index]['component_name']}"
+                )
 
     active_indices = [
         index
         for index, item in enumerate(inventory)
         if item["selection_status"] == "candidate"
     ]
-    for left_offset, left_index in enumerate(active_indices):
-        for right_index in active_indices[left_offset + 1 :]:
-            overlap = sorted(name_sets[left_index] & name_sets[right_index])
-            if overlap:
-                raise PipelineBlocked(
-                    "COLMAP active mapper components have non-subset overlap in "
-                    f"registered names between {inventory[left_index]['component_name']} "
-                    f"and {inventory[right_index]['component_name']}: {overlap}"
-                )
-
     ranked = sorted(
         active_indices,
         key=lambda index: (
             -int(inventory[index]["longest_contiguous_run_count"]),
+            -int(inventory[index]["registered_image_count"]),
+            -float(inventory[index]["coverage_ratio"]),
             str(inventory[index]["component_name"]),
+            str(inventory[index]["component_path"]),
         ),
     )
     if not ranked or int(inventory[ranked[0]]["longest_contiguous_run_count"]) <= 0:
-        raise PipelineBlocked("COLMAP mapper components have no registered member in the selected frame contract")
-    if len(ranked) > 1 and inventory[ranked[0]]["longest_contiguous_run_count"] == inventory[ranked[1]]["longest_contiguous_run_count"]:
-        raise PipelineBlocked("COLMAP mapper component selection is ambiguous: equal contiguous segments")
-    selected_index = ranked[0]
-    if bool(inventory[selected_index]["longest_contiguous_run_count_tie"]):
-        raise PipelineBlocked(
-            "COLMAP component has ambiguous non-contiguous registered segments: "
-            f"{inventory[selected_index]['component_path']}"
+        snapshot = {
+            "schema_version": "colmap-component-inventory-v1",
+            "mapper_component_count": len(components),
+            "active_model_component_count": 0,
+            "active_candidate_component_count": len(active_indices),
+            "components": inventory,
+            "selected_component_name": None,
+            "selected_component_path": None,
+            "selection_rule": "complete inventory; candidate-local invalidity; no usable registered component",
+        }
+        duplicate = next(
+            (item for item in inventory if "duplicate_registered_image_names" in item.get("exclusion_reasons", [])),
+            None,
         )
+        message = (
+            "duplicate COLMAP image NAME in mapper component: " + str(duplicate["component_path"])
+            if duplicate is not None
+            else "COLMAP mapper components have no usable registered member in the selected frame contract"
+        )
+        raise MapperComponentSelectionBlocked(message, inventory=snapshot)
+
+    winner = inventory[ranked[0]]
+    winner_quality = (
+        int(winner["longest_contiguous_run_count"]),
+        int(winner["registered_image_count"]),
+        float(winner["coverage_ratio"]),
+    )
+    tied_quality = [
+        index
+        for index in ranked
+        if (
+            int(inventory[index]["longest_contiguous_run_count"]),
+            int(inventory[index]["registered_image_count"]),
+            float(inventory[index]["coverage_ratio"]),
+        )
+        == winner_quality
+    ]
+    if len(tied_quality) > 1:
+        snapshot = {
+            "schema_version": "colmap-component-inventory-v1",
+            "mapper_component_count": len(components),
+            "active_model_component_count": 0,
+            "active_candidate_component_count": len(active_indices),
+            "components": inventory,
+            "selection_ambiguity": {
+                "reason": "equal_component_quality",
+                "components": [inventory[index]["component_name"] for index in tied_quality],
+                "quality": winner_quality,
+            },
+            "selected_component_name": None,
+            "selected_component_path": None,
+            "selection_rule": "complete inventory; dynamic quality ranking; true equal-quality candidate tie",
+        }
+        raise MapperComponentSelectionBlocked(
+            "COLMAP mapper component selection is ambiguous: equal contiguous segments/component quality",
+            inventory=snapshot,
+        )
+
+    selected_index = ranked[0]
+    selected = inventory[selected_index]
     for index in active_indices:
         if index == selected_index:
             inventory[index]["selection_status"] = "selected"
+            if bool(inventory[index]["longest_contiguous_run_count_tie"]):
+                inventory[index]["selection_advisories"].append(
+                    "selected_component_has_equal_longest_registered_segments; model_retains_all_registered_images"
+                )
         else:
             inventory[index]["selection_status"] = "not_selected"
             inventory[index]["exclusion_reasons"] = [
                 "shorter_longest_contiguous_registered_segment"
+                if int(inventory[index]["longest_contiguous_run_count"])
+                < int(selected["longest_contiguous_run_count"])
+                else "lower_quality_ranked_component"
             ]
-    selected = inventory[selected_index]
+            if bool(inventory[index]["longest_contiguous_run_count_tie"]):
+                inventory[index]["selection_advisories"].append(
+                    "not_selected_component_internal_segment_tie_is_candidate_local"
+                )
     selected_path = Path(str(selected["component_path"])).resolve()
     return selected_path, list(selected["registered_image_names"]), {
         "schema_version": "colmap-component-inventory-v1",
@@ -479,10 +604,12 @@ def _select_mapper_component(
         "components": inventory,
         "selected_component_name": selected["component_name"],
         "selected_component_path": str(selected_path),
+        "selection_confidence": "low" if selected.get("selection_advisories") else "high",
+        "selection_advisories": list(selected.get("selection_advisories", [])),
         "selection_rule": (
-            "longest_temporally_contiguous registered segment among active components; "
-            "strict registered-name subsets are dominated/redundant; "
-            "non-subset overlap and ties blocked; no merge"
+            "complete component inventory; rank longest temporally contiguous registered segment, "
+            "then registered count and coverage; strict registered-name subsets are dominated/redundant; "
+            "component relationships are evidence only; no merge"
         ),
     }
 
@@ -561,6 +688,8 @@ def _segment_provenance(
             }
         )
     chosen = max(candidate_rows, key=lambda row: (int(row["frame_count"]), -float(row["start_time_sec"] or 0.0))) if candidate_rows else None
+    longest_count = max((int(row["frame_count"]) for row in candidate_rows), default=0)
+    longest_candidates = [row for row in candidate_rows if int(row["frame_count"]) == longest_count and longest_count > 0]
     return {
         "schema_version": "longsplat-segment-provenance-v1",
         "selection_policy": "longest_temporally_contiguous registered candidate; no component merge",
@@ -573,6 +702,13 @@ def _segment_provenance(
         "coverage_ratio": (len(ordered) / len(selected_records)) if selected_records else 0.0,
         "candidate_segments": candidate_rows,
         "selected_segment": chosen,
+        "selected_segment_tie": len(longest_candidates) > 1,
+        "selected_segment_tie_count": len(longest_candidates),
+        "selected_segment_tie_policy": (
+            "provenance_only_model_retains_all_registered_images; deterministic earliest segment is reported"
+            if len(longest_candidates) > 1
+            else "not_applicable"
+        ),
         "excluded_time_intervals": excluded_intervals,
         "excluded_frame_count": len(excluded),
         "model_scope": "all registered images in the chosen single COLMAP component; excluded intervals are not staged downstream",
@@ -1191,6 +1327,9 @@ def run_raw_video_pipeline(
         else:
             status = "passed"
             mapper_stage_count = 3
+            components: list[Path] = []
+            component_inventory: dict[str, Any] | None = None
+            segment_provenance: dict[str, Any] | None = None
             for command_data in pre_plan["commands"][:mapper_stage_count]:
                 result = run_colmap_command(
                     ColmapCommand(str(command_data["stage"]), tuple(command_data["argv"]), str(command_data["cwd"])),
@@ -1216,6 +1355,7 @@ def run_raw_video_pipeline(
                         selected_records,
                     )
                 except PipelineBlocked as exc:
+                    component_inventory = getattr(exc, "inventory", None)
                     plan_data = pre_plan
                     geometry = {"computed_pass": False, "accepted": False, "hard_failures": [str(exc)], "warnings": []}
                     evidence = None
@@ -1298,9 +1438,9 @@ def run_raw_video_pipeline(
             "dense_mvs": {"enabled": False, "blocking": False, "next_stage": "future"},
             "selected_frame_records": selected_records,
             "colmap_input_frame_records": input_records,
-            "segment_provenance": locals().get("segment_provenance"),
-            "component_inventory": locals().get("component_inventory"),
-            "mapper_component_count": len(locals().get("components", [])),
+            "segment_provenance": segment_provenance,
+            "component_inventory": component_inventory,
+            "mapper_component_count": len(components),
             "active_model_component_count": 1 if evidence is not None else 0,
             "artifacts": [] if evidence is None else [
                 {"path": str(Path(plan_data["paths"]["bundle_adjusted_txt"]) / name), "sha256": sha256_file(Path(plan_data["paths"]["bundle_adjusted_txt"]) / name)}

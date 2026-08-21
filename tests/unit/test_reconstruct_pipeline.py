@@ -953,6 +953,7 @@ def test_validate_only_reuses_dynamic_authority_candidate_and_cpu_recovery(tmp_p
     (post_stage / "postprocess_result.json").write_text(
         json.dumps(
             {
+                "STRUCTURAL_EVALUATION_PASS": True,
                 "FULL_STREAM_VALIDATION_PASS": True,
                 "SAME_CAMERA_VISUAL_PASS": "pass",
                 "gpu_invoked": False,

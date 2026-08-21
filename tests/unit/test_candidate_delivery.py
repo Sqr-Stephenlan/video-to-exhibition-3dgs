@@ -27,7 +27,7 @@ def test_candidate_delivery_is_explicitly_not_accepted(tmp_path: Path, monkeypat
     converted.write_bytes(b"technical-ply")
     evaluation = evidence_root / "evaluation.json"
     evaluation.write_text(
-        json.dumps({"SAME_CAMERA_VISUAL_PASS": "needs_review", "held_out": False}),
+        json.dumps({"STRUCTURAL_EVALUATION_PASS": True, "SAME_CAMERA_VISUAL_PASS": "needs_review", "held_out": False}),
         encoding="utf-8",
     )
     conversion = evidence_root / "conversion.json"
@@ -60,7 +60,7 @@ def test_candidate_delivery_is_explicitly_not_accepted(tmp_path: Path, monkeypat
     assert "point_cloud.ply" in (root / "SHA256SUMS.txt").read_text(encoding="utf-8")
 
 
-def test_failed_same_camera_evaluation_blocks_candidate(tmp_path: Path) -> None:
+def test_failed_same_camera_visual_is_advisory_after_structural_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _manifest, authority_path, route = _fixture(
         tmp_path,
         "candidate-fail",
@@ -73,14 +73,52 @@ def test_failed_same_camera_evaluation_blocks_candidate(tmp_path: Path) -> None:
     converted = evidence_root / "converted.ply"
     converted.write_bytes(b"technical-ply")
     evaluation = evidence_root / "evaluation.json"
+    evaluation.write_text(
+        json.dumps({
+            "STRUCTURAL_EVALUATION_PASS": True,
+            "SAME_CAMERA_VISUAL_PASS": "fail",
+            "quality_advisories": ["visual quality is below the local advisory threshold"],
+        }),
+        encoding="utf-8",
+    )
+    comparison = evidence_root / "comparison.png"
+    assert cv2.imwrite(str(comparison), np.zeros((9, 13, 3), dtype=np.uint8))
+
+    monkeypatch.setattr("scripts.longsplat.acceptance_delivery._point_count", lambda _path: 1)
+    result = create_candidate_delivery(
+        converted_ply=converted,
+        output_dir=route / "outputs" / "candidate-fail" / "candidate_delivery",
+        authority_manifest=authority_path,
+        evidence_files={"evaluation_result.json": evaluation},
+        comparison_sheet=comparison,
+    )
+    assert result["accepted"] is False
+    manifest = json.loads((Path(result["root"]) / "candidate_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["same_camera_visual_pass"] == "fail"
+    assert manifest["quality_advisories"]
+
+
+def test_candidate_delivery_requires_structural_evaluation_pass(tmp_path: Path) -> None:
+    _manifest, authority_path, route = _fixture(
+        tmp_path,
+        "candidate-no-structural",
+        camera_names=["only"],
+        width=13,
+        height=9,
+    )
+    evidence_root = route / "outputs" / "candidate-no-structural" / "evidence"
+    evidence_root.mkdir(parents=True)
+    converted = evidence_root / "converted.ply"
+    converted.write_bytes(b"technical-ply")
+    evaluation = evidence_root / "evaluation.json"
     evaluation.write_text(json.dumps({"SAME_CAMERA_VISUAL_PASS": "fail"}), encoding="utf-8")
     comparison = evidence_root / "comparison.png"
     assert cv2.imwrite(str(comparison), np.zeros((9, 13, 3), dtype=np.uint8))
 
-    with pytest.raises(AcceptanceDeliveryError, match="failed same-camera evaluation"):
+    with pytest.raises(AcceptanceDeliveryError, match="structural converted-evaluation pass"):
         create_candidate_delivery(
             converted_ply=converted,
-            output_dir=route / "outputs" / "candidate-fail" / "candidate_delivery",
+            output_dir=route / "outputs" / "candidate-no-structural" / "candidate_delivery",
             authority_manifest=authority_path,
             evidence_files={"evaluation_result.json": evaluation},
             comparison_sheet=comparison,
@@ -98,7 +136,7 @@ def test_candidate_delivery_comparison_sheet_contract_is_identity_dict(tmp_path:
     converted = evidence_root / "converted.ply"
     converted.write_bytes(b"technical-ply")
     evaluation = evidence_root / "evaluation.json"
-    evaluation.write_text(json.dumps({"SAME_CAMERA_VISUAL_PASS": "needs_review", "held_out": False}), encoding="utf-8")
+    evaluation.write_text(json.dumps({"STRUCTURAL_EVALUATION_PASS": True, "SAME_CAMERA_VISUAL_PASS": "needs_review", "held_out": False}), encoding="utf-8")
     comparison = evidence_root / "comparison.png"
     assert cv2.imwrite(str(comparison), np.zeros((17, 29, 3), dtype=np.uint8))
 

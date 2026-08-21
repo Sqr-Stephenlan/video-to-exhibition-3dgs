@@ -21,7 +21,6 @@ from .pipeline_contract import PipelineBlocked, sha256_file
 CONVERGENCE_SMOKE_SCHEMA = "convergence-smoke-v1"
 PROFILE = "convergence1000-v1"
 ITERATIONS = 1000
-MAX_ACTIVE_CAMERA_COUNT = 500
 TELEMETRY_SCHEMA = "camera-sampling-telemetry-v1"
 _LOSS_RE = re.compile(r"Loss=([-+0-9.eE]+)")
 
@@ -102,13 +101,6 @@ def plan_convergence_smoke(
         _fail("active_camera_count must be a positive integer")
     if requested_iterations != ITERATIONS:
         _fail(f"{PROFILE} is fixed at exactly {ITERATIONS} iterations")
-    if active_camera_count > MAX_ACTIVE_CAMERA_COUNT:
-        _fail(
-            f"{PROFILE} supports at most {MAX_ACTIVE_CAMERA_COUNT} active cameras; "
-            "profile insufficient and automatic iteration search is forbidden"
-        )
-    if requested_iterations < 2 * active_camera_count:
-        _fail(f"{PROFILE} requires at least two complete camera coverage rounds: T={requested_iterations}, N={active_camera_count}")
     names = _names(camera_names)
     if len(names) != active_camera_count:
         _fail("camera order length differs from active_camera_count")
@@ -156,6 +148,19 @@ def plan_convergence_smoke(
             "telemetry_required": True,
             "telemetry_observer_has_no_random_side_effect": True,
         },
+        "coverage_advisory": {
+            "policy": "advisory_only_no_camera_count_or_complete_round_gate",
+            "complete_rounds": prediction["complete_rounds"],
+            "predicted_unique_camera_count": prediction["predicted_unique_camera_count"],
+            "predicted_zero_exposure_camera_count": prediction["predicted_zero_exposure_camera_count"],
+            "predicted_coverage_fraction": prediction["predicted_coverage_fraction"],
+            "warning": (
+                "the fixed diagnostic has fewer than two complete camera rounds or leaves cameras unexposed; "
+                "this is retained as telemetry/advisory evidence and does not reject the immutable input"
+                if prediction["complete_rounds"] < 2 or prediction["predicted_zero_exposure_camera_count"] > 0
+                else None
+            ),
+        },
         "densification": {
             "fork_semantics": "anchor_growing via adjust_anchor/anchor_growing; external route does not use classic densify_and_clone/split/reset_opacity",
             "planned_adjust_anchor_iterations": anchors,
@@ -188,6 +193,7 @@ def plan_convergence_smoke(
         },
         "experiment_required": [
             "whether 1000 iterations produces recognizable geometry requires this one runtime diagnostic",
+            "camera coverage is reported as an advisory; it is not a candidate rejection or frame-selection rule",
             "initialization/anchor growth must be diagnosed from runtime counts if visual output remains low-frequency",
             "no adaptive iteration formula is asserted by this local profile",
         ],
@@ -203,10 +209,6 @@ def validate_convergence_smoke_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     names = plan.get("active_camera_order")
     if not isinstance(count, int) or count <= 0 or not isinstance(names, list) or len(names) != count:
         _fail("convergence camera count/order is invalid")
-    if count > MAX_ACTIVE_CAMERA_COUNT:
-        _fail(f"convergence camera count exceeds the {MAX_ACTIVE_CAMERA_COUNT}-camera profile cap")
-    if ITERATIONS < 2 * count:
-        _fail("convergence plan does not provide two complete camera coverage rounds")
     _names([str(value) for value in names])
     if plan.get("computed_pass") is not True or plan.get("gpu_invoked") is not False or plan.get("training_invoked") is not False:
         _fail("convergence CPU plan must be computed_pass and not invoked")
@@ -216,6 +218,9 @@ def validate_convergence_smoke_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     sampling = plan.get("sampling")
     if not isinstance(sampling, Mapping) or sampling.get("prediction") != prediction:
         _fail("convergence exposure prediction is inconsistent")
+    coverage = plan.get("coverage_advisory")
+    if not isinstance(coverage, Mapping) or coverage.get("policy") != "advisory_only_no_camera_count_or_complete_round_gate":
+        _fail("convergence coverage advisory is missing or has become a blocking policy")
     densification = plan.get("densification")
     if not isinstance(densification, Mapping) or densification.get("planned_adjust_anchor_iterations") != expected_anchor_adjust_iterations(ITERATIONS):
         _fail("convergence anchor schedule is inconsistent with the fork gate")

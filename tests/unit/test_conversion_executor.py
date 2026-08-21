@@ -251,7 +251,12 @@ def test_authority_stage_creates_eval_executor_root_and_threads_conversion_root(
         assert Path(evidence_root).is_dir(), "eval executor root must be created before dispatch"
         assert kwargs["conversion_evidence_root"] == conversion_root
         assert kwargs["stage"] == "converted-eval"
-        return {"stage": "converted-eval", "exit_code": 0, "SAME_CAMERA_VISUAL_PASS": "needs_review"}
+        return {
+            "stage": "converted-eval",
+            "exit_code": 0,
+            "STRUCTURAL_EVALUATION_PASS": True,
+            "SAME_CAMERA_VISUAL_PASS": "needs_review",
+        }
 
     monkeypatch.setattr("scripts.longsplat.smoke_executor.execute_stage", fake_execute_stage)
 

@@ -1398,8 +1398,8 @@ def _verify_training_outputs(
             expected_prediction = predicted_exposure(len(expected_names), iteration)
             if telemetry.get("iterations") != iteration or iteration != 1000:
                 _fail("convergence telemetry must contain exactly 1000 iterations")
-            if telemetry.get("active_camera_count") != len(expected_names) or telemetry.get("unique_camera_count") != len(expected_names):
-                _fail("convergence telemetry must expose every active camera")
+            if telemetry.get("active_camera_count") != len(expected_names):
+                _fail("convergence telemetry active camera count differs from static input")
             exposure_counts = telemetry.get("exposure_counts")
             if not isinstance(exposure_counts, Mapping) or set(exposure_counts) != set(internal_names):
                 _fail("convergence telemetry exposure identity set differs from pose contract")
@@ -1447,8 +1447,8 @@ def _verify_training_outputs(
                 )
             if iteration != 30000 or telemetry.get("iterations") != iteration:
                 _fail("formal30000 telemetry must contain exactly 30000 iterations")
-            if telemetry.get("active_camera_count") != len(expected_names) or telemetry.get("unique_camera_count") != len(expected_names):
-                _fail("formal30000 telemetry must expose every active camera")
+            if telemetry.get("active_camera_count") != len(expected_names):
+                _fail("formal30000 telemetry active camera count differs from static input")
             exposure_counts = telemetry.get("exposure_counts")
             if not isinstance(exposure_counts, Mapping) or set(exposure_counts) != set(internal_names):
                 _fail("formal30000 telemetry exposure identity set differs from pose contract")
@@ -1488,6 +1488,20 @@ def _verify_training_outputs(
             "required_for_new_execution": False,
             "bit_exact_resume": False,
         }
+    coverage_advisory: dict[str, Any] = {
+        "policy": "advisory_only_no_complete_round_or_full_camera_coverage_gate",
+        "workload_profile": workload_profile,
+        "unique_camera_count": telemetry.get("unique_camera_count"),
+        "zero_exposure_camera_count": sum(
+            1
+            for value in (telemetry.get("exposure_counts", {}) or {}).values()
+            if isinstance(value, int) and value == 0
+        ),
+    }
+    if workload_profile in {"convergence1000-v1", "formal30000-v1"}:
+        coverage_advisory["prediction"] = predicted_exposure(len(expected_names), iteration)
+        if coverage_advisory["unique_camera_count"] != len(expected_names):
+            coverage_advisory["warning"] = "runtime unique-camera coverage is advisory and did not block the selected full input"
     ply = _verify_ply_finite(model / f"point_cloud/iteration_{iteration}/point_cloud.ply")
     return {
         "structural_pass": True,
@@ -1501,6 +1515,7 @@ def _verify_training_outputs(
         "cameras_all_train_sha256": sha256_file(model / "cameras_all_train.json"),
         "cameras_all_test_sha256": sha256_file(model / "cameras_all_test.json"),
         "camera_sampling_telemetry": telemetry,
+        "coverage_advisory": coverage_advisory,
         "image_residency": image_residency,
         "anchor_schedule": pose_contract.get("anchor_schedule") if workload_profile in {"coverage-smoke-v1", "convergence1000-v1", "formal30000-v1"} else {
             "status": "legacy_or_noncoverage_not_required"

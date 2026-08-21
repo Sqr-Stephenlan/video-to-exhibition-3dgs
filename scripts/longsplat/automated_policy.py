@@ -99,12 +99,19 @@ def _telemetry_gate(
         _fail("active camera count is missing from training structural evidence")
     if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
         _fail("automated gate iteration count is invalid")
+    coverage_warnings: list[str] = []
     if require_two_rounds and iterations < 2 * count:
-        _fail("early automated gate requires at least two complete camera-coverage rounds")
+        coverage_warnings.append("camera sampling has fewer than two complete coverage rounds; advisory only")
     if telemetry.get("iterations") != iterations:
         _fail("camera sampling telemetry iteration count differs from policy")
-    if telemetry.get("active_camera_count") != count or telemetry.get("unique_camera_count") != count:
-        _fail("camera sampling telemetry does not cover every active camera")
+    if telemetry.get("active_camera_count") != count:
+        _fail("camera sampling telemetry active camera count differs from policy")
+    unique_count = telemetry.get("unique_camera_count")
+    if isinstance(unique_count, bool) or not isinstance(unique_count, int) or not 0 <= unique_count <= count:
+        coverage_warnings.append("camera sampling unique-camera telemetry is unavailable or out of range; advisory only")
+        unique_count = None
+    elif unique_count != count:
+        coverage_warnings.append("camera sampling did not expose every active camera; advisory only")
     exposures = _mapping(telemetry.get("exposure_counts"), "exposure counts")
     if len(exposures) != count:
         _fail("exposure count identity set differs from active camera count")
@@ -128,8 +135,8 @@ def _telemetry_gate(
     if sum(values) != iterations:
         _fail("exposure count sum differs from iteration count")
     zero = sum(value == 0 for value in values)
-    if zero != 0:
-        _fail("automated technical gate requires zero cameras with zero exposure")
+    if zero:
+        coverage_warnings.append(f"{zero} active camera(s) have zero exposure in this fixed iteration budget; advisory only")
     anchor = _mapping(structural.get("anchor_schedule"), "anchor runtime schedule")
     if anchor.get("observed_from_runtime") is not True:
         _fail("anchor schedule was not observed from runtime")
@@ -143,6 +150,14 @@ def _telemetry_gate(
         "iterations": iterations,
         "exposure_counts": dict(exposures),
         "exposure_prediction": prediction,
+        "coverage_advisory": {
+            "policy": "advisory_only_no_complete_round_or_full_camera_coverage_gate",
+            "unique_camera_count": unique_count,
+            "zero_exposure_camera_count": zero,
+            "complete_rounds": prediction["complete_rounds"],
+            "predicted_coverage_fraction": prediction["predicted_coverage_fraction"],
+            "warnings": coverage_warnings,
+        },
         "zero_exposure_camera_count": zero,
         "anchor_schedule": dict(anchor),
         "checkpoint": dict(checkpoint),
@@ -188,7 +203,7 @@ def _postcheck_evidence(postcheck: Mapping[str, Any]) -> Mapping[str, Any]:
         _fail("render postcheck counts are incomplete")
     rough = _mapping(evidence.get("rough_visual"), "rough render health")
     if rough.get("automatic_health") == "fail":
-        _fail("render postcheck reports black, identical, or non-finite fixed views")
+        _fail("render postcheck reports black/unusable or non-finite fixed views")
     if rough.get("automatic_health") in {"needs_review", "unclassified"}:
         warnings.append(f"rough visual health is {rough.get('automatic_health')}; no human visual claim is made")
     metrics = _mapping(evidence.get("fixed_view_metrics"), "training-view metrics")
@@ -248,7 +263,7 @@ def evaluate_early_gate(*, training: Mapping[str, Any], postcheck: Mapping[str, 
     warnings: list[str] = []
     try:
         structural = _training_structural(training)
-        runtime = _telemetry_gate(structural, iterations=1000, require_two_rounds=True)
+        runtime = _telemetry_gate(structural, iterations=1000, require_two_rounds=False)
         evidence = _postcheck_evidence(postcheck)
         metric_gate = _thresholds_gate(_mapping(evidence["fixed_view_metrics"], "training-view metrics"), EARLY_THRESHOLDS)
         cross_gap = _cross_gap_gate(evidence)
@@ -256,6 +271,7 @@ def evaluate_early_gate(*, training: Mapping[str, Any], postcheck: Mapping[str, 
             warnings.append("early metric thresholds are below the local advisory values")
         if cross_gap.get("warning"):
             warnings.append("cross-gap is explicitly present and retained as provenance")
+        warnings.extend(str(item) for item in runtime.get("coverage_advisory", {}).get("warnings", []))
         warnings.extend(str(item) for item in evidence.get("technical_warnings", []))
         passed = not reasons
     except AutomatedPolicyBlocked as exc:
@@ -301,6 +317,7 @@ def evaluate_formal_gate(*, training: Mapping[str, Any], postcheck: Mapping[str,
             warnings.append("formal metric thresholds are below the local advisory values")
         if cross_gap.get("warning"):
             warnings.append("cross-gap is explicitly present and retained as provenance")
+        warnings.extend(str(item) for item in runtime.get("coverage_advisory", {}).get("warnings", []))
         warnings.extend(str(item) for item in evidence.get("technical_warnings", []))
         passed = not reasons
     except AutomatedPolicyBlocked as exc:

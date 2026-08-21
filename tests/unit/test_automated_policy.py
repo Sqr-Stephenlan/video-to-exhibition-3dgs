@@ -6,6 +6,7 @@ from scripts.longsplat.automated_policy import evaluate_early_gate, evaluate_for
 def _training(*, count: int, iterations: int) -> dict[str, object]:
     low, high = divmod(iterations, count)
     exposures = {f"camera-{index}.png": low + (index < high) for index in range(count)}
+    unique = sum(value > 0 for value in exposures.values())
     return {
         "computed_pass": True,
         "executor_result": {
@@ -15,7 +16,7 @@ def _training(*, count: int, iterations: int) -> dict[str, object]:
                 "camera_sampling_telemetry": {
                     "iterations": iterations,
                     "active_camera_count": count,
-                    "unique_camera_count": count,
+                    "unique_camera_count": unique,
                     "exposure_counts": exposures,
                 },
                 "anchor_schedule": {"observed_from_runtime": True, "observed_events": [100, 200]},
@@ -55,10 +56,12 @@ def _postcheck(*, cross_gap: bool = False, psnr: float = 18.0) -> dict[str, obje
     return {"postcheck_result": evidence, "postcheck_result_path": "/tmp/postcheck.json"}
 
 
-def test_early_policy_requires_two_rounds_and_zero_exposure() -> None:
-    decision = evaluate_early_gate(training=_training(count=2, iterations=1000), postcheck=_postcheck())
+def test_early_policy_records_short_coverage_as_advisory() -> None:
+    decision = evaluate_early_gate(training=_training(count=1200, iterations=1000), postcheck=_postcheck())
     assert decision["computed_pass"] is True
     assert decision["manual_visual_review"] is False
+    assert decision["runtime"]["zero_exposure_camera_count"] == 200
+    assert any("zero exposure" in warning for warning in decision["warnings"])
 
 
 def test_early_policy_records_cross_gap_and_threshold_warning_without_blocking() -> None:

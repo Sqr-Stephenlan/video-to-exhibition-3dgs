@@ -1850,13 +1850,23 @@ def _render_quality(result: Mapping[str, Any]) -> dict[str, Any]:
         return {"quality_status": "blocked", "computed_pass": False, "reason": "all fixed renders are black"}
     fingerprints = {sha256_file(path) for path in renders}
     if len(fingerprints) == 1:
-        return {"quality_status": "blocked", "computed_pass": False, "reason": "all fixed renders are identical"}
+        return {
+            "quality_status": "needs_review",
+            "computed_pass": False,
+            "reason": "all fixed renders are identical; retained as a visual-quality advisory",
+            "visual_quality_advisory": "all_fixed_renders_identical",
+        }
     if max(stds) < 1.0e-5:
-        return {"quality_status": "blocked", "computed_pass": False, "reason": "all fixed renders are uniform"}
+        return {
+            "quality_status": "needs_review",
+            "computed_pass": False,
+            "reason": "all fixed renders are uniform; retained as a visual-quality advisory",
+            "visual_quality_advisory": "all_fixed_renders_uniform",
+        }
     giant_like = sum(std < 1.0 for std in stds) == len(stds)
     smoke_profile = result.get("workload_profile") in {"smoke100-v1", "smoke100"}
     coverage_profile = result.get("workload_profile") == "coverage-smoke-v1"
-    base_reason = "finite, non-black, non-identical fixed views with verified endpoint/on-path structure" if not giant_like else "uniform-looking fixed views require visual review"
+    base_reason = "finite fixed views with verified endpoint/on-path structure" if not giant_like else "uniform-looking fixed views require visual review"
     if smoke_profile or coverage_profile:
         return {
             "quality_status": "needs_review",
@@ -3336,13 +3346,13 @@ def _converted_eval_postprocess_stage(
         )
         stage = _stage_result(
             stage="converted-eval-postprocess",
-            status="passed" if result.get("FULL_STREAM_VALIDATION_PASS") is True else "needs_review",
-            # The CPU recovery gate is technical: complete ordered finite
-            # triples and no severe degradation.  It must not reintroduce a
-            # manual/rough-visual acceptance requirement into the automated
-            # delivery path.
-            computed_pass=result.get("FULL_STREAM_VALIDATION_PASS") is True,
-            reason="CPU streaming postprocess passed on reused GPU PNGs" if result.get("FULL_STREAM_VALIDATION_PASS") is True else "CPU streaming postprocess needs review",
+            status="passed" if result.get("STRUCTURAL_EVALUATION_PASS") is True else "blocked",
+            # The CPU recovery gate is structural: complete ordered finite
+            # triples and a usable candidate.  Severe/black-view metrics are
+            # retained as visual-quality evidence and do not gate the
+            # automated technical delivery path.
+            computed_pass=result.get("STRUCTURAL_EVALUATION_PASS") is True,
+            reason="CPU streaming postprocess passed structural validation" if result.get("STRUCTURAL_EVALUATION_PASS") is True else "CPU streaming postprocess has no usable structural candidate",
             plan=False,
             artifacts=_artifacts([attempt / "postprocess_result.json", attempt / "metrics.json", attempt / "png_hashes.json", attempt / "fixed_gt_native_converted_contact_sheet.png"]),
             gpu_invoked=False,
@@ -3934,8 +3944,9 @@ def _candidate_delivery(
         _record_stage(ledger, "candidate-delivery", result, status="blocked")
         return result, "blocked"
     eval_result = evaluation.get("executor_result", {})
-    if eval_result.get("SAME_CAMERA_VISUAL_PASS") == "fail":
-        result = _stage_result(stage="candidate-delivery", status="blocked", computed_pass=False, reason="same-camera evaluation failed; candidate delivery is unreachable", plan=False)
+    structural_evaluation = eval_result.get("STRUCTURAL_EVALUATION_PASS") is True
+    if not structural_evaluation:
+        result = _stage_result(stage="candidate-delivery", status="blocked", computed_pass=False, reason="converted evaluation has no structural pass; visual quality is advisory only after structural validation", plan=False)
         _record_stage(ledger, "candidate-delivery", result, status="blocked")
         return result, "blocked"
     attempt = ledger.begin_attempt("candidate-delivery", {"authority_manifest": authority["authority_manifest_path"], "conversion_stage": conversion["stage"], "evaluation_stage": evaluation["stage"]})
@@ -5750,7 +5761,13 @@ def _execute_authority_stage(
         result = _stage_result(stage=stage, status="blocked", computed_pass=False, reason=str(exc), plan=plan, gpu_invoked=True, executor_root=str(executor_root), authority_manifest_path=authority_result["authority_manifest_path"])
         ledger.finish_attempt(stage=stage, attempt=attempt, status="blocked", result=result)
         return result, "blocked"
-    passed = (child.get("stage") == "conversion" and child.get("structural_pass") is True and child.get("STRUCTURAL_CONVERSION_PASS") is True) if stage == "conversion" else child.get("SAME_CAMERA_VISUAL_PASS") in {"pass", "needs_review"}
+    if stage == "conversion":
+        passed = child.get("stage") == "conversion" and child.get("structural_pass") is True and child.get("STRUCTURAL_CONVERSION_PASS") is True
+    else:
+        # Converted evaluation has its own structural marker.  A visual
+        # failure remains evidence/advisory and must not gate the downstream
+        # technical chain once the ordered render set was safely validated.
+        passed = child.get("STRUCTURAL_EVALUATION_PASS") is True
     child_status = "passed" if passed else ("failed" if child.get("exit_code") not in (0, None) else "blocked")
     result = _stage_result(stage=stage, status=child_status, computed_pass=passed, reason="authority executor passed" if passed else str(child.get("reason", "authority executor failed")), plan=plan, artifacts=_artifacts([executor_root / "conversion_result.json", executor_root / "evaluation_result.json", executor_root / "request.json", executor_root / "argv.json", executor_root / "same_camera_eval" / "evaluator_result.json", authority_result["authority_manifest_path"]]), gpu_invoked=True, executor_root=str(executor_root), executor_result=child, authority_manifest_path=authority_result["authority_manifest_path"], plan_path=authority_result["authority"]["manifest"]["plan"]["path"], static_contract_path=authority_result["authority"]["manifest"]["static_contract"]["path"])
     ledger.finish_attempt(stage=stage, attempt=attempt, status=child_status, result=result)

@@ -759,9 +759,13 @@ def postprocess_evaluation(
                 row["native_vs_gt"] = _metrics(native, _read_png(native_gt, dimensions))
         rows.append(row)
     severe = any(float(item["mse"]) > 0.25 for item in converted_vs_gt)
+    quality_advisories = []
+    if severe:
+        quality_advisories.append("converted-vs-GT MSE exceeded the visual advisory threshold; structural evaluation remains valid")
     return {
         "schema_version": "longsplat-generic-conversion-ab-v1",
         "STRUCTURAL_CONVERSION_PASS": True,
+        "STRUCTURAL_EVALUATION_PASS": True,
         "SAME_CAMERA_VISUAL_PASS": "fail" if severe else "needs_review",
         "accepted": False,
         "supersplat": False,
@@ -775,6 +779,7 @@ def postprocess_evaluation(
         "native_vs_converted": _aggregate(native_vs_converted),
         "per_view": rows,
         "severe_degradation": severe,
+        "quality_advisories": quality_advisories,
         "evaluator_result_path": str(evaluator_path),
         "evaluator_result_sha256": _sha256(evaluator_path),
     }

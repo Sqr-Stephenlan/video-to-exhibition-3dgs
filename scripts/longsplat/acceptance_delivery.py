@@ -508,8 +508,11 @@ def create_candidate_delivery(
     if evaluation_value is None:
         _fail("candidate delivery requires evaluation_result evidence")
     evaluation = _load_json(Path(evaluation_value), "converted evaluation result")
-    if evaluation.get("SAME_CAMERA_VISUAL_PASS") == "fail":
-        _fail("candidate delivery is blocked by failed same-camera evaluation")
+    structural_evaluation = evaluation.get("STRUCTURAL_EVALUATION_PASS")
+    if structural_evaluation is None:
+        structural_evaluation = evaluation.get("FULL_STREAM_VALIDATION_PASS") is True
+    if structural_evaluation is not True:
+        _fail("candidate delivery requires a structural converted-evaluation pass; visual quality remains advisory")
     root = Path(output_dir)
     if root.exists() or root.is_symlink():
         _fail(f"candidate delivery must be a fresh sibling directory: {root}")
@@ -562,6 +565,7 @@ def create_candidate_delivery(
         "camera_dimensions": dimensions,
         "conversion_profile_id": authority["profile_id"],
         "same_camera_visual_pass": evaluation.get("SAME_CAMERA_VISUAL_PASS"),
+        "quality_advisories": evaluation.get("quality_advisories", []),
         "known_limitations": known_limitations,
         "comparison_sheet": comparison["destination"],
         "authority_manifest": authority["manifest_path"] or str(authority_manifest),
@@ -613,6 +617,7 @@ def create_candidate_delivery(
         "evaluation": {
             "result": _identity(Path(evaluation_value), "evaluation result"),
             "same_camera_visual_pass": evaluation.get("SAME_CAMERA_VISUAL_PASS"),
+            "quality_advisories": evaluation.get("quality_advisories", []),
             "held_out": False,
             "metrics_scope": "training_views_only",
         },

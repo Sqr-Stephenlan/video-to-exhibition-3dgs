@@ -312,6 +312,43 @@ def test_smoke100_quality_cannot_auto_release_formal(tmp_path: Path) -> None:
     assert gate["formal_release_eligible"] is False
 
 
+@pytest.mark.parametrize(
+    ("kind", "advisory"),
+    [("identical", "all_fixed_renders_identical"), ("uniform", "all_fixed_renders_uniform")],
+)
+def test_default_render_quality_keeps_finite_visual_heuristics_advisory(
+    tmp_path: Path, kind: str, advisory: str
+) -> None:
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    render_root = tmp_path / kind
+    (render_root / "renders").mkdir(parents=True)
+    if kind == "identical":
+        images = [
+            np.arange(8 * 10 * 3, dtype=np.uint8).reshape(8, 10, 3),
+            np.arange(8 * 10 * 3, dtype=np.uint8).reshape(8, 10, 3),
+        ]
+    else:
+        images = [
+            np.full((8, 10, 3), value, dtype=np.uint8)
+            for value in (32, 64)
+        ]
+    for index, image in enumerate(images):
+        assert cv2.imwrite(str(render_root / "renders" / f"view_{index}.png"), image)
+
+    quality = _render_quality(
+        {
+            "workload_profile": "formal30000-v1",
+            "structural": {"structural_pass": True, "render_root": str(render_root)},
+        }
+    )
+
+    assert quality["quality_status"] == "needs_review"
+    assert quality["computed_pass"] is False
+    assert quality["visual_quality_advisory"] == advisory
+
+
 def test_legacy_plan_without_new_telemetry_contract_remains_valid(tmp_path: Path) -> None:
     route = Path(__file__).resolve().parents[2]
     (tmp_path / "training").mkdir()

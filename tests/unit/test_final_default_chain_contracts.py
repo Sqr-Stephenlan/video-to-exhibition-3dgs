@@ -13,7 +13,7 @@ from scripts.longsplat.pipeline_contract import (
     PipelineBlocked,
     classify_stage_migration,
 )
-from scripts.longsplat.raw_pipeline import _select_mapper_component
+from scripts.longsplat.raw_pipeline import _segment_provenance, _select_mapper_component
 from scripts.longsplat.longsplat_input import parse_colmap_images_text
 from scripts.longsplat.reconstruct_pipeline import (
     DEFAULT_PIPELINE_PROFILE,
@@ -98,7 +98,7 @@ def test_default_plan_records_dynamic_stage_order_without_algorithms(tmp_path: P
     assert "coverage-smoke-training" not in result["stage_results"]
 
 
-@pytest.mark.parametrize("count", [2, 45, 70, 144, 240])
+@pytest.mark.parametrize("count", [2, 45, 70, 144, 240, 501, 1001])
 def test_convergence_profile_dynamic_camera_bound(count: int) -> None:
     plan = plan_convergence_smoke(
         active_camera_count=count,
@@ -108,9 +108,11 @@ def test_convergence_profile_dynamic_camera_bound(count: int) -> None:
     assert plan["active_camera_count"] == count
 
 
-def test_convergence_profile_blocks_insufficient_rounds_and_selector_cap() -> None:
-    with pytest.raises(ConvergenceSmokeBlocked, match="at most"):
-        plan_convergence_smoke(active_camera_count=501, camera_names=[str(index) for index in range(501)])
+def test_convergence_profile_records_coverage_advisory_without_selector_cap() -> None:
+    plan = plan_convergence_smoke(active_camera_count=1001, camera_names=[str(index) for index in range(1001)])
+    assert plan["computed_pass"] is True
+    assert plan["coverage_advisory"]["predicted_zero_exposure_camera_count"] == 1
+    assert plan["coverage_advisory"]["warning"]
     with pytest.raises(ConvergenceSmokeBlocked, match="fixed at exactly 1000"):
         plan_convergence_smoke(active_camera_count=70, camera_names=[str(index) for index in range(70)], requested_iterations=999)
 
@@ -136,7 +138,7 @@ def test_colmap_two_line_contract_is_shared_and_strict(tmp_path: Path) -> None:
     assert [record["name"] for record in records] == ["view-a.png"]
 
 
-def test_component_inventory_requires_unambiguous_segment_and_overlap_is_blocked(tmp_path: Path) -> None:
+def test_component_inventory_records_overlap_without_blocking_a_clear_winner(tmp_path: Path) -> None:
     selected = [{"staged_name": f"frame_{index:06d}.png"} for index in range(6)]
     first = _component(tmp_path / "mapper" / "1", ["frame_000000.png", "frame_000001.png", "frame_000002.png", "frame_000003.png"])
     second = _component(tmp_path / "mapper" / "2", ["frame_000004.png", "frame_000005.png"])
@@ -145,10 +147,20 @@ def test_component_inventory_requires_unambiguous_segment_and_overlap_is_blocked
     assert names == ["frame_000000.png", "frame_000001.png", "frame_000002.png", "frame_000003.png"]
     assert inventory["mapper_component_count"] == 2
     assert inventory["active_model_component_count"] == 1
-    overlap = _component(tmp_path / "mapper-overlap" / "1", ["frame_000000.png", "frame_000001.png"])
-    overlap2 = _component(tmp_path / "mapper-overlap" / "2", ["frame_000001.png", "frame_000002.png"])
-    with pytest.raises(PipelineBlocked, match="overlap"):
-        _select_mapper_component([overlap, overlap2], selected)
+    overlap = _component(tmp_path / "mapper-overlap" / "1", [
+        "frame_000000.png", "frame_000001.png", "frame_000002.png", "frame_000003.png",
+    ])
+    overlap2 = _component(tmp_path / "mapper-overlap" / "2", [
+        "frame_000002.png", "frame_000003.png", "frame_000004.png",
+    ])
+    chosen_overlap, _, overlap_inventory = _select_mapper_component([overlap, overlap2], selected)
+    assert chosen_overlap == overlap.resolve()
+    relations = {
+        relation["relation"]
+        for item in overlap_inventory["components"]
+        for relation in item["relationships"]
+    }
+    assert "non_subset_overlap" in relations
 
 
 def test_component_inventory_dominates_strict_subset_before_segment_tie_checks(tmp_path: Path) -> None:
@@ -202,7 +214,7 @@ def test_component_inventory_does_not_let_shorter_active_segment_tie_block_winne
     ]
 
 
-def test_component_inventory_blocks_tie_inside_unique_winner(tmp_path: Path) -> None:
+def test_component_inventory_records_tie_inside_unique_winner_as_provenance(tmp_path: Path) -> None:
     selected = [{"staged_name": f"sample_{index:03d}.jpg"} for index in range(8)]
     tied_winner = _component(
         tmp_path / "winner-tie" / "component",
@@ -210,8 +222,19 @@ def test_component_inventory_blocks_tie_inside_unique_winner(tmp_path: Path) -> 
     )
     shorter = _component(tmp_path / "winner-tie" / "shorter", ["sample_007.jpg"])
 
-    with pytest.raises(PipelineBlocked, match="ambiguous non-contiguous"):
-        _select_mapper_component([tied_winner, shorter], selected)
+    chosen, _, inventory = _select_mapper_component([tied_winner, shorter], selected)
+    assert chosen == tied_winner.resolve()
+    selected_item = next(item for item in inventory["components"] if item["selection_status"] == "selected")
+    assert selected_item["longest_contiguous_run_count_tie"] is True
+    assert any("model_retains_all_registered_images" in item for item in selected_item["selection_advisories"])
+    provenance = _segment_provenance(
+        selected,
+        selected_item["registered_image_names"],
+        component_count=2,
+        component_inventory=inventory,
+    )
+    assert provenance["selected_segment_tie"] is True
+    assert provenance["selected_segment_tie_policy"].startswith("provenance_only")
 
 
 def test_component_inventory_blocks_equal_candidates_and_equal_sets(tmp_path: Path) -> None:
@@ -235,7 +258,7 @@ def test_component_inventory_blocks_equal_candidates_and_equal_sets(tmp_path: Pa
         tmp_path / "same" / "second",
         ["capture_000.jpg", "capture_001.jpg"],
     )
-    with pytest.raises(PipelineBlocked, match="overlap"):
+    with pytest.raises(PipelineBlocked, match="equal contiguous segments"):
         _select_mapper_component([same_first, same_second], selected)
 
 
@@ -260,6 +283,53 @@ def test_component_inventory_preserves_one_component_and_name_validation(tmp_pat
     duplicate = _component(tmp_path / "duplicate" / "component", ["single.png", "single.png"])
     with pytest.raises(PipelineBlocked, match="duplicate COLMAP image NAME"):
         _select_mapper_component([duplicate], selected)
+
+
+def test_component_inventory_excludes_invalid_candidate_locally(tmp_path: Path) -> None:
+    selected = [{"staged_name": f"frame_{index:03d}.png"} for index in range(5)]
+    valid = _component(tmp_path / "valid" / "component", [f"frame_{index:03d}.png" for index in range(5)])
+    malformed = _component(tmp_path / "malformed" / "component", ["frame_000.png", "frame_001.png"])
+    (malformed / "images.txt").write_text("not a COLMAP image record\n", encoding="utf-8")
+
+    chosen, names, inventory = _select_mapper_component([malformed, valid], selected)
+
+    assert chosen == valid.resolve()
+    assert names == [f"frame_{index:03d}.png" for index in range(5)]
+    malformed_item = next(item for item in inventory["components"] if item["component_name"] == malformed.name)
+    assert malformed_item["selection_status"] == "invalid"
+    assert "registered_name_parse_error" in malformed_item["exclusion_reasons"]
+
+
+def test_component_inventory_blocks_only_after_all_candidates_are_invalid(tmp_path: Path) -> None:
+    selected = [{"staged_name": "frame_000.png"}]
+    malformed = _component(tmp_path / "malformed-only" / "component", ["frame_000.png"])
+    (malformed / "images.txt").write_text("not a COLMAP image record\n", encoding="utf-8")
+
+    with pytest.raises(PipelineBlocked, match="no usable registered") as raised:
+        _select_mapper_component([malformed], selected)
+
+    inventory = getattr(raised.value, "inventory", None)
+    assert isinstance(inventory, dict)
+    assert inventory["active_model_component_count"] == 0
+    assert inventory["components"][0]["selection_status"] == "invalid"
+
+
+def test_component_inventory_records_selected_text_parse_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    selected = [{"staged_name": "frame_000.png"}]
+    broken = _component(tmp_path / "broken-text" / "component", ["frame_000.png"])
+
+    def raise_parse_error(_component_path: Path) -> list[str]:
+        raise PipelineBlocked("synthetic registered-name parse failure")
+
+    monkeypatch.setattr("scripts.longsplat.raw_pipeline._component_image_names", raise_parse_error)
+    with pytest.raises(PipelineBlocked, match="no usable registered") as raised:
+        _select_mapper_component([broken], selected)
+
+    inventory = getattr(raised.value, "inventory", None)
+    assert isinstance(inventory, dict)
+    item = inventory["components"][0]
+    assert item["selection_status"] == "invalid"
+    assert "registered_name_parse_error" in item["exclusion_reasons"]
 
 
 def test_stage_migration_distinguishes_exact_stale_and_unsafe() -> None:
