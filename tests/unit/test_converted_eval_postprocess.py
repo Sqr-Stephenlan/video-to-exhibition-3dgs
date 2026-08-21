@@ -12,6 +12,7 @@ from scripts.longsplat.converted_eval_postprocess import (
     ConvertedEvalPostprocessError,
     _contract_output_token,
     _expected_converted_names,
+    create_candidate_from_postprocess,
     run_postprocess,
 )
 from tests.unit.test_authority_manifest import _fixture
@@ -155,6 +156,45 @@ def test_visual_quality_advisory_does_not_clear_structural_pass(tmp_path: Path) 
     assert result["visual_quality_pass"] is False
     assert result["SAME_CAMERA_VISUAL_PASS"] == "fail"
     assert result["status"] == "needs_review"
+
+
+def test_manual_candidate_path_still_requires_visual_pass(tmp_path: Path) -> None:
+    camera_names = ["manual-view"]
+    _manifest, authority_path, route = _fixture(
+        tmp_path,
+        "manual-gate",
+        camera_names=camera_names,
+        width=19,
+        height=11,
+    )
+    postprocess_path = route / "outputs" / "manual-gate" / "postprocess_result.json"
+    postprocess_path.parent.mkdir(parents=True, exist_ok=True)
+    postprocess_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "longsplat-converted-eval-postprocess-v2",
+                "STRUCTURAL_EVALUATION_PASS": True,
+                "FULL_STREAM_VALIDATION_PASS": True,
+                "SAME_CAMERA_VISUAL_PASS": "fail",
+                "visual_quality_pass": False,
+                "camera_count": 1,
+                "camera_order": camera_names,
+                "camera_dimensions": {"width": 19, "height": 11},
+                "full_stream_validation": {"pass": True, "structural_pass": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConvertedEvalPostprocessError, match="complete passing CPU postprocess"):
+        create_candidate_from_postprocess(
+            authority_manifest_path=authority_path,
+            postprocess_result_path=postprocess_path,
+            candidate_output=route / "outputs" / "manual-gate" / "candidate",
+            route_root=route,
+            manual_visual_decision="pass",
+            manual_visual_note="not visually accepted",
+        )
 
 
 def test_explicit_contract_extension_mapping_is_not_fuzzy() -> None:

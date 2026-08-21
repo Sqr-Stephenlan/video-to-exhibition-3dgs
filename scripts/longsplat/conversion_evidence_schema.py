@@ -19,6 +19,7 @@ _STRUCTURAL_FLAGS = (
     "all_dimensions_exact",
     "all_names_and_order_exact",
 )
+_LEGACY_COUNT_FIELDS = ("triples_processed", "expected_triples")
 
 
 class ConvertedEvaluationSchemaError(ValueError):
@@ -37,10 +38,27 @@ def _legacy_structural_pass(result: Mapping[str, Any]) -> bool:
         raise ConvertedEvaluationSchemaError(
             "legacy converted-evaluation evidence lacks full_stream_validation structural evidence"
         )
+    camera_count = result.get("camera_count")
+    if isinstance(camera_count, bool) or not isinstance(camera_count, int) or camera_count <= 0:
+        raise ConvertedEvaluationSchemaError(
+            "legacy converted-evaluation evidence lacks a valid camera_count for structural binding"
+        )
     missing = [field for field in _STRUCTURAL_FLAGS if validation.get(field) is not True]
     if missing:
         raise ConvertedEvaluationSchemaError(
             "legacy converted-evaluation structural evidence is incomplete: " + ", ".join(missing)
+        )
+    counts: dict[str, int] = {}
+    for field in _LEGACY_COUNT_FIELDS:
+        value = validation.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ConvertedEvaluationSchemaError(
+                f"legacy converted-evaluation structural evidence lacks valid {field}"
+            )
+        counts[field] = value
+    if counts["expected_triples"] != camera_count or counts["triples_processed"] != counts["expected_triples"]:
+        raise ConvertedEvaluationSchemaError(
+            "legacy converted-evaluation structural evidence count differs from camera_count"
         )
     no_usable = validation.get("no_usable_converted_views")
     if not isinstance(no_usable, bool):
@@ -121,25 +139,38 @@ def normalize_converted_evaluation(
     if not isinstance(result, Mapping):
         raise ConvertedEvaluationSchemaError("converted-evaluation result must be an object")
     schema_version = result.get("schema_version")
+    legacy_v1 = schema_version == LEGACY_POSTPROCESS_SCHEMA
     structural_values: list[bool] = []
     for field in ("STRUCTURAL_EVALUATION_PASS", "FULL_STREAM_VALIDATION_PASS"):
         if field in result:
             structural_values.append(_bool_field(result[field], field))
-    legacy_fallback = not structural_values
     compatibility_warnings: list[str] = []
-    if structural_values:
+    if legacy_v1:
+        # Schema identity must control the interpretation path.  A legacy
+        # record cannot opt out of its full-stream evidence merely by adding
+        # the newer top-level aliases.
+        structural_pass = _legacy_structural_pass(result)
+        if structural_values:
+            if len(set(structural_values)) != 1:
+                raise ConvertedEvaluationSchemaError(
+                    "STRUCTURAL_EVALUATION_PASS and FULL_STREAM_VALIDATION_PASS disagree"
+                )
+            if structural_values[0] != structural_pass:
+                raise ConvertedEvaluationSchemaError(
+                    "legacy top-level structural aliases disagree with verified full-stream evidence"
+                )
+        else:
+            compatibility_warnings.append("legacy_structural_pass_derived_from_verified_full_stream_flags")
+    else:
+        if not structural_values:
+            raise ConvertedEvaluationSchemaError(
+                "converted-evaluation structural pass is missing; no supported legacy schema fallback"
+            )
         if len(set(structural_values)) != 1:
             raise ConvertedEvaluationSchemaError(
                 "STRUCTURAL_EVALUATION_PASS and FULL_STREAM_VALIDATION_PASS disagree"
             )
         structural_pass = structural_values[0]
-    else:
-        if schema_version != LEGACY_POSTPROCESS_SCHEMA:
-            raise ConvertedEvaluationSchemaError(
-                "converted-evaluation structural pass is missing; no supported legacy schema fallback"
-            )
-        structural_pass = _legacy_structural_pass(result)
-        compatibility_warnings.append("legacy_structural_pass_derived_from_verified_full_stream_flags")
 
     validation = result.get("full_stream_validation")
     nested_pass: bool | None = None
@@ -157,27 +188,29 @@ def normalize_converted_evaluation(
                 raise ConvertedEvaluationSchemaError(
                     "full_stream_validation.structural_pass disagrees with canonical structural pass"
                 )
-        if legacy_fallback:
+        if legacy_v1:
             # The fallback above already proved these fields.  Keep the
             # explicit check here so a malformed mixed record cannot pass by
             # virtue of a single legacy boolean.
             _legacy_structural_pass(result)
-        elif nested_pass is not None and nested_pass != structural_pass:
-            # v1 postprocess wrote the visual result into nested ``pass`` even
-            # while its top-level structural aliases were true.  Reconcile
-            # only that exact, independently verifiable legacy shape.
-            legacy_visual_mixed = (
-                schema_version == LEGACY_POSTPROCESS_SCHEMA
-                and nested_pass is False
-                and structural_pass is True
-                and _legacy_structural_pass(result)
-            )
-            if not legacy_visual_mixed:
-                raise ConvertedEvaluationSchemaError(
-                    "full_stream_validation.pass disagrees with canonical structural pass"
+            if nested_pass is not None and nested_pass != structural_pass:
+                # v1 postprocess wrote the visual result into nested ``pass``
+                # while its top-level structural aliases were true.  Reconcile
+                # only that exact, independently verifiable legacy shape.
+                legacy_visual_mixed = (
+                    nested_pass is False
+                    and structural_pass is True
                 )
-            compatibility_warnings.append(
-                "legacy_nested_full_stream_pass_was_visual_mixed; canonical_structural_pass_retained"
+                if not legacy_visual_mixed:
+                    raise ConvertedEvaluationSchemaError(
+                        "full_stream_validation.pass disagrees with canonical structural pass"
+                    )
+                compatibility_warnings.append(
+                    "legacy_nested_full_stream_pass_was_visual_mixed; canonical_structural_pass_retained"
+                )
+        elif nested_pass is not None and nested_pass != structural_pass:
+            raise ConvertedEvaluationSchemaError(
+                "full_stream_validation.pass disagrees with canonical structural pass"
             )
 
     same_camera = result.get("SAME_CAMERA_VISUAL_PASS")
@@ -206,7 +239,7 @@ def normalize_converted_evaluation(
     _check_identity(
         result,
         expected_identity,
-        required=legacy_fallback or schema_version == LEGACY_POSTPROCESS_SCHEMA,
+        required=legacy_v1,
     )
 
     normalized = dict(result)

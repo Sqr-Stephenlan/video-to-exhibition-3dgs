@@ -264,6 +264,13 @@ def test_component_inventory_resolves_equal_candidates_stably_and_preserves_ties
         }
     ]
     assert {item["selection_status"] for item in inventory["components"]} == {"selected", "not_selected"}
+    reversed_chosen, reversed_names, reversed_inventory = _select_mapper_component(
+        [second, first], selected
+    )
+    assert reversed_chosen == chosen
+    assert reversed_names == names
+    assert reversed_inventory["selection_ties"] == inventory["selection_ties"]
+    assert reversed_inventory["selection_confidence"] == "low"
 
     overlap_first = _component(
         tmp_path / "equal-overlap" / "first",
