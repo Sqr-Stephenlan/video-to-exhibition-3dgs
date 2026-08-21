@@ -7,8 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 FORK_URL = "https://github.com/Sqr-Stephenlan/LongSplat.git"
 FORK_BRANCH = "research/external-fixed-pose-clean-closure"
-NESTED_COMMIT = "bf766eb903c3d9144d64088b8c80b2da67d39411"
-NESTED_TREE = "79f232c42e9128092df0520c5b0209d7ac2b08fd"
+NESTED_COMMIT = "c6496dc43c4ced6d072e3896fd1b172f6658b259"
+NESTED_TREE = "d240c4113a95f632b58b56f3d197160e4dab24cc"
 
 
 def test_gitmodules_gitlink_runner_and_manifest_share_nested_distribution() -> None:

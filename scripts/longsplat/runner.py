@@ -34,7 +34,7 @@ from .conversion_observability import (
 # ---------------------------------------------------------------------------
 
 LONGSPLAT_REPO_URL = "https://github.com/Sqr-Stephenlan/LongSplat"
-LONGSPLAT_COMMIT = "bf766eb903c3d9144d64088b8c80b2da67d39411"
+LONGSPLAT_COMMIT = "c6496dc43c4ced6d072e3896fd1b172f6658b259"
 
 # Submodules expected at the locked commit, with their pinned gitlink SHAs.
 _LONGSPLAT_SUBMODULE_LINKS = {
@@ -79,11 +79,16 @@ _RESERVED_PARAMS = frozenset(
         "load_pose",
         "white_background",
         "seed",
+        "image_residency",
     }
 )
 
 # Valid backend_mode values.
 _BACKEND_MODES = frozenset({"locked_clean", "research_local"})
+
+# Versioned nested image policies.  ``None`` keeps older generic callers
+# unchanged; canonical external plans pass ``cpu-stream-v1`` explicitly.
+_IMAGE_RESIDENCY_POLICIES = frozenset({"auto", "cpu-stream-v1", "gpu-all-v0"})
 
 # Passthrough keys become ``--<key>`` argv entries.  Keep the accepted grammar
 # deliberately narrow so spellings such as ``model_path=/tmp/escape`` cannot
@@ -353,6 +358,9 @@ class LongSplatConfig:
     # Stage-specific iteration overrides for LongSplat.
     # Defaults (from locked train.py) are long runs; smoke tests need these.
     extra_train_args: dict[str, Any] = field(default_factory=dict)
+    # Optional explicit nested image residency policy.  ``None`` preserves
+    # legacy generic command construction; external frozen plans bind this.
+    image_residency: str | None = None
     # Converter settings
     convert_iteration: int = 30_000
     convert_prune_ratio: float = 0.6
@@ -443,6 +451,11 @@ def _validate_config(config: LongSplatConfig) -> None:
                 f"got {config.expected_native_checkpoint_iteration!r}"
             )
     _validate_extra_train_args(config.extra_train_args)
+    if config.image_residency is not None and config.image_residency not in _IMAGE_RESIDENCY_POLICIES:
+        raise BackendValidationError(
+            f"image_residency must be one of {sorted(_IMAGE_RESIDENCY_POLICIES)}, "
+            f"got {config.image_residency!r}"
+        )
 
 
 def _validate_extra_train_args(extra_train_args: Any) -> None:
@@ -672,6 +685,9 @@ def build_train_command(
             for attr_name, cli_name in vda_cli_map.items():
                 cmd.extend([f"--{cli_name}", str(getattr(qg.vda, attr_name))])
 
+    if config.image_residency is not None:
+        cmd.extend(["--image_residency", config.image_residency])
+
     return cmd
 
 
@@ -685,7 +701,7 @@ def build_convert_command(
     root = Path(repo_root)
     convert_script = root / "convert_3dgs.py"
 
-    return [
+    command = [
         python_exe,
         str(convert_script),
         "--source_path",
@@ -703,6 +719,9 @@ def build_convert_command(
         "--anisotropy_soft_limit",
         str(config.convert_anisotropy_soft_limit),
     ]
+    if config.image_residency is not None:
+        command.extend(["--image_residency", config.image_residency])
+    return command
 
 
 # ---------------------------------------------------------------------------

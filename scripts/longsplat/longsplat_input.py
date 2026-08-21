@@ -52,6 +52,7 @@ _SAFE_STATE_SOURCE = "third_party/LongSplat/utils/general_utils.py::safe_state"
 _SAFE_STATE_FILE = "third_party/LongSplat/utils/general_utils.py"
 _TRAIN_ENTRYPOINT = "third_party/LongSplat/train.py"
 _CAMERA_SAMPLING_TELEMETRY_SCHEMA = "camera-sampling-telemetry-v1"
+_IMAGE_RESIDENCY_SCHEMA = "image-residency-telemetry-v1"
 _FUTURE_WORKLOAD_PROFILES: dict[str, dict[str, Any]] = {
     "convergence1000-v1": {
         "iterations": 1000,
@@ -1149,6 +1150,35 @@ def validate_future_smoke_plan(
             _fail("future smoke camera_sampling_telemetry scope mismatch")
         if telemetry.get("legacy_evidence_compatibility") != "absent_allowed":
             _fail("future smoke camera_sampling_telemetry legacy compatibility mismatch")
+    residency = frozen.get("image_residency")
+    has_residency_flag = "--image_residency" in argv
+    if residency is None:
+        # Old plans predate the residency contract.  Keep them replayable; a
+        # partially added flag is still a fail-closed identity mismatch.
+        if has_residency_flag:
+            _fail("legacy future smoke plan cannot carry --image_residency without a frozen contract")
+    else:
+        if not isinstance(residency, Mapping):
+            _fail("future smoke image_residency contract must be an object")
+        expected_residency = {
+            "schema_version": _IMAGE_RESIDENCY_SCHEMA,
+            "strategy": "cpu-stream-v1",
+            "scope": "external_colmap_pose_depth_disabled",
+            "camera_order_binding": "camera_contract-v1",
+            "theory_is_advisory": True,
+            "hard_gate": "schema_identity_strategy_transfer_device_and_residency_only",
+        }
+        for key, expected in expected_residency.items():
+            if residency.get(key) != expected:
+                _fail(f"future smoke image_residency contract mismatch at {key}")
+        if not has_residency_flag:
+            _fail("future smoke argv must bind --image_residency cpu-stream-v1")
+        image_residency_indices = [index for index, token in enumerate(argv) if token == "--image_residency"]
+        if len(image_residency_indices) != 1:
+            _fail("future smoke argv must contain exactly one --image_residency")
+        image_residency_index = image_residency_indices[0]
+        if image_residency_index + 1 >= len(argv) or argv[image_residency_index + 1] != "cpu-stream-v1":
+            _fail("future smoke argv image_residency must be cpu-stream-v1")
     if containment_root is None:
         _fail("future smoke plan validation requires an explicit containment_root")
     try:
@@ -1681,6 +1711,8 @@ def build_future_smoke_plan(
         "0",
         "--translation_lr_init",
         "0",
+        "--image_residency",
+        "cpu-stream-v1",
         "--model_path",
         str(model_path),
     ]
@@ -1711,6 +1743,14 @@ def build_future_smoke_plan(
             "correspondence_loss_weight": 0.0,
             "rotation_lr_init": 0.0,
             "translation_lr_init": 0.0,
+            "image_residency": {
+                "schema_version": _IMAGE_RESIDENCY_SCHEMA,
+                "strategy": "cpu-stream-v1",
+                "scope": "external_colmap_pose_depth_disabled",
+                "camera_order_binding": "camera_contract-v1",
+                "theory_is_advisory": True,
+                "hard_gate": "schema_identity_strategy_transfer_device_and_residency_only",
+            },
             "vda_enabled": False,
             "mast3r_enabled": False,
             "matcher_ab_enabled": False,

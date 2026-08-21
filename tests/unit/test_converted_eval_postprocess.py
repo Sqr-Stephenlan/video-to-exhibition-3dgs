@@ -89,7 +89,9 @@ def test_streaming_postprocess_uses_dynamic_order_and_marks_cpu_reuse(tmp_path: 
     assert result["render_reused"] is True
     assert result["cuda_rerun"] is False
     assert result["full_stream_validation"]["triples_processed"] == 2
-    assert result["full_stream_validation"]["resident_full_resolution_frame_max"] == 3
+    # Legacy conversion evidence has no runtime residency telemetry, so no
+    # theoretical full-resolution-frame estimate is reported.
+    assert result["full_stream_validation"]["resident_full_resolution_frame_max"] is None
     assert result["metrics"]["path"].endswith("/metrics.json")
     assert Path(result["contact_sheet"]["path"]).is_file()
     rows = json.loads((Path(result["metrics"]["path"])).read_text(encoding="utf-8"))["per_view"]

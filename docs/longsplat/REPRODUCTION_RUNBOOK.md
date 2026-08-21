@@ -3,6 +3,35 @@
 > Branch: `research/longsplat-route`
 > Status: research prototype, manually validated
 
+## Current integrated CPU-stream closure (2026-08-21)
+
+The production integration is rooted at `fd07ec332a8c0caa595feaf19196e723450f8ce0`.
+The nested fork is first advanced from `bf766eb903c3d9144d64088b8c80b2da67d39411`
+to `c6496dc43c4ced6d072e3896fd1b172f6658b259`, whose tree is
+`d240c4113a95f632b58b56f3d197160e4dab24cc`. The exact nested delta is recorded
+in `patches/0004-longsplat-cpu-stream-image-residency.patch` (SHA-256
+`690ead1d4b01585d1ea6015c4509e41c2209377b87b2681c3f8a24155e8a356f`).
+
+For a fresh, reproducible nested checkout at the published base:
+
+```bash
+git clone https://github.com/Sqr-Stephenlan/LongSplat.git /tmp/longsplat-cpu-stream
+git -C /tmp/longsplat-cpu-stream checkout bf766eb903c3d9144d64088b8c80b2da67d39411
+git -C /tmp/longsplat-cpu-stream apply --check \
+  /path/to/video-to-exhibition-3dgs/docs/longsplat/patches/0004-longsplat-cpu-stream-image-residency.patch
+git -C /tmp/longsplat-cpu-stream apply \
+  /path/to/video-to-exhibition-3dgs/docs/longsplat/patches/0004-longsplat-cpu-stream-image-residency.patch
+test "$(git -C /tmp/longsplat-cpu-stream rev-parse HEAD^{tree})" = \
+  d240c4113a95f632b58b56f3d197160e4dab24cc
+```
+
+The current route uses `cpu-stream-v1` only for external fixed-pose with
+depth disabled. It retains camera order, native dimensions, pose/loss/sampling
+and conversion mathematics; CPU tests use the existing environments only.
+Theory, budget, and allocator peaks are advisory telemetry. This replay gate
+does not run media, COLMAP, ffmpeg, training, rendering, conversion, evaluation,
+GPU/CUDA, or `nvidia-smi`.
+
 ## Prerequisites
 
 - Python 3.10+ in project `.venv` with `plyfile`, `numpy`

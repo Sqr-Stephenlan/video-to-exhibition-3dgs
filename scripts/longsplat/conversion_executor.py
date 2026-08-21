@@ -59,6 +59,97 @@ def _identity(path: Path, label: str) -> dict[str, Any]:
     return {"path": str(path.resolve()), "sha256": _sha256(path), "size_bytes": path.stat().st_size}
 
 
+def _training_image_residency_strategy(model: Path) -> str | None:
+    """Read the already-produced training policy for conversion forwarding."""
+
+    path = model / "image_residency_training-v1.json"
+    if not path.exists():
+        return None
+    payload = _load_json(path, "training image residency telemetry")
+    strategy = payload.get("strategy")
+    if strategy not in {"cpu-stream-v1", "gpu-all-v0"}:
+        _fail("training image residency telemetry strategy is unsupported")
+    return str(strategy)
+
+
+def _validate_image_residency_telemetry(
+    snapshot: Path,
+    *,
+    authority: Mapping[str, Any],
+    required: bool,
+) -> dict[str, Any]:
+    """Validate conversion-phase residency evidence without a VRAM estimate gate."""
+
+    path = snapshot / "image_residency_conversion-v1.json"
+    if not path.exists():
+        if required:
+            _fail(f"conversion image residency telemetry is missing: {path}")
+        return {
+            "schema_version": "image-residency-telemetry-v1",
+            "status": "legacy_absent_allowed",
+            "path": str(path),
+        }
+    payload = _load_json(path, "conversion image residency telemetry")
+    if payload.get("schema_version") != "image-residency-telemetry-v1":
+        _fail("conversion image residency telemetry schema differs")
+    if payload.get("phase") != "conversion":
+        _fail("conversion image residency telemetry phase differs")
+    if payload.get("strategy") not in {"cpu-stream-v1", "gpu-all-v0"}:
+        _fail("conversion image residency telemetry strategy is unsupported")
+    if payload.get("camera_count") != int(authority["camera_count"]):
+        _fail("conversion image residency telemetry camera count differs")
+    contract = _load_json(snapshot / "external_colmap_pose_contract.json", "external pose contract")
+    names = contract.get("image_names")
+    if not isinstance(names, list) or not all(isinstance(value, str) for value in names):
+        _fail("conversion external pose contract image_names are missing")
+    if payload.get("camera_order") != names:
+        _fail("conversion image residency telemetry camera order differs")
+    if payload.get("camera_order_sha256") is not None:
+        import hashlib
+
+        expected_order_sha = hashlib.sha256(
+            json.dumps(names, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        if payload.get("camera_order_sha256") != expected_order_sha:
+            _fail("conversion image residency telemetry camera order SHA differs")
+    dimensions = payload.get("dimensions")
+    expected_dimensions = authority.get("camera_dimensions", {})
+    if not isinstance(dimensions, Mapping) or not isinstance(expected_dimensions, Mapping):
+        _fail("conversion image residency telemetry dimensions are missing")
+    if dimensions.get("width") != expected_dimensions.get("width") or dimensions.get("height") != expected_dimensions.get("height"):
+        _fail("conversion image residency telemetry dimensions differ")
+    if not isinstance(payload.get("image_dtype"), str) or not payload["image_dtype"]:
+        _fail("conversion image residency telemetry image_dtype is missing")
+    for field in (
+        "cpu_resident_image_bytes",
+        "gpu_resident_gt_frame_count",
+        "gpu_resident_gt_frame_bytes",
+        "gpu_resident_gt_frame_count_peak",
+        "gpu_resident_gt_frame_bytes_peak",
+        "transfer_count",
+        "transfer_bytes",
+        "device_errors",
+    ):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            _fail(f"conversion image residency field is invalid: {field}")
+    if payload.get("device_errors") != 0:
+        _fail("conversion image residency telemetry reports a device error")
+    if payload.get("theory_is_advisory") is not True:
+        _fail("conversion image residency telemetry must mark theory as advisory")
+    if payload.get("transfer_count") == 0 and payload.get("transfer_bytes") != 0:
+        _fail("conversion image residency telemetry reports transfer bytes without a transfer")
+    if payload.get("transfer_count", 0) > 0 and payload.get("transfer_bytes", 0) <= 0:
+        _fail("conversion image residency telemetry has transfers without bytes")
+    if payload.get("strategy") == "cpu-stream-v1" and (
+        payload.get("gpu_resident_gt_frame_count") != 0
+        or payload.get("gpu_resident_gt_frame_bytes") != 0
+        or int(payload.get("gpu_resident_gt_frame_count_peak", 0)) > 1
+    ):
+        _fail("conversion cpu-stream-v1 telemetry reports camera-held CUDA GT residency")
+    return {**payload, "path": str(path), "sha256": _sha256(path)}
+
+
 def _route_outputs(
     route_root: str | Path,
     *,
@@ -212,6 +303,7 @@ def _build_conversion_argv(
         convert_prune_ratio=profile["prune_ratio"],
         convert_anisotropy_reg_weight=profile["anisotropy_reg_weight"],
         convert_anisotropy_soft_limit=profile["anisotropy_soft_limit"],
+        image_residency=_training_image_residency_strategy(paths["model"]),
     )
     nested_argv = build_convert_command(paths["nested"], config, str(paths["backend_python"]))
     record_path = evidence_root / "conversion_record.json"
@@ -330,7 +422,11 @@ def _snapshot(
     snapshot.mkdir(parents=True, exist_ok=False)
     records = []
     before: dict[str, dict[str, Any]] = {}
-    for relative in source_relatives(iteration=iteration):
+    relatives = list(source_relatives(iteration=iteration))
+    optional_residency = "image_residency_training-v1.json"
+    if (model / optional_residency).is_file():
+        relatives.append(optional_residency)
+    for relative in relatives:
         source = model / relative
         source_identity = _identity(source, f"conversion source {relative}")
         before[relative] = source_identity
@@ -349,14 +445,14 @@ def _snapshot(
     alias = _identity(alias_destination, "conversion cameras_all alias")
     if alias["sha256"] != before["cameras_all_train.json"]["sha256"]:
         _fail("cameras_all alias is not byte-identical to cameras_all_train")
-    after = {relative: _identity(model / relative, f"conversion source recheck {relative}") for relative in source_relatives(iteration=iteration)}
+    after = {relative: _identity(model / relative, f"conversion source recheck {relative}") for relative in relatives}
     if {key: value["sha256"] for key, value in before.items()} != {key: value["sha256"] for key, value in after.items()}:
         _fail("conversion source mutated while creating snapshot")
     manifest = {
         "schema_version": "longsplat-conversion-snapshot-v2",
         "source_model": str(model),
         "destination_model": str(snapshot),
-        "allowlist": [*source_relatives(iteration=iteration), "cameras_all.json"],
+        "allowlist": [*relatives, "cameras_all.json"],
         "files": records,
         "alias": {
             "source": before["cameras_all_train.json"],
@@ -404,7 +500,10 @@ def verify_snapshot(snapshot: Path, manifest_path: Path, *, allow_converted_outp
         _fail("conversion cameras_all alias is not byte-identical")
     expected.add((snapshot / "cameras_all.json").resolve())
     actual = {path.resolve() for path in snapshot.rglob("*") if path.is_file() and not path.is_symlink()}
-    unexpected = actual - expected - ({path.resolve() for path in (snapshot / "converted_3dgs").rglob("*") if path.is_file()} if allow_converted_output and (snapshot / "converted_3dgs").is_dir() else set())
+    phase_evidence = {
+        (snapshot / "image_residency_conversion-v1.json").resolve()
+    } if (snapshot / "image_residency_conversion-v1.json").is_file() else set()
+    unexpected = actual - expected - phase_evidence - ({path.resolve() for path in (snapshot / "converted_3dgs").rglob("*") if path.is_file()} if allow_converted_output and (snapshot / "converted_3dgs").is_dir() else set())
     if unexpected:
         _fail("conversion snapshot contains files outside the allowlist")
     return {"manifest_path": str(manifest_path), "manifest_sha256": _sha256(manifest_path), "allowlist_file_count": len(expected)}
@@ -524,7 +623,17 @@ def execute_conversion(
 
             converted = snapshot / "converted_3dgs/point_cloud.ply"
             standard = validate_converted_ply(converted)
-            result.update({"structural_pass": True, "STRUCTURAL_CONVERSION_PASS": True, "structural": standard})
+            image_residency = _validate_image_residency_telemetry(
+                snapshot,
+                authority=authority,
+                required=(snapshot / "image_residency_training-v1.json").is_file(),
+            )
+            result.update({
+                "structural_pass": True,
+                "STRUCTURAL_CONVERSION_PASS": True,
+                "structural": standard,
+                "image_residency": image_residency,
+            })
         except Exception as exc:
             result.update({"structural_pass": False, "STRUCTURAL_CONVERSION_PASS": False, "reason": str(exc)})
     else:

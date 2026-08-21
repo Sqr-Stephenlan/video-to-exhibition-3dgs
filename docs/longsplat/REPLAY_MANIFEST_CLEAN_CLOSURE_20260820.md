@@ -23,6 +23,31 @@ required to replay the committed result.
 The final root commit SHA is reported with the handoff because a commit cannot
 contain its own SHA. Its first closure parent is the root base above.
 
+## CPU-stream successor closure (2026-08-21)
+
+The historical closure above remains available for provenance. The integrated
+successor used by the current production branch is:
+
+| item | value |
+|---|---|
+| root base | fd07ec332a8c0caa595feaf19196e723450f8ce0 |
+| root branch | codex/longsplat-productionize-20260820 |
+| nested base | bf766eb903c3d9144d64088b8c80b2da67d39411 |
+| nested commit | c6496dc43c4ced6d072e3896fd1b172f6658b259 |
+| nested parent | bf766eb903c3d9144d64088b8c80b2da67d39411 |
+| nested tree | d240c4113a95f632b58b56f3d197160e4dab24cc |
+| root gitlink | third_party/LongSplat -> c6496dc43c4ced6d072e3896fd1b172f6658b259 |
+| nested branch | research/external-fixed-pose-clean-closure |
+| nested patch | docs/longsplat/patches/0004-longsplat-cpu-stream-image-residency.patch |
+| nested patch SHA-256 | 690ead1d4b01585d1ea6015c4509e41c2209377b87b2681c3f8a24155e8a356f |
+
+published nested commit: c6496dc43c4ced6d072e3896fd1b172f6658b259
+published nested tree: d240c4113a95f632b58b56f3d197160e4dab24cc
+
+The successor root integration is linearized after the progress commit. Its
+root commit SHA is reported after integration because the manifest cannot
+contain the hash of the commit that contains it.
+
 ## Versioned replay inputs
 
 | path | SHA-256 |

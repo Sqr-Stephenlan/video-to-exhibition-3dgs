@@ -2157,7 +2157,8 @@ def _convergence_render_postcheck_stage(
             "gpu_invoked": False,
             "render_reused": True,
             "cuda_rerun": False,
-            "resident_full_resolution_frame_max": 2,
+            "resident_full_resolution_frame_max": evidence.get("resident_full_resolution_frame_max"),
+            "image_residency": evidence.get("image_residency"),
             "quality_v1": _artifact(quality_path),
             "postcheck": _artifact(postcheck_path),
             "contact_sheets": {
@@ -2333,7 +2334,8 @@ def _formal_native_render_postcheck_stage(
             "gpu_invoked": False,
             "render_reused": True,
             "cuda_rerun": False,
-            "resident_full_resolution_frame_max": 2,
+            "resident_full_resolution_frame_max": evidence.get("resident_full_resolution_frame_max"),
+            "image_residency": evidence.get("image_residency"),
             "quality_v1": _artifact(quality_path),
             "postcheck": _artifact(postcheck_path),
             "contact_sheets": {
@@ -2487,6 +2489,7 @@ def _training_policy(profile: str, plan: Mapping[str, Any], result: Mapping[str,
     width = camera.get("width") if isinstance(camera, Mapping) else None
     height = camera.get("height") if isinstance(camera, Mapping) else None
     telemetry = structural.get("camera_sampling_telemetry") if isinstance(structural, Mapping) else None
+    image_residency = structural.get("image_residency") if isinstance(structural, Mapping) else None
     profile_semantics = {
         "smoke100-v1": "local structural/numeric smoke only; no automatic rough-visual formal release",
         "coverage-smoke-v1": "local dynamic coverage diagnostic; visual decision is separate and does not auto-release formal",
@@ -2511,6 +2514,7 @@ def _training_policy(profile: str, plan: Mapping[str, Any], result: Mapping[str,
         "initial_points": None,
         "camera_sampling_policy": "external fixed-pose phase-local random pop without replacement with stack refill; safe_state seed 0",
         "camera_sampling_telemetry": telemetry,
+        "image_residency": image_residency,
         "checkpoint_metrics": {},
         "checkpoint_iteration": plan.get("render_iteration"),
         "stop_reason": "completed_fixed_profile" if result.get("exit_code") == 0 else "child_process_failure",

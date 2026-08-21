@@ -569,6 +569,7 @@ def run_postprocess(
         "camera_dimensions": dimensions,
         "authority_manifest": _identity(manifest_path, "authority manifest"),
         "conversion": conversion_inputs,
+        "image_residency": conversion_result.get("image_residency"),
         "failed_evaluation": {
             "root": str(failed["eval_root"]),
             "result": _identity(failed["result_path"], "failed evaluator result"),
@@ -582,7 +583,11 @@ def run_postprocess(
             "pass": full_pass,
             "triples_processed": len(rows),
             "expected_triples": count,
-            "resident_full_resolution_frame_max": 3,
+            "resident_full_resolution_frame_max": (
+                conversion_result.get("image_residency", {}).get("gpu_resident_gt_frame_count_peak")
+                if isinstance(conversion_result.get("image_residency"), Mapping)
+                else None
+            ),
             "all_pngs_decoded": structural_pass,
             "all_pngs_finite": structural_pass,
             "all_dimensions_exact": structural_pass,

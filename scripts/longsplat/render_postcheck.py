@@ -470,6 +470,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     camera_names = [str(name) for name in camera_contract["frame_names"]]
     width = int(static["camera"]["width"])
     height = int(static["camera"]["height"])
+    training_image_residency = training_result.get("structural", {}).get("image_residency")
+    render_image_residency = render_result.get("structural", {}).get("image_residency")
+    image_residency_peak = (
+        render_image_residency.get("gpu_resident_gt_frame_count_peak")
+        if isinstance(render_image_residency, dict)
+        else None
+    )
     render_root = model / "train" / f"ours_{iteration}"
     render_paths = _numeric_pngs(render_root / "renders")
     gt_paths = _numeric_pngs(render_root / "gt")
@@ -782,7 +789,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "gpu_invoked": False,
         "render_reused": True,
         "cuda_rerun": False,
-        "resident_full_resolution_frame_max": 2,
+        "resident_full_resolution_frame_max": image_residency_peak,
+        "image_residency": {
+            "training": training_image_residency,
+            "render": render_image_residency,
+            "source": "nested image-residency-telemetry-v1 when available",
+        },
         "run_root": str(run_root),
         "render_attempt": str(render_attempt),
         "render_result": _artifact(render_result_path, root=run_root),
@@ -905,7 +917,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "contact_sheet_layout": postcheck["contact_sheet_layout"],
         "baseline_comparison": baseline_comparison,
         "three_way_comparison": three_way_comparison,
-        "resident_full_resolution_frame_max": 2,
+        "resident_full_resolution_frame_max": image_residency_peak,
+        "image_residency": {
+            "training": training_image_residency,
+            "render": render_image_residency,
+            "source": "nested image-residency-telemetry-v1 when available",
+        },
         "gpu_invoked": False,
         "render_reused": True,
         "cuda_rerun": False,
@@ -1012,6 +1029,7 @@ def adapt_existing_postcheck_return(*, postcheck_path: Path, legacy_return: Mapp
             "mlp_files": dict(stored.get("mlp_files", {})),
             "camera_sampling_telemetry": dict(stored.get("camera_sampling_telemetry", {})),
             "anchor_schedule": dict(stored.get("anchor_schedule", {})),
+            "image_residency": dict(stored.get("image_residency", {})),
             "cross_gap": dict(stored.get("cross_gap", {})),
             "rough_visual": dict(stored.get("rough_visual", {})),
             "contact_sheet_layout": dict(stored.get("contact_sheet_layout", {})),

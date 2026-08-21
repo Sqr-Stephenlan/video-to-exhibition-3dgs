@@ -106,7 +106,9 @@ def test_render_postcheck_is_dynamic_and_streaming_contract_is_recorded(tmp_path
     assert postcheck["counts"] == {"fixed_render": count, "training_gt": count, "nvs_on_path": 2 * count - 1}
     assert postcheck["camera_contract"]["count"] == count
     assert postcheck["camera_contract"]["dimensions"] == {"width": width, "height": height}
-    assert postcheck["resident_full_resolution_frame_max"] == 2
+    # Legacy fixtures have no runtime residency telemetry; the advisory peak
+    # stays absent instead of being replaced by a theoretical estimate.
+    assert postcheck["resident_full_resolution_frame_max"] is None
     assert postcheck["gpu_invoked"] is False
     assert postcheck["held_out"] is False
     assert Path(result["fixed_sheet"]).is_file()

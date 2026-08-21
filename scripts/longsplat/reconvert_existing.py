@@ -39,6 +39,7 @@ _SNAPSHOT_WHITELIST = [
     "cameras_all_train.json",
     "cameras_all_test.json",
 ]
+_OPTIONAL_SNAPSHOT_FILES = ("image_residency_training-v1.json",)
 
 
 def _sha256_hex(path: Path) -> str:
@@ -47,6 +48,23 @@ def _sha256_hex(path: Path) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def _training_image_residency_strategy(source_model: Path) -> str | None:
+    """Bind conversion to the training phase's resolved image policy."""
+
+    path = source_model / "image_residency_training-v1.json"
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"training image residency telemetry is missing or symlinked: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"training image residency telemetry is invalid: {path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("strategy") not in {"cpu-stream-v1", "gpu-all-v0"}:
+        raise ValueError("training image residency telemetry strategy is unsupported")
+    return str(payload["strategy"])
 
 
 def _reject_observability_symlinks(path: Path, label: str) -> None:
@@ -128,8 +146,15 @@ def create_conversion_snapshot(
         "opacity_mlp.pt",
     ]
 
+    snapshot_files = list(_SNAPSHOT_WHITELIST)
+    snapshot_files.extend(
+        relative
+        for relative in _OPTIONAL_SNAPSHOT_FILES
+        if (source / relative).is_file() and not (source / relative).is_symlink()
+    )
+
     # --- Validate source ---
-    for rel in _SNAPSHOT_WHITELIST:
+    for rel in snapshot_files:
         p = source / rel
         if not p.is_file():
             raise FileNotFoundError(f"missing source file: {p}")
@@ -141,7 +166,7 @@ def create_conversion_snapshot(
     # --- Hash source before ---
     hashes_before: dict[str, str] = {}
     all_src_files: list[Path] = []
-    for rel in _SNAPSHOT_WHITELIST:
+    for rel in snapshot_files:
         all_src_files.append(source / rel)
     for fname in checkpoint_files:
         all_src_files.append(source / checkpoint_dir_rel / fname)
@@ -151,7 +176,7 @@ def create_conversion_snapshot(
     # --- Copy (remove a partial snapshot on any failure) ---
     destination.mkdir(parents=True, exist_ok=False)
     try:
-        for rel in _SNAPSHOT_WHITELIST:
+        for rel in snapshot_files:
             src = source / rel
             dst = destination / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -295,6 +320,11 @@ def main(argv: list[str] | None = None) -> None:
         backend_mode = str(args.backend_mode)
     destination_model = args.destination_model.resolve()
     output_record = args.output_record.resolve()
+    try:
+        image_residency = _training_image_residency_strategy(source_model)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     observability_root: Path | None = None
     live_stdout_path: Path | None = None
@@ -370,6 +400,7 @@ def main(argv: list[str] | None = None) -> None:
         convert_prune_ratio=prune_ratio,
         convert_anisotropy_reg_weight=anisotropy_reg_weight,
         convert_anisotropy_soft_limit=anisotropy_soft_limit,
+        image_residency=image_residency,
     )
 
     repo_root_resolved = args.repo_root.resolve()
@@ -388,6 +419,7 @@ def main(argv: list[str] | None = None) -> None:
         "conversion_profile_id": None if authority is None else authority["profile_id"],
         "authority_manifest": None if authority is None else authority["manifest_path"],
         "conversion_iterations": conversion_iterations,
+        "image_residency": image_residency,
         "prune_ratio": prune_ratio,
         "anisotropy_regularization": {
             "weight": anisotropy_reg_weight,

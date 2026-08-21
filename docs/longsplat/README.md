@@ -3,6 +3,20 @@
 Thin runner for pose-free 3DGS reconstruction of long videos via
 [NVlabs/LongSplat](https://github.com/NVlabs/LongSplat).
 
+## Current production closure
+
+The current distribution pins the nested fork to
+`c6496dc43c4ced6d072e3896fd1b172f6658b259` (tree
+`d240c4113a95f632b58b56f3d197160e4dab24cc`). External fixed-pose with depth
+disabled resolves `image_residency=auto` to `cpu-stream-v1`; optional MASt3R,
+VDA, depth, and pose-search routes retain their historical policy unless an
+explicit supported strategy is selected. Runtime evidence is versioned as
+`image-residency-telemetry-v1` and is advisory except for identity, transfer,
+device, and residency contract violations.
+
+The exact nested replay delta is
+[`0004-longsplat-cpu-stream-image-residency.patch`](patches/0004-longsplat-cpu-stream-image-residency.patch).
+
 For the supported product entry point, start with
 [ONE_CLICK_RECONSTRUCTION.md](ONE_CLICK_RECONSTRUCTION.md):
 
@@ -125,6 +139,7 @@ Drop a JSON file into `configs/longsplat/` matching the `LongSplatConfig` schema
 | `seed` | int | `0` | Random seed (locked backend uses 0) |
 | `mode` | str | `custom` | Dataset mode (must be `custom` for video input) |
 | `extra_train_args` | dict | `{}` | Passthrough args to `train.py` |
+| `image_residency` | str | `None` | Optional `auto`, `cpu-stream-v1`, or `gpu-all-v0` policy |
 | `convert_iteration` | int | `30000` | Iteration to convert at |
 | `convert_prune_ratio` | float | `0.6` | Prune ratio for conversion |
 
@@ -157,7 +172,8 @@ The record includes:
 ## Locked backend
 
 The runner is pinned to LongSplat commit
-`19750775a9d19f30aa05a8333c4c6c231b2d5f4a`.
+`c6496dc43c4ced6d072e3896fd1b172f6658b259` from
+`https://github.com/Sqr-Stephenlan/LongSplat`.
 `_check_repo()` verifies the commit and all required submodules before execution.
 
 ## Testing

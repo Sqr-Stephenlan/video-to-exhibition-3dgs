@@ -65,6 +65,7 @@ class SmokeExecutorBlocked(RuntimeError):
 
 
 _SCHEMA = "longsplat-future-smoke-plan-v2"
+_IMAGE_RESIDENCY_SCHEMA = "image-residency-telemetry-v1"
 _TRAIN_REL = Path("third_party/LongSplat/train.py")
 _RENDER_REL = Path("third_party/LongSplat/render.py")
 _DATASET_VALUE_FLAGS = (
@@ -76,6 +77,7 @@ _DATASET_VALUE_FLAGS = (
     "--model_path",
 )
 _DATASET_BOOL_FLAGS = ("--external_colmap_pose", "--disable_resize")
+_OPTIONAL_DATASET_VALUE_FLAGS = ("--image_residency",)
 
 _RENDER_CONSUMER_FILES = {
     "nested/render.py": Path("third_party/LongSplat/render.py"),
@@ -751,7 +753,7 @@ def validate_plan_and_static(
         _fail("argv source_path differs from plan source_path")
     if _value(argv, "--model_path") != str(model):
         _fail("argv model_path differs from plan model_path")
-    for flag, expected in {
+    expected_values = {
         "--images": "images",
         "--mode": "custom",
         "--resolution": "1",
@@ -761,7 +763,13 @@ def validate_plan_and_static(
         "--depth_loss_weight": "0",
         "--rotation_lr_init": "0",
         "--translation_lr_init": "0",
-    }.items():
+    }
+    frozen_contract = plan.get("frozen_contract")
+    if isinstance(frozen_contract, Mapping) and isinstance(frozen_contract.get("image_residency"), Mapping):
+        expected_values["--image_residency"] = str(
+            frozen_contract["image_residency"].get("strategy", "")
+        )
+    for flag, expected in expected_values.items():
         if _value(argv, flag) != expected:
             _fail(f"argv {flag} must be {expected}")
     for flag in _DATASET_BOOL_FLAGS:
@@ -863,6 +871,9 @@ def build_render_command(contract: Mapping[str, Any], *, route_root: str | Path)
     for flag in _DATASET_BOOL_FLAGS:
         if flag in argv:
             result.append(flag)
+    for flag in _OPTIONAL_DATASET_VALUE_FLAGS:
+        if flag in argv:
+            result.extend((flag, _value(argv, flag)))
     result.extend(("--iteration", str(iteration), "--eval", "--skip_test", "--nvs_pose_mode", "adjacent_midpoint_slerp"))
     if "--skip_train" in result:
         _fail("render command must not contain --skip_train")
@@ -928,7 +939,10 @@ def _snapshot_render_model(
         _fail(f"isolated render snapshot must be absent: {snapshot}")
     snapshot.mkdir(parents=True, exist_ok=False)
     source_records: list[dict[str, Any]] = []
-    for template in _SNAPSHOT_RELATIVE_FILES:
+    snapshot_relatives = list(_SNAPSHOT_RELATIVE_FILES)
+    if (original / "image_residency_training-v1.json").is_file():
+        snapshot_relatives.append("image_residency_training-v1.json")
+    for template in snapshot_relatives:
         relative = template.format(iteration=iteration)
         source = _authority_path(
             original / relative,
@@ -1080,7 +1094,10 @@ def _verify_snapshot_manifest(
             )
     unexpected = actual_paths - expected_paths
     unexpected_non_render = {
-        path for path in unexpected if path.relative_to(snapshot).parts[:1] != ("train",)
+        path
+        for path in unexpected
+        if path.relative_to(snapshot).parts[:1] != ("train",)
+        and path.relative_to(snapshot).as_posix() != "image_residency_render-v1.json"
     }
     if unexpected_non_render:
         _fail("isolated render snapshot contains files outside the allowlist/render output")
@@ -1140,6 +1157,86 @@ def _verify_ply_finite(path: Path) -> dict[str, Any]:
                 _fail(f"checkpoint PLY contains non-finite vertex data: {path}")
             offset += size
     return {"path": str(path), "sha256": sha256_file(path), "vertex_count": vertex_count, "finite": True}
+
+
+def _verify_image_residency_evidence(
+    path: Path,
+    *,
+    expected_strategy: str,
+    expected_phase: str,
+    expected_names: Sequence[str],
+    expected_width: int,
+    expected_height: int,
+    expected_transfer_count: int | None = None,
+) -> dict[str, Any]:
+    """Validate runtime residency evidence without a theoretical VRAM gate."""
+
+    if expected_strategy not in {"cpu-stream-v1", "gpu-all-v0"}:
+        _fail(f"image residency strategy is unsupported: {expected_strategy}")
+    if not path.is_file() or path.is_symlink():
+        _fail(f"image residency telemetry is missing or symlinked: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _fail(f"image residency telemetry is not valid JSON: {path}: {exc}")
+    if not isinstance(payload, Mapping):
+        _fail("image residency telemetry must be an object")
+    for key, expected in {
+        "schema_version": _IMAGE_RESIDENCY_SCHEMA,
+        "strategy": expected_strategy,
+        "phase": expected_phase,
+        "camera_count": len(expected_names),
+    }.items():
+        if payload.get(key) != expected:
+            _fail(f"image residency telemetry mismatch at {key}")
+    if payload.get("camera_order") != list(expected_names):
+        _fail("image residency telemetry camera order differs from the pose contract")
+    order_sha = hashlib.sha256(
+        json.dumps(list(expected_names), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    if payload.get("camera_order_sha256") != order_sha:
+        _fail("image residency telemetry camera order SHA differs from the pose contract")
+    dimensions = payload.get("dimensions")
+    if not isinstance(dimensions, Mapping) or dimensions.get("width") != expected_width or dimensions.get("height") != expected_height:
+        _fail("image residency telemetry dimensions differ from the static camera contract")
+    numeric_fields = (
+        "cpu_resident_image_bytes",
+        "gpu_resident_gt_frame_count",
+        "gpu_resident_gt_frame_bytes",
+        "gpu_resident_gt_frame_count_peak",
+        "gpu_resident_gt_frame_bytes_peak",
+        "safe_alias_camera_count",
+        "transfer_count",
+        "transfer_bytes",
+        "device_errors",
+    )
+    for field in numeric_fields:
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            _fail(f"image residency telemetry field is not a non-negative integer: {field}")
+    if payload.get("theory_is_advisory") is not True:
+        _fail("image residency telemetry must mark theory as advisory")
+    if not isinstance(payload.get("image_dtype"), str) or not payload["image_dtype"]:
+        _fail("image residency telemetry image_dtype is missing")
+    if payload.get("device_errors") != 0:
+        _fail("image residency telemetry reports a transfer/device error")
+    if expected_strategy == "cpu-stream-v1":
+        if payload.get("gpu_resident_gt_frame_count") != 0 or payload.get("gpu_resident_gt_frame_bytes") != 0:
+            _fail("cpu-stream-v1 telemetry reports camera-held CUDA GT residency")
+        if int(payload.get("gpu_resident_gt_frame_count_peak", 0)) > 1:
+            _fail("cpu-stream-v1 telemetry reports more than one resident GT frame")
+        if expected_transfer_count is not None and payload.get("transfer_count") != expected_transfer_count:
+            _fail("cpu-stream-v1 transfer count differs from the sampled iteration count")
+        if payload.get("transfer_count", 0) == 0:
+            if payload.get("transfer_bytes") != 0:
+                _fail("cpu-stream-v1 telemetry reports transfer bytes without a transfer")
+        elif payload.get("transfer_bytes", 0) <= 0 or payload.get("gpu_resident_gt_frame_bytes_peak", 0) <= 0:
+            _fail("cpu-stream-v1 telemetry does not bind transfer bytes to one bounded GT frame")
+    return {
+        **dict(payload),
+        "path": str(path),
+        "sha256": sha256_file(path),
+    }
 
 
 def _verify_training_outputs(
@@ -1206,6 +1303,33 @@ def _verify_training_outputs(
             _fail(f"external pose residual exceeds strict smoke tolerance: {key}")
     frozen = contract.get("plan", {}).get("frozen_contract", {}) if isinstance(contract.get("plan"), Mapping) else {}
     workload_profile = contract.get("plan", {}).get("workload_profile") if isinstance(contract.get("plan"), Mapping) else None
+    residency_policy = frozen.get("image_residency") if isinstance(frozen, Mapping) else None
+    if residency_policy is None:
+        image_residency = {
+            "schema_version": _IMAGE_RESIDENCY_SCHEMA,
+            "status": "legacy_absent_allowed",
+            "required_for_new_execution": False,
+        }
+    else:
+        if not isinstance(residency_policy, Mapping):
+            _fail("image residency policy is malformed")
+        expected_residency_strategy = residency_policy.get("strategy")
+        if expected_residency_strategy not in {"cpu-stream-v1", "gpu-all-v0"}:
+            _fail("image residency policy strategy is unsupported")
+        internal_names_for_residency = pose_contract.get("image_names")
+        if not isinstance(internal_names_for_residency, list) or not all(
+            isinstance(value, str) for value in internal_names_for_residency
+        ):
+            _fail("external pose contract image_names are required for image residency telemetry")
+        image_residency = _verify_image_residency_evidence(
+            model / "image_residency_training-v1.json",
+            expected_strategy=str(expected_residency_strategy),
+            expected_phase="training",
+            expected_names=internal_names_for_residency,
+            expected_width=int(camera["width"]),
+            expected_height=int(camera["height"]),
+            expected_transfer_count=iteration if expected_residency_strategy == "cpu-stream-v1" else None,
+        )
     telemetry_policy = frozen.get("camera_sampling_telemetry") if isinstance(frozen, Mapping) else None
     telemetry_required = isinstance(telemetry_policy, Mapping) and telemetry_policy.get("required_for_new_execution") is True
     telemetry_files = (model / "camera_sampling_telemetry-v1.jsonl", model / "camera_sampling_telemetry-v1.json")
@@ -1377,6 +1501,7 @@ def _verify_training_outputs(
         "cameras_all_train_sha256": sha256_file(model / "cameras_all_train.json"),
         "cameras_all_test_sha256": sha256_file(model / "cameras_all_test.json"),
         "camera_sampling_telemetry": telemetry,
+        "image_residency": image_residency,
         "anchor_schedule": pose_contract.get("anchor_schedule") if workload_profile in {"coverage-smoke-v1", "convergence1000-v1", "formal30000-v1"} else {
             "status": "legacy_or_noncoverage_not_required"
         },
@@ -1486,6 +1611,25 @@ def _verify_render_outputs(
             _fail(f"endpoint verification requires OpenCV: {exc}")
     if endpoints_decoded != count:
         _fail(f"fixed/NVS endpoint decoded equality failed: {endpoints_decoded}/{count}")
+    frozen = contract.get("plan", {}).get("frozen_contract", {}) if isinstance(contract.get("plan"), Mapping) else {}
+    residency_policy = frozen.get("image_residency") if isinstance(frozen, Mapping) else None
+    if residency_policy is None:
+        image_residency = {
+            "schema_version": _IMAGE_RESIDENCY_SCHEMA,
+            "status": "legacy_absent_allowed",
+            "required_for_new_execution": False,
+        }
+    else:
+        if not isinstance(residency_policy, Mapping):
+            _fail("render image residency policy is malformed")
+        image_residency = _verify_image_residency_evidence(
+            model / "image_residency_render-v1.json",
+            expected_strategy=str(residency_policy.get("strategy")),
+            expected_phase="render",
+            expected_names=contract["static_verification"]["image_names"],
+            expected_width=width,
+            expected_height=height,
+        )
     return {
         "structural_pass": True,
         "fixed_render_count": len(renders),
@@ -1497,6 +1641,7 @@ def _verify_render_outputs(
         "endpoint_file_byte_equal_count": endpoints_bytes,
         "training_views_only": True,
         "render_root": str(root),
+        "image_residency": image_residency,
     }
 
 

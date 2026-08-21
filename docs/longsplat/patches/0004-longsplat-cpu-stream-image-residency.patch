@@ -1,0 +1,1185 @@
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index c3cb6e9..51bba48 100755
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -66,6 +66,10 @@ class ModelParams(ParamGroup):
+         self._resolution = -1
+         self._white_background = False
+         self.data_device = "cuda"
++        # ``auto`` resolves to cpu-stream-v1 only for the canonical external
++        # fixed-pose/depth-disabled route.  Optional MASt3R/VDA paths retain
++        # the historical GPU image policy unless explicitly changed.
++        self.image_residency = "auto"
+         self.eval = False
+         self.lod = 0
+ 
+diff --git a/convert_3dgs.py b/convert_3dgs.py
+index 3c2c2c8..ffa4cd6 100755
+--- a/convert_3dgs.py
++++ b/convert_3dgs.py
+@@ -128,7 +128,7 @@ def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int
+ 
+         image = render3dgs(viewpoint_cam, gaussians, pipe, background)["render"]
+ 
+-        gt_image = viewpoint_cam.original_image.cuda()
++        gt_image = viewpoint_cam.get_image(device="cuda")
+         Ll1 = l1_loss(image, gt_image)
+         if FUSED_SSIM_AVAILABLE:
+             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+@@ -173,15 +173,20 @@ def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int
+                     psnr_test = 0.0
+                     for view in scene.getTestCameras():
+                         image = render3dgs(view, gaussians, pipe, background)["render"]
+-                        gt_image = view.original_image.cuda()
++                        gt_image = view.get_image(device="cuda")
+                         psnr_test += psnr(image, gt_image).mean().double()
+                     psnr_test /= len(scene.getTestCameras())
+                     print(f"Test PSNR: {psnr_test}")
+-            
++
+             if iteration < opt.iterations:
+                 gaussians.optimizer.step()
+                 gaussians.optimizer.zero_grad(set_to_none = True)
+ 
++    scene.write_image_residency_telemetry(
++        "image_residency_conversion-v1.json",
++        phase="conversion",
++    )
++
+ 
+ if __name__ == "__main__":
+     # Set up command line argument parser
+diff --git a/render.py b/render.py
+index bcfcf09..1437df2 100755
+--- a/render.py
++++ b/render.py
+@@ -55,10 +55,11 @@ from utils.nvs_pose_utils import (
+     build_adjacent_midpoint_slerp_pose_sequence,
+     build_nvs_pose_sequence,
+ )
+-from scene.cameras import Camera
++from scene.cameras import MiniCam
+ import cv2
+ import imageio
+ from utils.colmap_utils import save_imagestxt, save_cameras
++from utils.graphics_utils import getProjectionMatrix, getWorld2View
+ 
+ def render_nvs(model_path, name, iteration, views, gaussians, pipeline, background, nvs_pose_mode="legacy_spline"):
+     nvs_path = os.path.join(model_path, name, "ours_{}".format(iteration), "nvs")
+@@ -90,9 +91,16 @@ def render_nvs(model_path, name, iteration, views, gaussians, pipeline, backgrou
+     FoVy = views[0].FoVy
+     nvs_image_list = []
+     nvs_depth_list = []
+-    gt_list = []
+-    nvs_views = []
+     name_list = []
++    gt_source = views[0].get_image(stage="final", device="cpu")[0:3, :, :]
++    gt_source = (gt_source.permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)[..., ::-1]
++    gt_source = cv2.cvtColor(gt_source, cv2.COLOR_RGB2BGR)
++    gt_writer = imageio.get_writer(
++        os.path.join(videos_path, 'gt.mp4'),
++        fps=30,
++        quality=6,
++        output_params=["-f", "mp4"],
++    )
+     with open(os.path.join(videos_path, "nvs_camera_poses.json"), "w") as pose_file:
+         json.dump(
+             {
+@@ -121,28 +129,52 @@ def render_nvs(model_path, name, iteration, views, gaussians, pipeline, backgrou
+             pose_file,
+             indent=2,
+         )
+-    for i in tqdm(range(nvs_num), desc="Rendering NVS progress"):
+-        nvs_view = Camera(colmap_id=i, R=None, T=None, R_gt=None, T_gt=None, FoVx=FoVx, FoVy=FoVy, 
+-                         image=views[0].original_image, gt_alpha_mask=None, image_name=None, uid=None)
+-        nvs_view.update_RT(nvs_update_rotation[i], nvs_update_translation[i])
+-        nvs_view.to_final()
+-        rendering = render(nvs_view, gaussians, pipeline, background, retain_grad=False)
+-        voxel_visible_mask = rendering["visible_mask"]
+-        torchvision.utils.save_image(rendering["render"], os.path.join(nvs_path, '{0:05d}'.format(i) + ".png"))
+-        render_img = torch.clamp(rendering["render"], min=0., max=1.)
+-        render_img = (render_img.permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)[..., ::-1]
+-        gt = nvs_view.original_image[0:3, :, :]
+-        gt = (gt.permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)[..., ::-1]
+-        gt = cv2.cvtColor(gt, cv2.COLOR_RGB2BGR)
+-        gt_list.append(gt)
+-        depth_map = vis_depth(rendering['depth'][0].detach().cpu().numpy())
+-        depth_map = cv2.cvtColor(depth_map, cv2.COLOR_RGB2BGR)
+-        nvs_depth_list.append(depth_map)
+-        render_img = cv2.cvtColor(render_img, cv2.COLOR_RGB2BGR)
+-        nvs_image_list.append(render_img)
+-        nvs_views.append(nvs_view)
+-        name_list.append('{0:05d}'.format(i))
+-    imageio.mimwrite(os.path.join(videos_path, 'gt.mp4'), np.stack(gt_list), fps=30, quality=6, output_params=["-f", "mp4"])
++    try:
++        for i in tqdm(range(nvs_num), desc="Rendering NVS progress"):
++            world_view_transform = getWorld2View(
++                nvs_update_rotation[i], nvs_update_translation[i]
++            ).transpose(0, 1)
++            projection_matrix = getProjectionMatrix(
++                znear=views[0].znear,
++                zfar=views[0].zfar,
++                fovX=FoVx,
++                fovY=FoVy,
++            ).transpose(0, 1).to(world_view_transform.device)
++            full_proj_transform = (
++                world_view_transform.unsqueeze(0)
++                .bmm(projection_matrix.unsqueeze(0))
++                .squeeze(0)
++            )
++            nvs_view = MiniCam(
++                width=views[0].image_width,
++                height=views[0].image_height,
++                fovy=FoVy,
++                fovx=FoVx,
++                znear=views[0].znear,
++                zfar=views[0].zfar,
++                world_view_transform=world_view_transform,
++                full_proj_transform=full_proj_transform,
++            )
++            nvs_view.projection_matrix = projection_matrix
++            nvs_view.cam_rot_delta = torch.zeros(3, device=world_view_transform.device)
++            nvs_view.cam_trans_delta = torch.zeros(3, device=world_view_transform.device)
++            rendering = render(nvs_view, gaussians, pipeline, background, retain_grad=False)
++            voxel_visible_mask = rendering["visible_mask"]
++            torchvision.utils.save_image(rendering["render"], os.path.join(nvs_path, '{0:05d}'.format(i) + ".png"))
++            render_img = torch.clamp(rendering["render"], min=0., max=1.)
++            render_img = (render_img.permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)[..., ::-1]
++            # Keep only one full-resolution GT frame in memory; the writer
++            # consumes it immediately instead of retaining 2N-1 copies.
++            gt_writer.append_data(gt_source)
++            depth_map = vis_depth(rendering['depth'][0].detach().cpu().numpy())
++            depth_map = cv2.cvtColor(depth_map, cv2.COLOR_RGB2BGR)
++            nvs_depth_list.append(depth_map)
++            render_img = cv2.cvtColor(render_img, cv2.COLOR_RGB2BGR)
++            nvs_image_list.append(render_img)
++            name_list.append('{0:05d}'.format(i))
++            del nvs_view, rendering, render_img, depth_map
++    finally:
++        gt_writer.close()
+     imageio.mimwrite(os.path.join(videos_path, 'nvs_rgb.mp4'), np.stack(nvs_image_list), fps=30, quality=6, output_params=["-f", "mp4"])
+     imageio.mimwrite(os.path.join(videos_path, 'nvs_depth.mp4'), np.stack(nvs_depth_list), fps=30, quality=6, output_params=["-f", "mp4"])
+ 
+@@ -184,7 +216,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
+         t_list.append(t1-t0)
+ 
+         poses_list.append(view.view_world_transform.transpose(0, 1).detach().cpu().numpy())
+-        gt = view.original_image[0:3, :, :]
++        gt = view.get_image(stage="final", device="cpu")[0:3, :, :]
+         name_list.append('{0:05d}'.format(idx))
+ 
+         torchvision.utils.save_image(rendering["render"], os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+@@ -234,7 +266,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
+         focals = np.array(focals)[..., None]
+         principal_points = [views[0].intrinsic[:2, 2].detach().cpu().numpy()] * len(views)
+         principal_points = np.array(principal_points)
+-        image_shape = views[0].original_image.shape
++        image_shape = views[0].image_shape("final")
+         world2cam_np = []
+         for cam in views:
+             Rt = np.eye(4)
+@@ -284,6 +316,11 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
+         with torch.no_grad():
+             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+ 
++    scene.write_image_residency_telemetry(
++        "image_residency_render-v1.json",
++        phase="render",
++    )
++
+ if __name__ == "__main__":
+     # Set up command line argument parser
+     parser = ArgumentParser(description="Testing script parameters")
+diff --git a/scene/__init__.py b/scene/__init__.py
+index 512df10..46fd7e8 100755
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -21,6 +21,10 @@ from utils.external_colmap_pose import (
+     external_camera_contract,
+     load_external_camera_identity,
+ )
++from utils.image_residency import (
++    ImageResidencyTelemetry,
++    resolve_image_residency,
++)
+ 
+ class Scene:
+ 
+@@ -69,11 +73,34 @@ class Scene:
+ 
+         self.gaussians.set_appearance(len(scene_info.train_cameras))
+ 
++        self.image_residency = resolve_image_residency(
++            getattr(args, "image_residency", "auto"),
++            external_colmap_pose=bool(getattr(args, "external_colmap_pose", False)),
++            depth_source=str(getattr(args, "depth_source", "mast3r")),
++        )
++        self.image_residency_telemetry = ImageResidencyTelemetry(
++            strategy=self.image_residency,
++            phase="scene",
++        )
++
+         for resolution_scale in resolution_scales:
+             print("Loading Training Cameras")
+-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
++            self.train_cameras[resolution_scale] = cameraList_from_camInfos(
++                scene_info.train_cameras,
++                resolution_scale,
++                args,
++                image_residency=self.image_residency,
++                residency_telemetry=self.image_residency_telemetry,
++            )
+             print("Loading Test Cameras")
+-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
++            self.test_cameras[resolution_scale] = cameraList_from_camInfos(
++                scene_info.test_cameras,
++                resolution_scale,
++                args,
++                image_residency=self.image_residency,
++                residency_telemetry=self.image_residency_telemetry,
++            )
++        self.image_residency_telemetry.bind(self.getAllCameras())
+ 
+         if self.loaded_iter:
+             self.gaussians.load_ply_sparse_gaussian(os.path.join(self.model_path,
+@@ -129,11 +156,14 @@ class Scene:
+                 if i == 0:
+                     next_viewpoint_cam = self.getTrainCameras()[i + 1]
+                     intrinsic_np = cur_viewpoint_cam.intrinsic.detach().cpu().numpy()
++                    cur_image = cur_viewpoint_cam.get_image(device="cuda")
++                    next_image = next_viewpoint_cam.get_image(device="cuda")
+                     cur_viewpoint_cam.kp0, cur_viewpoint_cam.kp1, desc_conf1, desc_conf2, pts3d1, pts3d2, conf1, conf2, depth1, depth2 = matcher._forward(
+-                        cur_viewpoint_cam.original_image,
+-                        next_viewpoint_cam.original_image,
++                        cur_image,
++                        next_image,
+                         intrinsic_np
+                     )
++                    del cur_image, next_image
+                     cur_viewpoint_cam.depth_map = torch.from_numpy(depth_maps[i]).float().cuda().detach()
+                     cur_viewpoint_cam.depth_map = F.interpolate(cur_viewpoint_cam.depth_map.unsqueeze(0).unsqueeze(0), 
+                                                                 size=(cur_viewpoint_cam.image_height, 
+@@ -145,11 +175,14 @@ class Scene:
+                     pre_viewpoint_cam = self.getTrainCameras()[i - 1]
+                     
+                     intrinsic_np = cur_viewpoint_cam.intrinsic.detach().cpu().numpy()
++                    pre_image = pre_viewpoint_cam.get_image(device="cuda")
++                    cur_image = cur_viewpoint_cam.get_image(device="cuda")
+                     cur_viewpoint_cam.kp0, cur_viewpoint_cam.kp1, desc_conf1, desc_conf2, pts3d1, pts3d2, conf1, conf2, depth1, depth2 = matcher._forward(
+-                        pre_viewpoint_cam.original_image, 
+-                        cur_viewpoint_cam.original_image, 
++                        pre_image,
++                        cur_image,
+                         intrinsic_np
+                     )
++                    del pre_image, cur_image
+                     cur_viewpoint_cam.conf = torch.ones(cur_viewpoint_cam.kp0.shape[0], device=cur_viewpoint_cam.kp0.device)
+                     cur_viewpoint_cam.depth_map = torch.from_numpy(depth_maps[i]).float().cuda().detach()
+                     cur_viewpoint_cam.depth_map = F.interpolate(cur_viewpoint_cam.depth_map.unsqueeze(0).unsqueeze(0), 
+@@ -223,6 +256,7 @@ class Scene:
+             "active_focal_x_px": float(cameras[0].Focalx),
+             "active_focal_y_px": float(cameras[0].Focaly),
+             "depth_source": "disabled",
++            "image_residency": self.image_residency_telemetry.snapshot(phase="scene"),
+         }
+         print(
+             "EXTERNAL_POSE_CONTRACT "
+@@ -247,3 +281,11 @@ class Scene:
+     
+     def getAllCameras(self, scale=1.0):
+         return self.getTrainCameras(scale) + self.getTestCameras(scale)
++
++    def write_image_residency_telemetry(self, filename, *, phase=None):
++        """Write one append-only phase evidence file for the current Scene."""
++
++        return self.image_residency_telemetry.write(
++            os.path.join(self.model_path, filename),
++            phase=phase,
++        )
+diff --git a/scene/cameras.py b/scene/cameras.py
+index 4eeef4f..0251ea4 100755
+--- a/scene/cameras.py
++++ b/scene/cameras.py
+@@ -11,18 +11,26 @@ from torch import nn
+ import numpy as np
+ from utils.graphics_utils import getWorld2View, getProjectionMatrix
+ from utils.graphics_utils import fov2focal, focal2fov
++from utils.image_residency import (
++    IMAGE_RESIDENCY_GPU_ALL_V0,
++    ImageResidencyTelemetry,
++)
+ 
+ class Camera(nn.Module):
+     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
+                  image_name, uid,
+                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+-                 R_gt = None, T_gt = None, disable_resize=False):
++                 R_gt = None, T_gt = None, disable_resize=False,
++                 image_residency=IMAGE_RESIDENCY_GPU_ALL_V0,
++                 residency_telemetry: ImageResidencyTelemetry | None = None):
+         super(Camera, self).__init__()
+ 
+         self.uid = uid
+         self.colmap_id = colmap_id
+         self.image_name = image_name
+         self.is_registered = False
++        self.image_residency = image_residency
++        self.residency_telemetry = residency_telemetry
+ 
+         try:
+             self.data_device = torch.device(data_device)
+@@ -45,10 +53,15 @@ class Camera(nn.Module):
+             self.R_pred = None
+             self.T_pred = None
+ 
+-        t = torch.eye(4, device=data_device)
++        t = torch.eye(4, device=self.data_device)
+         self.R = t[:3, :3]
+         self.T = t[:3, 3]
+ 
++        if image_residency == "cpu-stream-v1":
++            self.image_storage_device = torch.device("cpu")
++        else:
++            self.image_storage_device = self.data_device
++
+         with torch.no_grad():
+             max_side = max(image.shape[1], image.shape[2])
+             if not disable_resize and max_side > 512:
+@@ -57,16 +70,24 @@ class Camera(nn.Module):
+             else:
+                 image_resize = image
+ 
+-        self.original_image = image_resize.clamp(0.0, 1.0).to(self.data_device)
++        self._images_share_storage = bool(
++            disable_resize
++            and gt_alpha_mask is None
++            and tuple(image_resize.shape) == tuple(image.shape)
++        )
++        self.original_image = image_resize.clamp(0.0, 1.0).to(self.image_storage_device)
+         self.image_width = self.original_image.shape[2]
+         self.image_height = self.original_image.shape[1]
+ 
+-        self.original_image_final = image.clamp(0.0, 1.0).to(self.data_device)
++        if self._images_share_storage:
++            self.original_image_final = self.original_image
++        else:
++            self.original_image_final = image.clamp(0.0, 1.0).to(self.image_storage_device)
+         self.image_width_final = self.original_image_final.shape[2]
+         self.image_height_final = self.original_image_final.shape[1]
+ 
+         if gt_alpha_mask is not None:
+-            self.original_image *= gt_alpha_mask.to(self.data_device)
++            self.original_image = self.original_image * gt_alpha_mask.to(self.image_storage_device)
+         
+         self.zfar = 100.0
+         self.znear = 0.01
+@@ -118,6 +139,54 @@ class Camera(nn.Module):
+     def camera_center(self):
+         return self.world_view_transform.inverse()[3, :3]
+ 
++    @property
++    def images_share_storage(self):
++        return self._images_share_storage
++
++    def resident_image_tensors(self):
++        """Return image tensors retained by this Camera, without transferring."""
++
++        return (self.original_image, self.original_image_final)
++
++    def image_shape(self, stage="optimization"):
++        """Return CHW image shape without materializing a device copy."""
++
++        if stage not in ("optimization", "final"):
++            raise ValueError(f"unknown image stage: {stage!r}")
++        image = self.original_image if stage == "optimization" else self.original_image_final
++        return tuple(int(value) for value in image.shape)
++
++    def get_image(self, stage="optimization", device=None, non_blocking=False):
++        """Get one GT image, optionally transferring only the caller's copy.
++
++        The Camera never caches a transfer.  In ``cpu-stream-v1`` the camera
++        list therefore retains CPU tensors only; the returned CUDA tensor is
++        bounded by the caller's current operation.
++        """
++
++        if stage not in ("optimization", "final"):
++            raise ValueError(f"unknown image stage: {stage!r}")
++        image = self.original_image if stage == "optimization" else self.original_image_final
++        target = self.image_storage_device if device is None else torch.device(device)
++        same_type = image.device.type == target.type
++        same_index = target.index is None or image.device.index == target.index
++        if same_type and same_index:
++            return image
++        try:
++            transferred = image.to(device=target, non_blocking=non_blocking)
++        except Exception:
++            if self.residency_telemetry is not None:
++                self.residency_telemetry.record_device_error()
++            raise
++        if self.residency_telemetry is not None:
++            self.residency_telemetry.record_transfer(
++                camera=self,
++                image=transferred,
++                stage=stage,
++                target=target,
++            )
++        return transferred
++
+     @property
+     def tanfovx(self):
+         if self._tanfovx is None:
+@@ -136,9 +205,10 @@ class Camera(nn.Module):
+         self.original_image = self.original_image_final
+         self.image_width = self.image_width_final
+         self.image_height = self.image_height_final
+-        self.Focalx = fov2focal(self.FoVx, self.image_width_final)
+-        self.Focaly = fov2focal(self.FoVy, self.image_height_final)
+-        self.intrinsic = torch.tensor([[self.Focalx, 0, self.image_width_final / 2], [0, self.Focaly, self.image_height_final / 2], [0, 0, 1]]).cuda()
++        if self.FoVx is not None and self.FoVy is not None:
++            self.Focalx = fov2focal(self.FoVx, self.image_width_final)
++            self.Focaly = fov2focal(self.FoVy, self.image_height_final)
++            self.intrinsic = torch.tensor([[self.Focalx, 0, self.image_width_final / 2], [0, self.Focaly, self.image_height_final / 2], [0, 0, 1]]).cuda()
+         if self.depth_map is not None:
+             self.depth_map = torch.nn.functional.interpolate(self.depth_map.unsqueeze(0).unsqueeze(0), size=(self.image_height_final, self.image_width_final), mode='bilinear', align_corners=True).squeeze(0).squeeze(0)
+ 
+@@ -182,6 +252,24 @@ class MiniCam:
+         self.zfar = zfar
+         self.world_view_transform = world_view_transform
+         self.full_proj_transform = full_proj_transform
++        self.projection_matrix = None
++        self.cam_rot_delta = None
++        self.cam_trans_delta = None
++        self._tanfovx = None
++        self._tanfovy = None
+         view_inv = torch.inverse(self.world_view_transform)
+         self.camera_center = view_inv[3][:3]
+ 
++    @property
++    def tanfovx(self):
++        if self._tanfovx is None:
++            import math
++            self._tanfovx = math.tan(self.FoVx * 0.5)
++        return self._tanfovx
++
++    @property
++    def tanfovy(self):
++        if self._tanfovy is None:
++            import math
++            self._tanfovy = math.tan(self.FoVy * 0.5)
++        return self._tanfovy
+diff --git a/tests/test_image_residency.py b/tests/test_image_residency.py
+new file mode 100644
+index 0000000..b3d45ab
+--- /dev/null
++++ b/tests/test_image_residency.py
+@@ -0,0 +1,201 @@
++from __future__ import annotations
++
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest import mock
++
++import torch
++
++from scene.cameras import Camera, MiniCam
++from utils.image_residency import (
++    IMAGE_RESIDENCY_CPU_STREAM_V1,
++    IMAGE_RESIDENCY_GPU_ALL_V0,
++    ImageResidencyError,
++    ImageResidencyTelemetry,
++    resolve_image_residency,
++)
++
++
++def _camera(
++    name: str,
++    *,
++    width: int,
++    height: int,
++    alpha: bool = False,
++    alpha_value: float = 1.0,
++    residency: str = IMAGE_RESIDENCY_CPU_STREAM_V1,
++    telemetry: ImageResidencyTelemetry | None = None,
++) -> Camera:
++    image = torch.linspace(
++        0.0,
++        1.0,
++        3 * height * width,
++        dtype=torch.float32,
++    ).reshape(3, height, width)
++    mask = torch.full((1, height, width), alpha_value, dtype=torch.float32) if alpha else None
++    return Camera(
++        colmap_id=0,
++        R=None,
++        T=None,
++        FoVx=None,
++        FoVy=None,
++        image=image,
++        gt_alpha_mask=mask,
++        image_name=name,
++        uid=0,
++        data_device="cpu",
++        disable_resize=True,
++        image_residency=residency,
++        residency_telemetry=telemetry,
++    )
++
++
++class ImageResidencyTests(unittest.TestCase):
++    def setUp(self) -> None:
++        # These are CPU-only tests.  Telemetry's optional allocator probe is
++        # patched so importing/running this suite never queries CUDA.
++        self.cuda_probe = mock.patch(
++            "utils.image_residency._cuda_memory_snapshot",
++            return_value={"available": False},
++        )
++        self.cuda_probe.start()
++        self.addCleanup(self.cuda_probe.stop)
++
++    def test_cpu_stream_binds_dynamic_camera_order_shapes_bytes_and_dtype(self) -> None:
++        for count, width, height in ((1, 8, 6), (3, 11, 7), (17, 5, 13)):
++            with self.subTest(count=count, width=width, height=height):
++                telemetry = ImageResidencyTelemetry(strategy=IMAGE_RESIDENCY_CPU_STREAM_V1)
++                cameras = [
++                    _camera(f"camera-{index}", width=width, height=height, telemetry=telemetry)
++                    for index in range(count)
++                ]
++                telemetry.bind(cameras)
++
++                evidence = telemetry.snapshot(phase="training")
++
++                self.assertEqual(evidence["camera_count"], count)
++                self.assertEqual(evidence["camera_order"], [f"camera-{index}" for index in range(count)])
++                self.assertEqual(evidence["dimensions"], {"channels": 3, "height": height, "width": width})
++                self.assertEqual(evidence["image_dtype"], "torch.float32")
++                self.assertEqual(evidence["cpu_resident_image_bytes"], count * 3 * height * width * 4)
++                self.assertEqual(evidence["gpu_resident_gt_frame_count"], 0)
++                self.assertEqual(evidence["gpu_resident_gt_frame_bytes"], 0)
++                self.assertEqual(evidence["safe_alias_camera_count"], count)
++                self.assertTrue(evidence["theory_is_advisory"])
++
++    def test_telemetry_reports_shape_set_for_arbitrary_camera_shapes(self) -> None:
++        telemetry = ImageResidencyTelemetry(strategy=IMAGE_RESIDENCY_CPU_STREAM_V1)
++        cameras = [
++            _camera("small", width=8, height=6, telemetry=telemetry),
++            _camera("wide", width=11, height=7, telemetry=telemetry),
++        ]
++        telemetry.bind(cameras)
++
++        self.assertEqual(
++            telemetry.snapshot()["dimensions"],
++            {"shape_set": [[3, 6, 8], [3, 7, 11]]},
++        )
++
++    def test_safe_alias_is_disabled_when_alpha_changes_optimization_semantics(self) -> None:
++        aliased = _camera("plain", width=8, height=6, alpha=False)
++        masked = _camera("masked", width=8, height=6, alpha=True, alpha_value=0.5)
++
++        self.assertTrue(aliased.images_share_storage)
++        self.assertEqual(aliased.original_image.data_ptr(), aliased.original_image_final.data_ptr())
++        self.assertFalse(masked.images_share_storage)
++        self.assertNotEqual(masked.original_image.data_ptr(), masked.original_image_final.data_ptr())
++        self.assertFalse(torch.equal(masked.original_image, masked.original_image_final))
++        self.assertEqual(masked.original_image.dtype, masked.original_image_final.dtype)
++
++    def test_to_final_switches_to_final_pixels_without_device_transfer(self) -> None:
++        camera = _camera("masked", width=7, height=5, alpha=True, alpha_value=0.25)
++        final = camera.original_image_final.clone()
++
++        camera.to_final()
++
++        self.assertTrue(torch.equal(camera.original_image, final))
++        self.assertEqual(camera.image_shape("final"), (3, 5, 7))
++        self.assertEqual(camera.original_image.device.type, "cpu")
++        self.assertEqual(camera.original_image.dtype, torch.float32)
++
++    def test_cpu_stream_transfer_does_not_mutate_camera_residency(self) -> None:
++        telemetry = ImageResidencyTelemetry(strategy=IMAGE_RESIDENCY_CPU_STREAM_V1)
++        camera = _camera("one", width=8, height=6, telemetry=telemetry)
++        telemetry.bind([camera])
++
++        transferred = camera.get_image(device="meta")
++
++        self.assertEqual(transferred.device.type, "meta")
++        self.assertEqual(camera.original_image.device.type, "cpu")
++        self.assertEqual(camera.original_image_final.device.type, "cpu")
++        self.assertEqual(telemetry.snapshot()["transfer_count"], 1)
++        self.assertGreater(telemetry.snapshot()["transfer_bytes"], 0)
++        self.assertEqual(telemetry.snapshot()["gpu_resident_gt_frame_count"], 0)
++
++    def test_transfer_device_mismatch_is_hard_error(self) -> None:
++        telemetry = ImageResidencyTelemetry(strategy=IMAGE_RESIDENCY_CPU_STREAM_V1)
++        camera = _camera("one", width=4, height=3, telemetry=telemetry)
++        telemetry.bind([camera])
++
++        with self.assertRaisesRegex(ImageResidencyError, "different device"):
++            telemetry.record_transfer(
++                camera=camera,
++                image=camera.original_image,
++                stage="optimization",
++                target=SimpleNamespace(type="meta", index=None),
++            )
++        self.assertEqual(telemetry.snapshot()["device_errors"], 1)
++
++    def test_policy_auto_is_route_scoped_and_optional_route_stays_legacy(self) -> None:
++        self.assertEqual(
++            resolve_image_residency(
++                "auto", external_colmap_pose=True, depth_source="disabled"
++            ),
++            IMAGE_RESIDENCY_CPU_STREAM_V1,
++        )
++        self.assertEqual(
++            resolve_image_residency(
++                "auto", external_colmap_pose=False, depth_source="mast3r"
++            ),
++            IMAGE_RESIDENCY_GPU_ALL_V0,
++        )
++        with self.assertRaisesRegex(ImageResidencyError, "scoped"):
++            resolve_image_residency(
++                IMAGE_RESIDENCY_CPU_STREAM_V1,
++                external_colmap_pose=False,
++                depth_source="mast3r",
++            )
++
++    def test_minicam_has_renderer_geometry_but_no_ground_truth_residency(self) -> None:
++        world_view = torch.eye(4)
++        camera = MiniCam(
++            width=11,
++            height=7,
++            fovy=1.0,
++            fovx=1.2,
++            znear=0.01,
++            zfar=100.0,
++            world_view_transform=world_view,
++            full_proj_transform=world_view,
++        )
++
++        self.assertEqual((camera.image_width, camera.image_height), (11, 7))
++        self.assertEqual(camera.camera_center.shape, (3,))
++        self.assertTrue(hasattr(camera, "projection_matrix"))
++        self.assertTrue(hasattr(camera, "cam_rot_delta"))
++        self.assertFalse(hasattr(camera, "original_image"))
++        self.assertFalse(hasattr(camera, "get_image"))
++
++    def test_nvs_uses_bounded_gt_writer_and_minicam(self) -> None:
++        source = (Path(__file__).resolve().parents[1] / "render.py").read_text(encoding="utf-8")
++        nvs_body = source.split("def render_nvs", 1)[1].split("def render_set", 1)[0]
++
++        self.assertNotIn("gt_list", nvs_body)
++        self.assertIn("get_writer", nvs_body)
++        self.assertIn("MiniCam", nvs_body)
++        self.assertIn('get_image(stage="final", device="cpu")', nvs_body)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/train.py b/train.py
+index c236181..c179aa3 100755
+--- a/train.py
++++ b/train.py
+@@ -184,7 +184,7 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
+         scaling = render_pkg["scaling"]
+         opacity = render_pkg["neural_opacity"]
+ 
+-        gt_image = viewpoint_cam.original_image.cuda()
++        gt_image = viewpoint_cam.get_image(device="cuda")
+         Ll1 = l1_loss(image, gt_image)
+         if FUSED_SSIM_AVAILABLE:
+             ssim_loss = 1 - fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+@@ -247,6 +247,10 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
+     scene.save(checkpoint_iteration)
+     save_transforms(scene.getTrainCameras().copy(), os.path.join(scene.model_path, "cameras_all_train.json"))
+     save_transforms(scene.getTestCameras().copy(), os.path.join(scene.model_path, "cameras_all_test.json"))
++    image_residency = scene.write_image_residency_telemetry(
++        "image_residency_training-v1.json",
++        phase="training",
++    )
+     sampling_summary = sampling_telemetry.finalize(checkpoint_iteration=checkpoint_iteration)
+     contract.update({
+         "checkpoint_iteration": checkpoint_iteration,
+@@ -258,6 +262,7 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
+         ),
+         "active_camera_json": os.path.join(scene.model_path, "cameras_all_train.json"),
+         "camera_sampling_telemetry": sampling_summary,
++        "image_residency": image_residency,
+         "anchor_schedule": {
+             "semantics": "LongSplat anchor_growing/adjust_anchor runtime events",
+             "observed_iterations": anchor_adjust_iterations,
+@@ -344,7 +349,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+         rendered_depth = render_pkg["depth"][0]
+         voxel_visible_mask = render_pkg["visible_mask"]
+ 
+-        gt_image = viewpoint_cam.original_image.cuda()
++        gt_image = viewpoint_cam.get_image(device="cuda")
+         Ll1 = l1_loss(image, gt_image)
+ 
+         if FUSED_SSIM_AVAILABLE:
+@@ -442,7 +447,10 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 pre_rendered_depth = pre_render_pkg["depth"][0]
+ 
+                 intrinsic_np = viewpoint_cam.intrinsic.detach().cpu().numpy()
+-                viewpoint_cam.kp0, viewpoint_cam.kp1, _, _, _, _, _, _, viewpoint_cam.pre_depth_map, viewpoint_cam.depth_map = matcher._forward(pre_viewpoint_cam1.original_image, viewpoint_cam.original_image, intrinsic_np)
++                pre_image = pre_viewpoint_cam1.get_image(device="cuda")
++                viewpoint_image = viewpoint_cam.get_image(device="cuda")
++                viewpoint_cam.kp0, viewpoint_cam.kp1, _, _, _, _, _, _, viewpoint_cam.pre_depth_map, viewpoint_cam.depth_map = matcher._forward(pre_image, viewpoint_image, intrinsic_np)
++                del pre_image, viewpoint_image
+                 viewpoint_cam.conf = torch.ones(viewpoint_cam.kp0.shape[0], device=viewpoint_cam.kp0.device)
+                 viewpoint_cam.kp0 = viewpoint_cam.kp0.cuda()
+                 viewpoint_cam.kp1 = viewpoint_cam.kp1.cuda()
+@@ -452,8 +460,9 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 pre_pts = unporject(pre_rendered_depth, pre_viewpoint_cam1.view_world_transform, pre_viewpoint_cam1.intrinsic, viewpoint_cam.kp0)
+                 
+                 kp1 = viewpoint_cam.kp1 / 2 + .5
+-                kp1[:, 0] *= viewpoint_cam.original_image.shape[2]
+-                kp1[:, 1] *= viewpoint_cam.original_image.shape[1]
++                image_shape = viewpoint_cam.image_shape()
++                kp1[:, 0] *= image_shape[2]
++                kp1[:, 1] *= image_shape[1]
+                 pre_pts_np = pre_pts.detach().cpu().numpy()
+                 kp1_np = kp1.detach().cpu().numpy()
+ 
+@@ -495,7 +504,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 viewpoint_cam.depth_map = viewpoint_cam.depth_map * scale + offset
+                 
+             pose_optimizer = torch.optim.Adam([{"params": [viewpoint_cam.cam_trans_delta], "lr": opt.translation_lr_init}, {"params": [viewpoint_cam.cam_rot_delta], "lr": opt.rotation_lr_init}])
+-            gt_image = viewpoint_cam.original_image.cuda()
++            gt_image = viewpoint_cam.get_image(device="cuda")
+             
+             progress_bar = tqdm(range(0, pose_iteration), desc="Pose estiamtion progress")
+             for iteration in range(pose_iteration):
+@@ -572,7 +581,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+             rendered_depth = render_pkg["depth"][0]
+ 
+-            gt_image = viewpoint_cam.original_image.cuda()
++            gt_image = viewpoint_cam.get_image(device="cuda")
+             Ll1 = l1_loss(image, gt_image)
+ 
+             if FUSED_SSIM_AVAILABLE:
+@@ -683,7 +692,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+             rendered_depth = render_pkg["depth"][0]
+             
+-            gt_image = viewpoint_cam.original_image.cuda()
++            gt_image = viewpoint_cam.get_image(device="cuda")
+             Ll1 = l1_loss(image, gt_image)
+ 
+             if FUSED_SSIM_AVAILABLE:
+@@ -875,7 +884,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+         rendered_depth = render_pkg["depth"][0]
+         
+-        gt_image = viewpoint_cam.original_image.cuda()
++        gt_image = viewpoint_cam.get_image(device="cuda")
+         Ll1 = l1_loss(image, gt_image)
+ 
+         if FUSED_SSIM_AVAILABLE:
+@@ -953,6 +962,10 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+     scene.save(iteration)
+     save_transforms(scene.getTrainCameras().copy(), os.path.join(scene.model_path, "cameras_all_train.json"))
+     save_transforms(scene.getTestCameras().copy(), os.path.join(scene.model_path, "cameras_all_test.json"))
++    scene.write_image_residency_telemetry(
++        "image_residency_training-v1.json",
++        phase="training",
++    )
+ 
+ def prepare_output_and_logger(args):    
+     if not args.model_path:
+@@ -995,7 +1008,7 @@ def training_report(tb_writer, dataset_name, Ll1, loss, l1_loss, scene : Scene,
+                 render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                 image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                 voxel_visible_mask = render_pkg["visible_mask"]
+-                gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
++                gt_image = torch.clamp(viewpoint.get_image(device="cuda"), 0.0, 1.0)
+                 if tb_writer and (idx < 30):
+                     tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=end_view_id)
+                     tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=end_view_id)
+diff --git a/utils/camera_utils.py b/utils/camera_utils.py
+index 8985345..c136d8d 100755
+--- a/utils/camera_utils.py
++++ b/utils/camera_utils.py
+@@ -11,10 +11,15 @@ from scene.cameras import Camera
+ import numpy as np
+ from utils.general_utils import PILtoTorch
+ from utils.graphics_utils import fov2focal
++from utils.image_residency import (
++    ImageResidencyTelemetry,
++    resolve_image_residency,
++)
+ 
+ WARNED = False
+ 
+-def loadCam(args, id, cam_info, resolution_scale):
++def loadCam(args, id, cam_info, resolution_scale, *, image_residency=None,
++            residency_telemetry: ImageResidencyTelemetry | None = None):
+     global WARNED
+     orig_w, orig_h = cam_info.image.size
+ 
+@@ -50,18 +55,37 @@ def loadCam(args, id, cam_info, resolution_scale):
+     if resized_image_rgb.shape[1] == 4:
+         loaded_mask = resized_image_rgb[3:4, ...]
+ 
+-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
++    if image_residency is None:
++        image_residency = resolve_image_residency(
++            getattr(args, "image_residency", "auto"),
++            external_colmap_pose=bool(getattr(args, "external_colmap_pose", False)),
++            depth_source=str(getattr(args, "depth_source", "mast3r")),
++        )
++
++    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                   R_gt=cam_info.R_gt, T_gt=cam_info.T_gt,
+                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+                   image=gt_image, gt_alpha_mask=loaded_mask,
+                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+-                  disable_resize=args.disable_resize)
++                  disable_resize=args.disable_resize,
++                  image_residency=image_residency,
++                  residency_telemetry=residency_telemetry)
+ 
+-def cameraList_from_camInfos(cam_infos, resolution_scale, args):
++def cameraList_from_camInfos(cam_infos, resolution_scale, args, *, image_residency=None,
++                             residency_telemetry: ImageResidencyTelemetry | None = None):
+     camera_list = []
+ 
+     for id, c in enumerate(cam_infos):
+-        camera_list.append(loadCam(args, id, c, resolution_scale))
++        camera_list.append(
++            loadCam(
++                args,
++                id,
++                c,
++                resolution_scale,
++                image_residency=image_residency,
++                residency_telemetry=residency_telemetry,
++            )
++        )
+ 
+     return camera_list
+ 
+@@ -77,4 +101,4 @@ def camera_to_JSON(img_path, camera : Camera):
+         'width' : camera.image_width,
+         'height' : camera.image_height,
+     }
+-    return camera_entry
+\ No newline at end of file
++    return camera_entry
+diff --git a/utils/image_residency.py b/utils/image_residency.py
+new file mode 100644
+index 0000000..76a0e33
+--- /dev/null
++++ b/utils/image_residency.py
+@@ -0,0 +1,267 @@
++"""Image residency policies and bounded, versioned runtime evidence.
++
++The camera geometry device and the ground-truth image residency device are
++deliberately separate.  The external fixed-pose RGB-only route uses
++``cpu-stream-v1`` by default; optional pose/depth paths retain the historical
++GPU residency unless a caller explicitly selects another supported policy.
++
++This module has no dependency on the custom rasterizers.  It is therefore
++usable by CPU/fake-device tests and can report CUDA allocator data when the
++runtime makes it available.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++from typing import Any, Iterable, Mapping, Sequence
++
++import torch
++
++
++IMAGE_RESIDENCY_SCHEMA = "image-residency-telemetry-v1"
++IMAGE_RESIDENCY_AUTO = "auto"
++IMAGE_RESIDENCY_CPU_STREAM_V1 = "cpu-stream-v1"
++IMAGE_RESIDENCY_GPU_ALL_V0 = "gpu-all-v0"
++SUPPORTED_IMAGE_RESIDENCIES = frozenset(
++    {
++        IMAGE_RESIDENCY_AUTO,
++        IMAGE_RESIDENCY_CPU_STREAM_V1,
++        IMAGE_RESIDENCY_GPU_ALL_V0,
++    }
++)
++
++
++class ImageResidencyError(ValueError):
++    """The requested image policy or its runtime evidence is invalid."""
++
++
++def resolve_image_residency(
++    requested: str | None,
++    *,
++    external_colmap_pose: bool,
++    depth_source: str,
++) -> str:
++    """Resolve a versioned policy without changing optional algorithm routes."""
++
++    policy = IMAGE_RESIDENCY_AUTO if requested in (None, "") else str(requested)
++    if policy not in SUPPORTED_IMAGE_RESIDENCIES:
++        raise ImageResidencyError(
++            f"unsupported image_residency {policy!r}; "
++            f"expected one of {sorted(SUPPORTED_IMAGE_RESIDENCIES)}"
++        )
++    if policy == IMAGE_RESIDENCY_AUTO:
++        if external_colmap_pose and depth_source == "disabled":
++            return IMAGE_RESIDENCY_CPU_STREAM_V1
++        return IMAGE_RESIDENCY_GPU_ALL_V0
++    if policy == IMAGE_RESIDENCY_CPU_STREAM_V1 and not (
++        external_colmap_pose and depth_source == "disabled"
++    ):
++        raise ImageResidencyError(
++            "cpu-stream-v1 is scoped to external_colmap_pose with "
++            "depth_source=disabled"
++        )
++    return policy
++
++
++def _tensor_nbytes(tensor: torch.Tensor) -> int:
++    return int(tensor.numel() * tensor.element_size())
++
++
++def _storage_key(tensor: torch.Tensor) -> tuple[str, str, int, int]:
++    """Return a key that counts safe aliases only once."""
++
++    try:
++        storage = tensor.untyped_storage()
++        return (
++            "storage",
++            tensor.device.type,
++            int(storage.data_ptr()),
++            int(storage.nbytes()),
++        )
++    except (AttributeError, RuntimeError):
++        return (
++            "tensor",
++            tensor.device.type,
++            int(tensor.data_ptr()),
++            _tensor_nbytes(tensor),
++        )
++
++
++def _unique_tensor_bytes(tensors: Iterable[torch.Tensor]) -> int:
++    seen: set[tuple[str, str, int, int]] = set()
++    total = 0
++    for tensor in tensors:
++        key = _storage_key(tensor)
++        if key in seen:
++            continue
++        seen.add(key)
++        total += _tensor_nbytes(tensor)
++    return total
++
++
++def _cuda_memory_snapshot() -> dict[str, Any]:
++    """Read allocator counters when available; never make them mandatory."""
++
++    try:
++        if not torch.cuda.is_available():
++            return {"available": False}
++        return {
++            "available": True,
++            "allocated_bytes": int(torch.cuda.memory_allocated()),
++            "reserved_bytes": int(torch.cuda.memory_reserved()),
++            "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
++        }
++    except (AttributeError, RuntimeError):
++        return {"available": False, "status": "unavailable"}
++
++
++class ImageResidencyTelemetry:
++    """Static image binding plus observed transfer and allocator evidence."""
++
++    def __init__(self, *, strategy: str, phase: str = "scene") -> None:
++        if strategy not in SUPPORTED_IMAGE_RESIDENCIES - {IMAGE_RESIDENCY_AUTO}:
++            raise ImageResidencyError(f"telemetry requires a resolved strategy, got {strategy!r}")
++        self.strategy = strategy
++        self.phase = str(phase)
++        self.cameras: list[object] = []
++        self.camera_order: list[str] = []
++        self.camera_order_sha256: str | None = None
++        self.camera_count = 0
++        self.dimensions: dict[str, Any] = {}
++        self.image_dtype: str | None = None
++        self.cpu_resident_image_bytes = 0
++        self.gpu_resident_gt_frame_count = 0
++        self.gpu_resident_gt_frame_bytes = 0
++        self.gpu_resident_gt_frame_count_peak = 0
++        self.gpu_resident_gt_frame_bytes_peak = 0
++        self.safe_alias_camera_count = 0
++        self.transfer_count = 0
++        self.transfer_bytes = 0
++        self.cuda_memory_peak: dict[str, Any] = {"available": False}
++        self.device_errors = 0
++
++    def bind(self, cameras: Sequence[object]) -> None:
++        self.cameras = list(cameras)
++        self.camera_order = [str(getattr(camera, "image_name", "")) for camera in self.cameras]
++        if any(not name for name in self.camera_order):
++            raise ImageResidencyError("every bound camera must have an image_name")
++        if len(self.camera_order) != len(set(self.camera_order)):
++            raise ImageResidencyError("bound camera image_name values must be unique")
++        self.camera_order_sha256 = hashlib.sha256(
++            json.dumps(self.camera_order, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
++        ).hexdigest()
++        self.camera_count = len(self.camera_order)
++
++        shapes = {
++            tuple(int(value) for value in camera.image_shape("final"))
++            for camera in self.cameras
++        }
++        if len(shapes) == 1:
++            channels, height, width = next(iter(shapes))
++            self.dimensions = {
++                "channels": channels,
++                "height": height,
++                "width": width,
++            }
++        else:
++            self.dimensions = {
++                "shape_set": [list(shape) for shape in sorted(shapes)],
++            }
++
++        tensors = [
++            image
++            for camera in self.cameras
++            for image in camera.resident_image_tensors()
++        ]
++        self.cpu_resident_image_bytes = _unique_tensor_bytes(
++            image for image in tensors if image.device.type == "cpu"
++        )
++        gpu_tensors = [image for image in tensors if image.device.type == "cuda"]
++        self.gpu_resident_gt_frame_count = len(
++            {
++                _storage_key(image)
++                for image in gpu_tensors
++            }
++        )
++        self.gpu_resident_gt_frame_bytes = _unique_tensor_bytes(gpu_tensors)
++        self.gpu_resident_gt_frame_count_peak = self.gpu_resident_gt_frame_count
++        self.gpu_resident_gt_frame_bytes_peak = self.gpu_resident_gt_frame_bytes
++        self.safe_alias_camera_count = sum(
++            1 for camera in self.cameras if bool(getattr(camera, "images_share_storage", False))
++        )
++        dtypes = {str(image.dtype) for image in tensors}
++        self.image_dtype = next(iter(dtypes)) if len(dtypes) == 1 else None
++        self.cuda_memory_peak = _cuda_memory_snapshot()
++
++    def record_transfer(
++        self,
++        *,
++        camera: object,
++        image: torch.Tensor,
++        stage: str,
++        target: torch.device,
++    ) -> None:
++        del camera, stage
++        if image.device.type != target.type or (
++            target.index is not None and image.device.index != target.index
++        ):
++            self.record_device_error()
++            raise ImageResidencyError(
++                "image transfer returned a tensor on a different device: "
++                f"target={target}, actual={image.device}"
++            )
++        self.transfer_count += 1
++        self.transfer_bytes += _tensor_nbytes(image)
++        if target.type == "cuda":
++            # cpu-stream-v1 deliberately has no cache: at most this one
++            # current GT tensor is owned by the caller between transfers.
++            self.gpu_resident_gt_frame_count_peak = max(
++                self.gpu_resident_gt_frame_count_peak, 1
++            )
++            self.gpu_resident_gt_frame_bytes_peak = max(
++                self.gpu_resident_gt_frame_bytes_peak, _tensor_nbytes(image)
++            )
++        self.cuda_memory_peak = _cuda_memory_snapshot()
++
++    def record_device_error(self) -> None:
++        self.device_errors += 1
++
++    def snapshot(self, *, phase: str | None = None) -> dict[str, Any]:
++        if phase is not None:
++            self.phase = str(phase)
++        self.cuda_memory_peak = _cuda_memory_snapshot()
++        result: dict[str, Any] = {
++            "schema_version": IMAGE_RESIDENCY_SCHEMA,
++            "phase": self.phase,
++            "strategy": self.strategy,
++            "camera_count": self.camera_count,
++            "camera_order": list(self.camera_order),
++            "camera_order_sha256": self.camera_order_sha256,
++            "dimensions": dict(self.dimensions),
++            "image_dtype": self.image_dtype,
++            "cpu_resident_image_bytes": int(self.cpu_resident_image_bytes),
++            "gpu_resident_gt_frame_count": int(self.gpu_resident_gt_frame_count),
++            "gpu_resident_gt_frame_bytes": int(self.gpu_resident_gt_frame_bytes),
++            "gpu_resident_gt_frame_count_peak": int(self.gpu_resident_gt_frame_count_peak),
++            "gpu_resident_gt_frame_bytes_peak": int(self.gpu_resident_gt_frame_bytes_peak),
++            "safe_alias_camera_count": int(self.safe_alias_camera_count),
++            "transfer_count": int(self.transfer_count),
++            "transfer_bytes": int(self.transfer_bytes),
++            "device_errors": int(self.device_errors),
++            "theory_is_advisory": True,
++            "cuda_memory": dict(self.cuda_memory_peak),
++        }
++        return result
++
++    def write(self, path: str | Path, *, phase: str | None = None) -> dict[str, Any]:
++        destination = Path(path)
++        if destination.exists() or destination.is_symlink():
++            raise ImageResidencyError(f"residency telemetry must be absent: {destination}")
++        destination.parent.mkdir(parents=True, exist_ok=True)
++        payload = self.snapshot(phase=phase)
++        with destination.open("x", encoding="utf-8") as handle:
++            json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
++            handle.write("\n")
++        return payload
+diff --git a/utils/pose_utils.py b/utils/pose_utils.py
+index acec092..5b38947 100644
+--- a/utils/pose_utils.py
++++ b/utils/pose_utils.py
+@@ -186,8 +186,11 @@ def vis_loc(viewpoint, ref_viewpoint, gaussians, pipeline, background, matcher):
+         intrinsic_np = viewpoint.intrinsic.detach().cpu().numpy()
+         
+         # Use mast3r for feature matching between reference and test images
++        ref_image = ref_viewpoint.get_image(device="cuda")
++        viewpoint_image = viewpoint.get_image(device="cuda")
+         viewpoint.kp0, viewpoint.kp1, _, _, _, _, _, _, viewpoint.pre_depth_map, viewpoint.depth_map = matcher._forward(
+-            ref_viewpoint.original_image, viewpoint.original_image, intrinsic_np)
++            ref_image, viewpoint_image, intrinsic_np)
++        del ref_image, viewpoint_image
+         
+         # Set confidence and move to GPU
+         viewpoint.conf = torch.ones(viewpoint.kp0.shape[0], device=viewpoint.kp0.device)
+@@ -201,8 +204,9 @@ def vis_loc(viewpoint, ref_viewpoint, gaussians, pipeline, background, matcher):
+         
+         # Convert keypoints to pixel coordinates
+         kp1 = viewpoint.kp1 / 2 + .5
+-        kp1[:, 0] *= viewpoint.original_image.shape[2]
+-        kp1[:, 1] *= viewpoint.original_image.shape[1]
++        image_shape = viewpoint.image_shape()
++        kp1[:, 0] *= image_shape[2]
++        kp1[:, 1] *= image_shape[1]
+         pre_pts_np = pre_pts.detach().cpu().numpy()
+         kp1_np = kp1.detach().cpu().numpy()
+         
+@@ -258,7 +262,7 @@ def vis_loc(viewpoint, ref_viewpoint, gaussians, pipeline, background, matcher):
+     ])
+     # Use step decay for better fine-tuning
+     scheduler = torch.optim.lr_scheduler.MultiStepLR(pose_optimizer, milestones=[400, 600], gamma=0.5)
+-    gt_image = viewpoint.original_image.cuda()
++    gt_image = viewpoint.get_image(device="cuda")
+ 
+     for iteration in range(pose_iteration):
+         render_pkg = render(viewpoint, gaussians, pipeline, background, retain_grad=True)
+@@ -306,4 +310,4 @@ def vis_loc(viewpoint, ref_viewpoint, gaussians, pipeline, background, matcher):
+             pose_optimizer.zero_grad(set_to_none=True)
+             scheduler.step()
+             update_pose(viewpoint)
+-    return True
+\ No newline at end of file
++    return True
