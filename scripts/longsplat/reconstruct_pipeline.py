@@ -3275,30 +3275,359 @@ def _conversion_ply_from_result(conversion: Mapping[str, Any]) -> Path:
     raise PipelineBlocked("conversion result has no technical PLY path")
 
 
-def _evaluation_reused_render_available(evaluation: Mapping[str, Any], camera_count: int) -> bool:
-    """Return true only when a failed evaluator left a complete PNG set."""
+def _strict_existing_run_path(
+    run_dir: Path,
+    value: str | Path,
+    label: str,
+    *,
+    relative: bool = False,
+    directory: bool | None = None,
+) -> Path | None:
+    """Resolve an existing run artifact without following any symlink."""
 
-    executor_root = evaluation.get("executor_root")
-    if not isinstance(executor_root, str):
+    try:
+        raw = Path(value)
+        if relative:
+            if raw.is_absolute() or ".." in raw.parts:
+                return None
+            candidate = run_dir / raw
+        else:
+            if not raw.is_absolute() or ".." in raw.parts:
+                return None
+            candidate = raw
+        if run_dir.is_symlink() or candidate.is_symlink():
+            return None
+        run_root = run_dir.resolve(strict=True)
+        probe = Path(candidate.anchor)
+        for component in candidate.parts[1:]:
+            probe /= component
+            if probe.is_symlink():
+                return None
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(run_root)
+        if directory is True and not resolved.is_dir():
+            return None
+        if directory is False and not resolved.is_file():
+            return None
+        return resolved
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _authority_camera_identity(authority: Mapping[str, Any]) -> dict[str, Any] | None:
+    count = authority.get("camera_count")
+    order = authority.get("camera_order")
+    dimensions = authority.get("camera_dimensions")
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        return None
+    if not isinstance(order, Sequence) or isinstance(order, (str, bytes)) or len(order) != count:
+        return None
+    if any(
+        not isinstance(name, str)
+        or not name
+        or Path(name).name != name
+        or name in {".", ".."}
+        for name in order
+    ) or len(set(order)) != count:
+        return None
+    if not isinstance(dimensions, Mapping):
+        return None
+    width = dimensions.get("width")
+    height = dimensions.get("height")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width <= 0
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height <= 0
+    ):
+        return None
+    return {
+        "camera_count": count,
+        "camera_order": list(order),
+        "camera_dimensions": {"width": width, "height": height},
+    }
+
+
+def _reused_evaluation_names(authority: Mapping[str, Any]) -> list[str] | None:
+    identity = _authority_camera_identity(authority)
+    if identity is None:
+        return None
+    manifest = authority.get("authority", {}).get("manifest", {}) if isinstance(authority.get("authority"), Mapping) else {}
+    if not isinstance(manifest, Mapping):
+        manifest = {}
+    try:
+        from .converted_eval_postprocess import _expected_converted_names
+
+        names = _expected_converted_names(identity["camera_order"], manifest)
+    except Exception:
+        return None
+    return names if len(names) == identity["camera_count"] and len(set(names)) == len(names) else None
+
+
+def _png_inventory_matches(
+    *,
+    run_dir: Path,
+    root: Path,
+    names: Sequence[str],
+    dimensions: Mapping[str, Any],
+) -> bool:
+    resolved_root = _strict_existing_run_path(run_dir, root, "reused evaluator PNG root", directory=True)
+    if resolved_root is None:
         return False
-    root = Path(executor_root).resolve()
-    result_path = root / "evaluation_result.json"
-    eval_root = root / "same_camera_eval"
-    if not result_path.is_file() or eval_root.is_symlink() or not eval_root.is_dir():
+    root = resolved_root
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return False
+    if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+        return False
+    if sorted(entry.name for entry in entries) != sorted(names):
+        return False
+    try:
+        import cv2
+    except ImportError:
+        return False
+    expected_shape = (int(dimensions["height"]), int(dimensions["width"]))
+    for name in names:
+        path = _strict_existing_run_path(run_dir, root / name, f"reused evaluator PNG {name}", directory=False)
+        if path is None:
+            return False
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None or tuple(image.shape[:2]) != expected_shape:
+            return False
+    return True
+
+
+def _evaluation_artifact_declaration_valid(
+    evaluation: Mapping[str, Any],
+    *,
+    run_dir: Path,
+    result_path: Path,
+) -> bool:
+    artifacts = evaluation.get("artifacts")
+    if not isinstance(artifacts, list) or not RunLedger._artifacts_valid(evaluation, root=run_dir):
+        return False
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping) or not isinstance(artifact.get("path"), str):
+            continue
+        path = _strict_existing_run_path(run_dir, artifact["path"], "converted evaluator artifact", directory=False)
+        if path != result_path:
+            continue
+        expected_sha = artifact.get("sha256")
+        return isinstance(expected_sha, str) and sha256_file(path) == expected_sha
+    return False
+
+
+def _evaluation_reused_render_available(
+    evaluation: Mapping[str, Any],
+    *,
+    authority_result: Mapping[str, Any],
+    run_dir: Path,
+) -> bool:
+    """Return true only for a fully bound, failed evaluator artifact set."""
+
+    if evaluation.get("status") != "failed" or evaluation.get("computed_pass") is True:
+        return False
+    identity = _authority_camera_identity(authority_result)
+    names = _reused_evaluation_names(authority_result)
+    if identity is None or names is None:
+        return False
+    for key in ("camera_count", "camera_order", "camera_dimensions"):
+        if key in evaluation and evaluation.get(key) != identity[key]:
+            return False
+    child = evaluation.get("executor_result")
+    if not isinstance(child, Mapping):
+        return False
+    exit_code = child.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code == 0:
+        return False
+    executor_root_value = evaluation.get("executor_root")
+    if not isinstance(executor_root_value, str):
+        return False
+    root = _strict_existing_run_path(run_dir, executor_root_value, "converted evaluator executor root", directory=True)
+    if root is None:
+        return False
+    result_path = _strict_existing_run_path(run_dir, root / "evaluation_result.json", "converted evaluator result", directory=False)
+    if result_path is None or not _evaluation_artifact_declaration_valid(evaluation, run_dir=run_dir, result_path=result_path):
         return False
     try:
         result = _load_json(result_path, "converted evaluator result")
     except PipelineBlocked:
         return False
-    if result.get("exit_code") == 0:
+    if result.get("stage") != "converted-eval" or result.get("exit_code") != exit_code:
+        return False
+    eval_root = _strict_existing_run_path(run_dir, root / "same_camera_eval", "converted evaluator render root", directory=True)
+    if eval_root is None:
         return False
     gt = eval_root / "evaluator_result_gt"
     converted = eval_root / "evaluator_result_renders"
-    if not gt.is_dir() or not converted.is_dir() or gt.is_symlink() or converted.is_symlink():
-        return False
-    gt_files = sorted(path for path in gt.iterdir() if path.is_file() and not path.is_symlink())
-    converted_files = sorted(path for path in converted.iterdir() if path.is_file() and not path.is_symlink())
-    return len(gt_files) == camera_count and len(converted_files) == camera_count and [path.name for path in gt_files] == [path.name for path in converted_files]
+    return _png_inventory_matches(
+        run_dir=run_dir,
+        root=gt,
+        names=names,
+        dimensions=identity["camera_dimensions"],
+    ) and _png_inventory_matches(
+        run_dir=run_dir,
+        root=converted,
+        names=names,
+        dimensions=identity["camera_dimensions"],
+    )
+
+
+def _latest_declared_stage_attempt(
+    summary: Mapping[str, Any],
+    run_dir: Path,
+    stage: str,
+    *,
+    required_status: str = "failed",
+    require_identity: bool = False,
+) -> dict[str, Any] | None:
+    """Load one latest stage attempt strictly through its ledger declaration."""
+
+    entries = _stage_summary_entries(summary, stage)
+    if entries is None:
+        return None
+    latest = entries[-1]
+    if not isinstance(latest, Mapping) or latest.get("status") != required_status:
+        return None
+    attempt_name = latest.get("attempt")
+    result_path_value = latest.get("result_path")
+    if not isinstance(attempt_name, str) or not re.fullmatch(r"attempt-[0-9]+", attempt_name):
+        return None
+    if not isinstance(result_path_value, str):
+        return None
+    declared = _strict_existing_run_path(run_dir, result_path_value, "failed evaluator ledger result", relative=True, directory=False)
+    expected = run_dir / "stages" / stage / attempt_name / "result.json"
+    if declared is None or declared != expected.resolve():
+        return None
+    try:
+        envelope = _load_json(declared, "failed evaluator ledger result")
+    except PipelineBlocked:
+        return None
+    if envelope.get("schema_version") != "stage-attempt-result-v1" or envelope.get("stage") != stage or envelope.get("status") != required_status:
+        return None
+    if require_identity:
+        summary_identity = summary.get("identity")
+        envelope_identity = envelope.get("identity")
+        if not isinstance(summary_identity, Mapping) or not isinstance(envelope_identity, Mapping) or dict(envelope_identity) != dict(summary_identity):
+            return None
+    result = envelope.get("result")
+    if not isinstance(result, Mapping) or result.get("stage") != stage or result.get("status") != required_status:
+        return None
+    if not RunLedger._artifacts_valid(result, root=run_dir):
+        return None
+    return {
+        "attempt": attempt_name,
+        "result_path": declared,
+        "result": dict(result),
+    }
+
+
+def _latest_declared_passed_stage_result(
+    summary: Mapping[str, Any],
+    run_dir: Path,
+    stage: str,
+) -> dict[str, Any] | None:
+    latest = _latest_declared_stage_attempt(
+        summary,
+        run_dir,
+        stage,
+        required_status="passed",
+    )
+    return None if latest is None else latest["result"]
+
+
+def _recover_failed_converted_evaluation(
+    *,
+    summary: Mapping[str, Any],
+    run_dir: Path,
+    authority_result: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Bind a complete failed evaluator attempt for CPU-only postprocess."""
+
+    latest = _latest_declared_stage_attempt(
+        summary,
+        run_dir,
+        "converted-eval",
+        required_status="failed",
+        require_identity=True,
+    )
+    if latest is None:
+        return None
+    evaluation = latest["result"]
+    if not _evaluation_reused_render_available(
+        evaluation,
+        authority_result=authority_result,
+        run_dir=run_dir,
+    ):
+        return None
+    recovered = dict(evaluation)
+    recovered.update(
+        {
+            "render_artifacts_available": True,
+            "render_reused": True,
+            "cuda_rerun": False,
+            "evaluation_gate": "deferred_to_cpu_streaming_postprocess",
+            "failed_evaluation_recovery": {
+                "schema_version": "failed-evaluator-artifact-recovery-v1",
+                "source_attempt": latest["attempt"],
+                "source_result_path": str(latest["result_path"]),
+                "read_only": True,
+            },
+        }
+    )
+    return recovered
+
+
+def _resolve_converted_evaluation(
+    *,
+    ledger: RunLedger,
+    authority_result: Mapping[str, Any],
+    route: Path,
+    execute_gpu: bool,
+    native_evidence_root: Path,
+    conversion_evidence_root: Path,
+) -> tuple[dict[str, Any], str]:
+    """Resolve converted evaluation for both default and legacy consumers."""
+
+    evaluation = _stage_reusable(ledger, "converted-eval")
+    if evaluation is not None:
+        return {**evaluation, "reused": True}, "passed"
+    blocked = ledger.summary.get("blocked")
+    if isinstance(blocked, Mapping) and blocked.get("stage") == "converted-eval-postprocess":
+        recovered = _recover_failed_converted_evaluation(
+            summary=ledger.summary,
+            run_dir=ledger.run_dir,
+            authority_result=authority_result,
+        )
+        if recovered is not None:
+            return recovered, "passed"
+    evaluation, status = _execute_authority_stage(
+        ledger=ledger,
+        stage="converted-eval",
+        authority_result=authority_result,
+        plan=False,
+        execute_gpu=execute_gpu,
+        route=route,
+        native_evidence_root=native_evidence_root,
+        conversion_evidence_root=conversion_evidence_root,
+    )
+    if status != "passed" and _evaluation_reused_render_available(
+        evaluation,
+        authority_result=authority_result,
+        run_dir=ledger.run_dir,
+    ):
+        evaluation = {
+            **evaluation,
+            "render_artifacts_available": True,
+            "render_reused": True,
+            "cuda_rerun": False,
+            "evaluation_gate": "deferred_to_cpu_streaming_postprocess",
+        }
+        return evaluation, "passed"
+    return evaluation, status
 
 
 def _converted_eval_postprocess_stage(
@@ -3784,28 +4113,18 @@ def _run_default_formal_delivery(
         _finish_summary(ledger, results, status="stopped", reason="requested stop-after conversion")
         return _run_result(ledger, results, stop_after=stop_after, plan=False, next_slice="resume at converted-eval")
 
-    evaluation = _stage_reusable(ledger, "converted-eval")
-    if evaluation is None:
-        evaluation, status = _execute_authority_stage(
-            ledger=ledger,
-            stage="converted-eval",
-            authority_result=authority_result,
-            plan=False,
-            execute_gpu=execute_gpu,
-            route=route,
-            native_evidence_root=Path(str(native["executor_root"])),
-            conversion_evidence_root=Path(str(conversion["executor_root"])),
-        )
-        results["converted-eval"] = evaluation
-        if status != "passed":
-            if not _evaluation_reused_render_available(evaluation, int(authority_result.get("camera_count", 0))):
-                _finish_summary(ledger, results, status="blocked", reason=evaluation["reason"])
-                return _run_result(ledger, results, stop_after=stop_after, plan=False, next_slice="inspect converted-eval failure")
-            evaluation = {**evaluation, "render_artifacts_available": True, "render_reused": True, "cuda_rerun": False, "evaluation_gate": "deferred_to_cpu_streaming_postprocess"}
-            results["converted-eval"] = evaluation
-    else:
-        evaluation = {**evaluation, "reused": True}
-        results["converted-eval"] = evaluation
+    evaluation, status = _resolve_converted_evaluation(
+        ledger=ledger,
+        authority_result=authority_result,
+        route=route,
+        execute_gpu=execute_gpu,
+        native_evidence_root=Path(str(native["executor_root"])),
+        conversion_evidence_root=Path(str(conversion["executor_root"])),
+    )
+    results["converted-eval"] = evaluation
+    if status != "passed":
+        _finish_summary(ledger, results, status="blocked", reason=evaluation["reason"])
+        return _run_result(ledger, results, stop_after=stop_after, plan=False, next_slice="inspect converted-eval failure")
     if stop_after == "converted-eval":
         _finish_summary(ledger, results, status="stopped", reason="requested stop-after converted-eval")
         return _run_result(ledger, results, stop_after=stop_after, plan=False, next_slice="resume at converted-eval-postprocess")
@@ -4304,6 +4623,19 @@ def _mid_consumer_resume_allowed(
     if blocked_stage not in retryable:
         return False
     idx = consumer_chain.index(blocked_stage)
+    failed_evaluation_recovery = False
+    if blocked_stage == "converted-eval-postprocess" and _stage_latest_status(summary, "converted-eval") == "failed":
+        summary_identity = summary.get("identity")
+        if not isinstance(summary_identity, Mapping) or dict(summary_identity) != dict(existing_identity):
+            return False
+        authority_result = _latest_declared_passed_stage_result(summary, run_dir, "authority-manifest")
+        if authority_result is None or _recover_failed_converted_evaluation(
+            summary=summary,
+            run_dir=run_dir,
+            authority_result=authority_result,
+        ) is None:
+            return False
+        failed_evaluation_recovery = True
     producer_stages = (
         "preflight",
         "probe",
@@ -4322,6 +4654,8 @@ def _mid_consumer_resume_allowed(
     if not _stage_latest_passed_with_valid_artifacts(summary, run_dir, "formal-training"):
         return False
     for stage in consumer_chain[:idx]:
+        if stage == "converted-eval" and failed_evaluation_recovery:
+            continue
         if not _stage_latest_passed_with_valid_artifacts(summary, run_dir, stage):
             return False
     if _stage_latest_status(summary, blocked_stage) not in {None, "blocked", "failed"}:
@@ -5640,24 +5974,18 @@ def run_reconstruction(
         _finish_summary(ledger, results, status="stopped", reason="requested stop-after conversion")
         return _run_result(ledger, results, stop_after=stop_after, plan=False, next_slice="resume at converted-eval")
 
-    evaluation = _stage_reusable(ledger, "converted-eval")
-    if evaluation is None:
-        evaluation, status = _execute_authority_stage(ledger=ledger, stage="converted-eval", authority_result=authority_result, plan=False, execute_gpu=execute_gpu, route=route, native_evidence_root=Path(str(native["executor_root"])), conversion_evidence_root=Path(str(conversion["executor_root"])))
-        results["converted-eval"] = evaluation
-        if status != "passed":
-            if not _evaluation_reused_render_available(evaluation, int(authority_result.get("camera_count", 0))):
-                _finish_summary(ledger, results, status="blocked", reason=evaluation["reason"])
-                return _run_result(ledger, results, stop_after=stop_after, plan=False, next_slice="inspect the preserved converted-eval attempt")
-            evaluation = {
-                **evaluation,
-                "render_artifacts_available": True,
-                "render_reused": True,
-                "cuda_rerun": False,
-                "evaluation_gate": "deferred_to_cpu_streaming_postprocess",
-            }
-            results["converted-eval"] = evaluation
-    else:
-        results["converted-eval"] = {**evaluation, "reused": True}
+    evaluation, status = _resolve_converted_evaluation(
+        ledger=ledger,
+        authority_result=authority_result,
+        route=route,
+        execute_gpu=execute_gpu,
+        native_evidence_root=Path(str(native["executor_root"])),
+        conversion_evidence_root=Path(str(conversion["executor_root"])),
+    )
+    results["converted-eval"] = evaluation
+    if status != "passed":
+        _finish_summary(ledger, results, status="blocked", reason=evaluation["reason"])
+        return _run_result(ledger, results, stop_after=stop_after, plan=False, next_slice="inspect the preserved converted-eval attempt")
     if STAGE_INDEX[stop_after] == STAGE_INDEX["converted-eval"]:
         _finish_summary(ledger, results, status="stopped", reason="requested stop-after converted-eval")
         return _run_result(ledger, results, stop_after=stop_after, plan=False, next_slice="resume at converted-eval-postprocess")

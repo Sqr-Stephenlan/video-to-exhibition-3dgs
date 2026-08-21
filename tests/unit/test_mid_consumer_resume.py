@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
+import scripts.longsplat.reconstruct_pipeline as reconstruct_pipeline
 from scripts.longsplat.pipeline_contract import RunLedger
 from scripts.longsplat.reconstruct_pipeline import (
+    _converted_eval_postprocess_stage,
+    _recover_failed_converted_evaluation,
     _mid_consumer_resume_allowed,
+    _resolve_converted_evaluation,
     _stage_reusable,
 )
 
@@ -138,6 +145,119 @@ def _gate_kwargs(run_dir: Path, identity: dict, config: dict, **over) -> dict:
     )
     kwargs.update(over)
     return kwargs
+
+
+def _recovery_fixture(tmp_path: Path) -> tuple[Path, dict[str, object], dict[str, object], dict[str, object], Path]:
+    run_dir, summary, identity, config = _fixture(tmp_path)
+    summary["identity"] = identity
+    camera_order = ["view-a", "view-b"]
+    dimensions = {"width": 5, "height": 4}
+    authority_manifest_path = run_dir / "authority-manifest.json"
+    authority_manifest_path.write_text("{}", encoding="utf-8")
+    authority_result = {
+        "schema_version": "longsplat-reconstruct-stage-v2",
+        "stage": "authority-manifest",
+        "status": "passed",
+        "computed_pass": True,
+        "artifacts": [],
+        "camera_count": len(camera_order),
+        "camera_order": camera_order,
+        "camera_dimensions": dimensions,
+        "authority_manifest_path": str(authority_manifest_path.resolve()),
+        "authority": {"manifest": {}},
+    }
+    authority_path = run_dir / "stages" / "authority-manifest" / "attempt-0001" / "result.json"
+    authority_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "stage-attempt-result-v1",
+                "stage": "authority-manifest",
+                "status": "passed",
+                "identity": identity,
+                "result": authority_result,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    eval_attempt = run_dir / "stages" / "converted-eval" / "attempt-0001"
+    executor_root = eval_attempt / "executor"
+    gt_root = executor_root / "same_camera_eval" / "evaluator_result_gt"
+    converted_root = executor_root / "same_camera_eval" / "evaluator_result_renders"
+    gt_root.mkdir(parents=True)
+    converted_root.mkdir(parents=True)
+    names = [f"{index:04d}_{name}.png" for index, name in enumerate(camera_order)]
+    for index, name in enumerate(names):
+        image = np.full((dimensions["height"], dimensions["width"], 3), index + 1, dtype=np.uint8)
+        assert cv2.imwrite(str(gt_root / name), image)
+        assert cv2.imwrite(str(converted_root / name), image)
+    evaluator_result = {
+        "schema_version": "longsplat-generic-converted-evaluation-v1",
+        "stage": "converted-eval",
+        "exit_code": 7,
+        "SAME_CAMERA_VISUAL_PASS": "fail",
+        "reason": "fixture evaluator failure",
+    }
+    evaluator_result_path = executor_root / "evaluation_result.json"
+    evaluator_result_path.write_text(json.dumps(evaluator_result), encoding="utf-8")
+    evaluator_stage = {
+        "schema_version": "longsplat-reconstruct-stage-v2",
+        "stage": "converted-eval",
+        "status": "failed",
+        "computed_pass": False,
+        "artifacts": [
+            {
+                "path": str(evaluator_result_path.resolve()),
+                "sha256": hashlib.sha256(evaluator_result_path.read_bytes()).hexdigest(),
+            }
+        ],
+        "executor_root": str(executor_root.resolve()),
+        "executor_result": evaluator_result,
+        "reason": "fixture evaluator failure",
+    }
+    (eval_attempt / "result.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage-attempt-result-v1",
+                "stage": "converted-eval",
+                "status": "failed",
+                "identity": identity,
+                "result": evaluator_stage,
+            }
+        ),
+        encoding="utf-8",
+    )
+    summary["stages"]["converted-eval"] = [
+        {"attempt": "attempt-0001", "status": "failed", "result_path": "stages/converted-eval/attempt-0001/result.json"}
+    ]
+    blocked_attempt = run_dir / "stages" / "converted-eval-postprocess" / "attempt-0001"
+    blocked_attempt.mkdir(parents=True)
+    (blocked_attempt / "result.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage-attempt-result-v1",
+                "stage": "converted-eval-postprocess",
+                "status": "blocked",
+                "identity": identity,
+                "result": {
+                    "schema_version": "longsplat-reconstruct-stage-v2",
+                    "stage": "converted-eval-postprocess",
+                    "status": "blocked",
+                    "computed_pass": False,
+                    "artifacts": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    summary["stages"]["converted-eval-postprocess"] = [
+        {"attempt": "attempt-0001", "status": "blocked", "result_path": "stages/converted-eval-postprocess/attempt-0001/result.json"}
+    ]
+    summary["blocked"] = {"stage": "converted-eval-postprocess", "error": "postprocess failed", "exit_code": 2}
+    summary.pop("active_stage", None)
+    summary.pop("active_attempt", None)
+    (run_dir / "run.json").write_text(json.dumps(summary), encoding="utf-8")
+    return run_dir, summary, identity, config, evaluator_result_path
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +499,237 @@ def test_mid_consumer_resume_allowed_blocked_at_converted_eval_postprocess(tmp_p
     summary["blocked"] = {"stage": "converted-eval-postprocess", "error": "postprocess failed", "exit_code": 2}
     (run_dir / "run.json").write_text(json.dumps(summary), encoding="utf-8")
     assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config)) is True
+
+
+def test_failed_evaluator_artifacts_allow_cpu_postprocess_resume_without_gpu_retry(tmp_path: Path) -> None:
+    run_dir, summary, identity, config, _evaluator_result_path = _recovery_fixture(tmp_path)
+    authority_result = json.loads(
+        (run_dir / "stages" / "authority-manifest" / "attempt-0001" / "result.json").read_text(encoding="utf-8")
+    )["result"]
+    recovered = _recover_failed_converted_evaluation(
+        summary=summary,
+        run_dir=run_dir,
+        authority_result=authority_result,
+    )
+    assert recovered is not None
+    assert recovered["executor_result"]["exit_code"] == 7
+    assert recovered["render_artifacts_available"] is True
+    assert recovered["render_reused"] is True
+    assert recovered["cuda_rerun"] is False
+    assert recovered["evaluation_gate"] == "deferred_to_cpu_streaming_postprocess"
+    assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config, execute_gpu=False)) is True
+
+
+def test_failed_evaluator_recovery_rejects_incomplete_png_inventory(tmp_path: Path) -> None:
+    run_dir, summary, identity, config, _ = _recovery_fixture(tmp_path)
+    (run_dir / "stages" / "converted-eval" / "attempt-0001" / "executor" / "same_camera_eval" / "evaluator_result_renders" / "0001_view-b.png").unlink()
+    (run_dir / "run.json").write_text(json.dumps(summary), encoding="utf-8")
+    assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config, execute_gpu=False)) is False
+
+
+def test_failed_evaluator_recovery_rejects_camera_identity_drift(tmp_path: Path) -> None:
+    run_dir, summary, identity, config, _ = _recovery_fixture(tmp_path)
+    authority_path = run_dir / "stages" / "authority-manifest" / "attempt-0001" / "result.json"
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority["result"]["camera_order"] = ["view-a", "different-view"]
+    authority_path.write_text(json.dumps(authority), encoding="utf-8")
+    assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config, execute_gpu=False)) is False
+
+
+def test_failed_evaluator_recovery_rejects_camera_dimension_drift(tmp_path: Path) -> None:
+    run_dir, summary, identity, config, _ = _recovery_fixture(tmp_path)
+    authority_path = run_dir / "stages" / "authority-manifest" / "attempt-0001" / "result.json"
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority["result"]["camera_dimensions"] = {"width": 6, "height": 4}
+    authority_path.write_text(json.dumps(authority), encoding="utf-8")
+    assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config, execute_gpu=False)) is False
+
+
+def test_failed_evaluator_recovery_rejects_symlinked_executor_root(tmp_path: Path) -> None:
+    run_dir, summary, identity, config, _ = _recovery_fixture(tmp_path)
+    actual_root = run_dir / "stages" / "converted-eval" / "attempt-0001" / "executor"
+    alias_root = actual_root.parent / "executor-alias"
+    alias_root.symlink_to(actual_root, target_is_directory=True)
+    result_path = run_dir / "stages" / "converted-eval" / "attempt-0001" / "result.json"
+    envelope = json.loads(result_path.read_text(encoding="utf-8"))
+    envelope["result"]["executor_root"] = str(alias_root)
+    result_path.write_text(json.dumps(envelope), encoding="utf-8")
+    assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config, execute_gpu=False)) is False
+
+
+def test_failed_evaluator_recovery_rejects_failed_result_drift(tmp_path: Path) -> None:
+    run_dir, summary, identity, config, evaluator_result_path = _recovery_fixture(tmp_path)
+    evaluator_result = json.loads(evaluator_result_path.read_text(encoding="utf-8"))
+    evaluator_result["exit_code"] = 0
+    evaluator_result_path.write_text(json.dumps(evaluator_result), encoding="utf-8")
+    assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config, execute_gpu=False)) is False
+
+
+def test_failed_evaluator_recovery_rejects_existing_subsequent_stage(tmp_path: Path) -> None:
+    run_dir, summary, identity, config, _ = _recovery_fixture(tmp_path)
+    summary["stages"]["automated-technical-delivery"] = [_write_passed_stage(run_dir, "automated-technical-delivery")]
+    (run_dir / "run.json").write_text(json.dumps(summary), encoding="utf-8")
+    assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config, execute_gpu=False)) is False
+
+
+def test_default_formal_delivery_recovers_failed_eval_without_executor_and_appends_postprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_dir, summary, identity, _config_value, evaluator_result_path = _recovery_fixture(tmp_path)
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"fixture video")
+
+    def overwrite_stage(stage: str, result: dict[str, object]) -> None:
+        entry = summary["stages"][stage][-1]
+        path = run_dir / entry["result_path"]
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "stage-attempt-result-v1",
+                    "stage": stage,
+                    "status": "passed",
+                    "identity": identity,
+                    "result": result,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    native_root = run_dir / "stages" / "native-render" / "attempt-0001" / "executor"
+    native_root.mkdir(parents=True)
+    overwrite_stage(
+        "native-render",
+        {
+            "schema_version": "longsplat-reconstruct-stage-v2",
+            "stage": "native-render",
+            "status": "passed",
+            "computed_pass": True,
+            "artifacts": [],
+            "executor_root": str(native_root.resolve()),
+            "quality": {"quality_status": "pass"},
+        },
+    )
+    formal_gate_result = {
+        "schema_version": "longsplat-reconstruct-stage-v2",
+        "stage": "automated-formal-gate",
+        "status": "passed",
+        "computed_pass": True,
+        "artifacts": [],
+    }
+    overwrite_stage("automated-formal-gate", formal_gate_result)
+
+    conversion_root = run_dir / "stages" / "conversion" / "attempt-0001" / "executor"
+    conversion_root.mkdir(parents=True)
+    converted_ply = conversion_root / "point_cloud.ply"
+    converted_ply.write_bytes(b"fixture ply")
+    conversion_result_path = conversion_root / "conversion_result.json"
+    conversion_result_path.write_text(
+        json.dumps(
+            {
+                "STRUCTURAL_CONVERSION_PASS": True,
+                "structural_pass": True,
+                "structural": {"path": str(converted_ply.resolve()), "vertex_count": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    overwrite_stage(
+        "conversion",
+        {
+            "schema_version": "longsplat-reconstruct-stage-v2",
+            "stage": "conversion",
+            "status": "passed",
+            "computed_pass": True,
+            "artifacts": [],
+            "executor_root": str(conversion_root.resolve()),
+            "executor_result": {"structural": {"path": str(converted_ply.resolve())}},
+        },
+    )
+    (run_dir / "run.json").write_text(json.dumps(summary), encoding="utf-8")
+    old_failed_result = (run_dir / "stages" / "converted-eval" / "attempt-0001" / "result.json").read_bytes()
+    old_blocked_result = (run_dir / "stages" / "converted-eval-postprocess" / "attempt-0001" / "result.json").read_bytes()
+    evaluator_attempt_dirs = sorted(
+        path.name for path in (run_dir / "stages" / "converted-eval").iterdir() if path.is_dir()
+    )
+    summary.update(
+        {
+            "run_id": run_dir.name,
+            "computed_pass": False,
+            "accepted": False,
+            "delivery_reachable": False,
+            "gpu_invoked": False,
+        }
+    )
+
+    ledger = RunLedger(run_dir, identity, resumed=True)
+    ledger.summary = summary
+    executor_calls: list[str] = []
+
+    def fail_if_executor_called(**kwargs: object) -> tuple[dict[str, object], str]:
+        executor_calls.append(str(kwargs.get("stage")))
+        raise AssertionError("failed evaluator recovery must not call the GPU authority executor")
+
+    monkeypatch.setattr(reconstruct_pipeline, "_execute_authority_stage", fail_if_executor_called)
+    monkeypatch.setattr(reconstruct_pipeline, "_profile_input", lambda _payload, _profile: {})
+
+    def fake_postprocess(**kwargs: object) -> dict[str, object]:
+        output = Path(str(kwargs["output_root"]))
+        output.mkdir(parents=True)
+        for name in ("postprocess_result.json", "metrics.json", "png_hashes.json", "fixed_gt_native_converted_contact_sheet.png"):
+            (output / name).write_bytes(name.encode("ascii"))
+        return {"STRUCTURAL_EVALUATION_PASS": True, "FULL_STREAM_VALIDATION_PASS": True, "visual_quality_pass": True}
+
+    monkeypatch.setattr("scripts.longsplat.converted_eval_postprocess.run_postprocess", fake_postprocess)
+    monkeypatch.setattr(
+        "scripts.longsplat.conversion_evidence_schema.normalize_converted_evaluation",
+        lambda *_args, **_kwargs: {
+            "STRUCTURAL_EVALUATION_PASS": True,
+            "visual_quality_pass": True,
+            "legacy_compatibility_warnings": [],
+        },
+    )
+    delivery_seen: dict[str, object] = {}
+
+    def fake_delivery(**kwargs: object) -> tuple[dict[str, object], str]:
+        delivery_seen.update(kwargs)
+        return {
+            "stage": "automated-technical-delivery",
+            "status": "passed",
+            "computed_pass": True,
+            "accepted_by_automated_policy": True,
+            "artifacts": [],
+        }, "passed"
+
+    monkeypatch.setattr(reconstruct_pipeline, "_automated_technical_delivery", fake_delivery)
+    result = reconstruct_pipeline._run_default_formal_delivery(
+        ledger=ledger,
+        route=tmp_path,
+        source=source,
+        camera_run_dir=None,
+        results={
+            "automated-early-gate": {"stage": "automated-early-gate", "status": "passed", "computed_pass": True},
+            "frames": {},
+            "colmap": {},
+        },
+        stop_after="automated-technical-delivery",
+        execute_gpu=False,
+        authority_manifest=None,
+        camera_model="SIMPLE_RADIAL",
+        matching="sequential",
+        tool_paths=None,
+        tool_provider={},
+    )
+
+    assert executor_calls == []
+    assert result["status"] == "stopped"
+    assert result["delivery_reachable"] is True
+    assert delivery_seen["evaluation"]["failed_evaluation_recovery"]["read_only"] is True
+    assert delivery_seen["postprocess"]["computed_pass"] is True
+    assert sorted(
+        path.name for path in (run_dir / "stages" / "converted-eval").iterdir() if path.is_dir()
+    ) == evaluator_attempt_dirs
+    assert (run_dir / "stages" / "converted-eval-postprocess" / "attempt-0002" / "result.json").is_file()
+    assert (run_dir / "stages" / "converted-eval" / "attempt-0001" / "result.json").read_bytes() == old_failed_result
+    assert (run_dir / "stages" / "converted-eval-postprocess" / "attempt-0001" / "result.json").read_bytes() == old_blocked_result
+    assert evaluator_result_path.is_file()
 
 
 def test_negative_blocked_gpu_stage_native_render(tmp_path: Path) -> None:

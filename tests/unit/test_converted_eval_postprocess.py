@@ -19,7 +19,16 @@ from scripts.longsplat.pipeline_contract import RunLedger
 from tests.unit.test_authority_manifest import _fixture
 
 
-def _write_reused_eval_evidence(route: Path, name: str, camera_names: list[str], width: int, height: int) -> tuple[Path, Path, Path]:
+def _write_reused_eval_evidence(
+    route: Path,
+    name: str,
+    camera_names: list[str],
+    width: int,
+    height: int,
+    *,
+    exit_code: int = -9,
+    visual_marker: str | None = "fail",
+) -> tuple[Path, Path, Path]:
     root = route / "outputs" / name / "failed-eval"
     eval_root = root / "same_camera_eval"
     gt_root = eval_root / "evaluator_result_gt"
@@ -31,10 +40,10 @@ def _write_reused_eval_evidence(route: Path, name: str, camera_names: list[str],
         filename = f"{index:04d}_{camera_name}.png"
         assert cv2.imwrite(str(gt_root / filename), image)
         assert cv2.imwrite(str(converted_root / filename), image)
-    (root / "evaluation_result.json").write_text(
-        json.dumps({"SAME_CAMERA_VISUAL_PASS": "fail", "exit_code": -9}),
-        encoding="utf-8",
-    )
+    evaluator_result = {"exit_code": exit_code, "reason": "fixture evaluator failure"}
+    if visual_marker is not None:
+        evaluator_result["SAME_CAMERA_VISUAL_PASS"] = visual_marker
+    (root / "evaluation_result.json").write_text(json.dumps(evaluator_result), encoding="utf-8")
     (root / "request.json").write_text(json.dumps({"stage": "converted-eval"}), encoding="utf-8")
     (root / "argv.json").write_text(json.dumps({"argv": [], "shell": False}), encoding="utf-8")
     (root / "stdout.log").write_text("", encoding="utf-8")
@@ -92,7 +101,15 @@ def test_streaming_postprocess_uses_dynamic_order_and_marks_cpu_reuse(tmp_path: 
         width=width,
         height=height,
     )
-    failed_root, _gt_root, _converted_root = _write_reused_eval_evidence(route, "streaming", camera_names, width, height)
+    failed_root, _gt_root, _converted_root = _write_reused_eval_evidence(
+        route,
+        "streaming",
+        camera_names,
+        width,
+        height,
+        exit_code=7,
+        visual_marker=None,
+    )
     conversion_root = route / "outputs" / "streaming" / "conversion"
     conversion_root.mkdir(parents=True)
     ply = conversion_root / "point_cloud.ply"
@@ -138,6 +155,8 @@ def test_streaming_postprocess_uses_dynamic_order_and_marks_cpu_reuse(tmp_path: 
     assert result["gpu_invoked"] is False
     assert result["render_reused"] is True
     assert result["cuda_rerun"] is False
+    assert result["original_evaluator_exit_code"] == 7
+    assert result["original_evaluator_failure_reason"] == "fixture evaluator failure"
     assert result["full_stream_validation"]["triples_processed"] == 2
     assert result["full_stream_validation"]["pass"] is True
     assert result["full_stream_validation"]["structural_pass"] is True

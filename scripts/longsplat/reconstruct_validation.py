@@ -518,7 +518,14 @@ def validate_existing_run(
             gpu_invoked=True,
             render_artifacts_available=render_available,
             original_evaluator_exit_code=evaluation.get("exit_code"),
-            original_evaluator_failure_reason="unknown" if evaluation.get("exit_code") == -9 else None,
+            original_evaluator_failure_reason=(
+                evaluation.get("reason")
+                if isinstance(evaluation.get("exit_code"), int)
+                and not isinstance(evaluation.get("exit_code"), bool)
+                and evaluation.get("exit_code") != 0
+                and isinstance(evaluation.get("reason"), str)
+                else None
+            ),
         )
     else:
         stage_results["converted-eval"] = _stage("converted-eval", "unavailable", False, "no converted evaluator result was found")

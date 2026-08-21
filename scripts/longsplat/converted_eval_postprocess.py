@@ -211,10 +211,10 @@ def _failed_evaluation_inputs(failed_root: Path, outputs: Path) -> dict[str, Any
     root = _output_path(failed_root, outputs, "failed evaluator root", directory=True)
     result_path = _output_path(root / "evaluation_result.json", outputs, "failed evaluator result")
     result = _load_json(result_path, "failed evaluator result")
-    if result.get("exit_code") != -9:
-        _fail(f"failed evaluator result must preserve exit_code -9, got {result.get('exit_code')!r}")
-    if result.get("SAME_CAMERA_VISUAL_PASS") != "fail":
-        _fail("failed evaluator result is not the preserved failed result")
+    exit_code = result.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code == 0:
+        _fail(f"failed evaluator result must preserve a nonzero integer exit code, got {exit_code!r}")
+    failure_reason = result.get("reason") if isinstance(result.get("reason"), str) else None
     eval_root = root / "same_camera_eval"
     if not eval_root.is_dir():
         _fail(f"failed evaluator render root is missing: {eval_root}")
@@ -237,8 +237,8 @@ def _failed_evaluation_inputs(failed_root: Path, outputs: Path) -> dict[str, Any
         "gt_root": gt_root,
         "converted_root": converted_root,
         "input_files": input_files,
-        "original_exit_code": -9,
-        "original_failure_reason": "unknown (SIGKILL; no cause inferred)",
+        "original_exit_code": exit_code,
+        "original_failure_reason": failure_reason,
     }
 
 
@@ -543,11 +543,13 @@ def run_postprocess(
         "postprocess_png_hashes.json": str(png_hashes_path.resolve()),
         **optional_evidence,
     }
+    evaluator_exit_code = failed["original_exit_code"]
+    evaluator_failure_reason = failed["original_failure_reason"]
     known_limitations = [
         "training views only; no held-out evaluation",
         "dynamic-person ghosting",
         "local breakage/ghosting around the 2.982s frame_000140 to frame_000146 cross-gap",
-        "the original converted evaluator exited with SIGKILL (-9); the cause is unknown and was not inferred as OOM",
+        f"the original converted evaluator exited with nonzero code {evaluator_exit_code!r}; its recorded reason was preserved without inference: {evaluator_failure_reason!r}",
         "the converted render PNGs were reused; no CUDA evaluator rerun was performed",
         "no real SuperSplat three-view manual acceptance has been imported",
     ]
@@ -563,8 +565,8 @@ def run_postprocess(
             "gpu_invoked": False,
             "render_reused": True,
             "cuda_rerun": False,
-            "original_evaluator_exit_code": -9,
-            "original_evaluator_failure_reason": "unknown",
+            "original_evaluator_exit_code": evaluator_exit_code,
+            "original_evaluator_failure_reason": evaluator_failure_reason,
         },
         "known_limitations": known_limitations,
     }
@@ -589,8 +591,8 @@ def run_postprocess(
         "gpu_invoked": False,
         "render_reused": True,
         "cuda_rerun": False,
-        "original_evaluator_exit_code": -9,
-        "original_evaluator_failure_reason": "unknown",
+        "original_evaluator_exit_code": evaluator_exit_code,
+        "original_evaluator_failure_reason": evaluator_failure_reason,
         "metrics_scope": "training_views_only",
         "held_out": False,
         "camera_count": count,
@@ -604,7 +606,7 @@ def run_postprocess(
             "result": _identity(failed["result_path"], "failed evaluator result"),
             "render_reused": True,
             "cuda_rerun": False,
-            "original_failure_reason": "unknown",
+            "original_failure_reason": evaluator_failure_reason,
             "input_files": failed["input_files"],
         },
         "native_render": {"root": str(native_root), "camera_order": native_names},
