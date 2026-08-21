@@ -7,7 +7,7 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, TextIO
@@ -23,6 +23,7 @@ _SAMPLING_SCHEMA = "camera-sampling-telemetry-v1"
 _SAMPLING_EVENTS_NAME = "camera_sampling_telemetry-v1.jsonl"
 _TRAINING_STAGES = {"convergence-smoke-training", "formal-training"}
 _FAILURE_STATUSES = {"blocked", "failed"}
+_TERMINAL_STATUSES = {"passed", "blocked", "failed"}
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class ProgressSnapshot:
     stage_status: str | None = None
     stage_finished: float | None = None
     training: TrainingProgress = TrainingProgress(None, None)
+    stage_observations: tuple[_StageObservation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,14 @@ class _StageSelection:
     summary: Mapping[str, Any]
     active: bool
     status: str | None
+
+
+@dataclass(frozen=True)
+class _StageObservation:
+    stage: str
+    attempt: str | None
+    status: str | None
+    active: bool
 
 
 @dataclass(frozen=True)
@@ -140,6 +150,27 @@ def _latest_attempt_name(
     return attempt if isinstance(attempt, str) else None
 
 
+def _active_attempt(summary: Mapping[str, Any], *, stage: str) -> str | None:
+    active_stage = summary.get("active_stage")
+    if not isinstance(active_stage, str):
+        active_stage = summary.get("current_intended_stage")
+    if active_stage != stage:
+        return None
+    attempt = summary.get("active_attempt")
+    return attempt if isinstance(attempt, str) else None
+
+
+def _stage_entry_for_attempt(
+    entries: list[Any],
+    *,
+    attempt: str,
+) -> Mapping[str, Any] | None:
+    for entry in reversed(entries):
+        if isinstance(entry, Mapping) and entry.get("attempt") == attempt:
+            return entry
+    return None
+
+
 def _stage_start(
     summary: Mapping[str, Any],
     *,
@@ -213,7 +244,10 @@ def _read_sidecar(path: Path) -> ConversionProgress:
 
 def _conversion_sidecar(summary: Mapping[str, Any], *, run_dir: Path) -> Path | None:
     active_attempt = summary.get("active_attempt")
-    if isinstance(active_attempt, str) and summary.get("active_stage") == "conversion":
+    active_stage = summary.get("active_stage")
+    if not isinstance(active_stage, str):
+        active_stage = summary.get("current_intended_stage")
+    if isinstance(active_attempt, str) and active_stage == "conversion":
         candidate = run_dir / "stages" / "conversion" / active_attempt / "executor" / "conversion-progress-v1.jsonl"
         return _contained_file(candidate, run_dir)
     latest_attempt = _latest_attempt_name(summary, stage="conversion")
@@ -253,9 +287,146 @@ def _latest_stage_status(summary: Mapping[str, Any], stage: str) -> str | None:
     entries = stages.get(stage) if isinstance(stages, Mapping) else None
     if not isinstance(entries, list) or not entries:
         return None
-    entry = entries[-1]
+    active_attempt = _active_attempt(summary, stage=stage)
+    if active_attempt is not None:
+        # A retry can be active before its new ledger entry is visible.  Never
+        # expose the previous attempt's terminal status as the new attempt's
+        # status during that race.
+        entry = _stage_entry_for_attempt(entries, attempt=active_attempt)
+        if entry is None:
+            return None
+    else:
+        entry = entries[-1]
     status = entry.get("status") if isinstance(entry, Mapping) else None
     return status if isinstance(status, str) else None
+
+
+def _summary_active_stage(
+    summary: Mapping[str, Any],
+    stage_order: tuple[str, ...],
+) -> str | None:
+    active = summary.get("active_stage")
+    if isinstance(active, str) and active in stage_order:
+        return active
+    intended = summary.get("current_intended_stage")
+    if isinstance(intended, str) and intended in stage_order:
+        return intended
+    return None
+
+
+def _summary_stage_observations(
+    summary: Mapping[str, Any],
+    *,
+    stage_order: tuple[str, ...],
+) -> tuple[_StageObservation, ...]:
+    stages = summary.get("stages")
+    if not isinstance(stages, Mapping):
+        stages = {}
+    active_stage = _summary_active_stage(summary, stage_order)
+    observations: list[_StageObservation] = []
+    for stage in stage_order:
+        entries = stages.get(stage)
+        if not isinstance(entries, list) or not entries:
+            entries = []
+        active = active_stage == stage
+        entry: Mapping[str, Any] | None
+        if active:
+            active_attempt = _active_attempt(summary, stage=stage)
+            if active_attempt is not None:
+                entry = _stage_entry_for_attempt(entries, attempt=active_attempt)
+                attempt = active_attempt
+            else:
+                entry = entries[-1] if entries else None
+                attempt = (
+                    entry.get("attempt")
+                    if isinstance(entry, Mapping) and isinstance(entry.get("attempt"), str)
+                    else None
+                )
+        elif entries:
+            entry = entries[-1]
+            attempt = (
+                entry.get("attempt")
+                if isinstance(entry, Mapping) and isinstance(entry.get("attempt"), str)
+                else None
+            )
+        else:
+            entry = None
+            attempt = None
+        if entry is None and not active:
+            continue
+        status = entry.get("status") if isinstance(entry, Mapping) else None
+        observations.append(
+            _StageObservation(
+                stage=stage,
+                attempt=attempt,
+                status=status if isinstance(status, str) else None,
+                active=active,
+            )
+        )
+    return tuple(observations)
+
+
+def _attempt_sort_key(attempt: str | None) -> tuple[int, str]:
+    if not isinstance(attempt, str):
+        return (-1, "")
+    prefix, separator, suffix = attempt.rpartition("-")
+    if separator and suffix.isdigit():
+        return (int(suffix), prefix)
+    return (-1, attempt)
+
+
+def _preferred_status(observations: list[_StageObservation]) -> str | None:
+    for status in ("failed", "blocked", "passed"):
+        if any(item.status == status for item in observations):
+            return status
+    for item in observations:
+        if item.status is not None:
+            return item.status
+    return None
+
+
+def _merge_stage_observations(
+    summaries: tuple[Mapping[str, Any], ...],
+    *,
+    stage_order: tuple[str, ...],
+) -> tuple[_StageObservation, ...]:
+    grouped: dict[str, list[_StageObservation]] = {stage: [] for stage in stage_order}
+    for summary in summaries:
+        for observation in _summary_stage_observations(summary, stage_order=stage_order):
+            grouped[observation.stage].append(observation)
+
+    merged: list[_StageObservation] = []
+    for stage in stage_order:
+        candidates = grouped[stage]
+        if not candidates:
+            continue
+        active = [item for item in candidates if item.active]
+        if active:
+            attempts = [item.attempt for item in active if item.attempt is not None]
+            selected_attempt = max(attempts, key=_attempt_sort_key) if attempts else None
+            if selected_attempt is not None:
+                candidates = [item for item in active if item.attempt == selected_attempt]
+            else:
+                candidates = active
+            merged_status = _preferred_status(candidates)
+            merged.append(
+                _StageObservation(
+                    stage=stage,
+                    attempt=selected_attempt or candidates[0].attempt,
+                    status=merged_status,
+                    active=merged_status not in _TERMINAL_STATUSES,
+                )
+            )
+            continue
+        merged.append(
+            _StageObservation(
+                stage=stage,
+                attempt=candidates[-1].attempt,
+                status=_preferred_status(candidates),
+                active=False,
+            )
+        )
+    return tuple(merged)
 
 
 def _terminal_summary_stage(
@@ -273,6 +444,13 @@ def _terminal_summary_stage(
     attempt_status = _latest_stage_status(summary, stage)
     if attempt_status in _FAILURE_STATUSES:
         return stage, attempt_status
+    if _summary_active_stage(summary, stage_order) == stage and isinstance(
+        summary.get("active_attempt"), str
+    ):
+        # The overall summary can still carry the previous attempt's terminal
+        # status while a retry is being opened.  The active attempt remains
+        # unresolved until its own ledger entry appears.
+        return None, None
     return stage, overall_status
 
 
@@ -294,7 +472,28 @@ def _summary_selection(
 
     direct_stage = _active_summary_stage(summary, stage_order)
     if direct_stage is not None:
-        status = _latest_stage_status(summary, direct_stage) or summary.get("status")
+        status = _latest_stage_status(summary, direct_stage)
+        overall_status = summary.get("status")
+        if status is None and _active_attempt(summary, stage=direct_stage) is None:
+            status = overall_status
+        elif (
+            status not in _TERMINAL_STATUSES
+            and overall_status in _FAILURE_STATUSES
+            and _stage_entry_for_attempt(
+                (
+                    summary.get("stages", {}).get(direct_stage, [])
+                    if isinstance(summary.get("stages"), Mapping)
+                    else []
+                ),
+                attempt=str(summary.get("active_attempt")),
+            )
+            is not None
+        ):
+            # Legacy summaries may leave the active attempt marked running
+            # while the overall run already records the authoritative stop.
+            # A real retry with no new ledger entry is handled by the branch
+            # above and remains unresolved instead of inheriting old failure.
+            status = overall_status
         return _StageSelection(
             direct_stage,
             root,
@@ -378,7 +577,10 @@ def _stage_timing(
 ) -> _StageTiming:
     if root is None or not isinstance(stage, str):
         return _StageTiming(None, None, None)
-    active = summary.get("active_stage") == stage
+    active_stage = summary.get("active_stage")
+    if not isinstance(active_stage, str):
+        active_stage = summary.get("current_intended_stage")
+    active = active_stage == stage
     attempt = summary.get("active_attempt") if active else _latest_attempt_name(summary, stage=stage)
     if not isinstance(attempt, str):
         return _StageTiming(None, None, None)
@@ -442,7 +644,10 @@ def _training_progress(
     summary: Mapping[str, Any],
     stage: str | None,
 ) -> TrainingProgress:
-    if root is None or stage not in _TRAINING_STAGES or summary.get("active_stage") != stage:
+    active_stage = summary.get("active_stage")
+    if not isinstance(active_stage, str):
+        active_stage = summary.get("current_intended_stage")
+    if root is None or stage not in _TRAINING_STAGES or active_stage != stage:
         return TrainingProgress(None, None)
     attempt = summary.get("active_attempt")
     if not isinstance(attempt, str):
@@ -502,6 +707,15 @@ def read_progress_snapshot(run_dir: str | Path, *, now: float | None = None) -> 
         if isinstance(stage_order_value, list)
         else ()
     )
+    summaries = tuple(
+        value
+        for value in (summary, raw_camera, raw_smoke)
+        if isinstance(value, Mapping)
+    )
+    stage_observations = _merge_stage_observations(
+        summaries,
+        stage_order=stage_order,
+    )
     selected = _stage_selection(
         summary,
         stage_order=stage_order,
@@ -523,6 +737,7 @@ def read_progress_snapshot(run_dir: str | Path, *, now: float | None = None) -> 
             downloaded_bytes=None,
             download_total=None,
             stage_active=False,
+            stage_observations=stage_observations,
         )
     sidecar = _conversion_sidecar(summary, run_dir=root)
     conversion = _read_sidecar(sidecar) if sidecar is not None else ConversionProgress(None, None, None)
@@ -530,6 +745,16 @@ def read_progress_snapshot(run_dir: str | Path, *, now: float | None = None) -> 
     timing = _stage_timing(selected.root, selected.summary, selected.stage)
     training = _training_progress(selected.root, selected.summary, selected.stage)
     status = selected.summary.get("status")
+    if selected.active and selected.stage is not None and _active_attempt(
+        selected.summary,
+        stage=selected.stage,
+    ) is not None:
+        # Do not let a stale overall failure leak through while the selected
+        # attempt is still being written.  Its own attempt status is the only
+        # authoritative status for an active retry.
+        status = selected.status
+        if status not in _TERMINAL_STATUSES and not isinstance(status, str):
+            status = None
     return ProgressSnapshot(
         stage_order=stage_order,
         stage=selected.stage,
@@ -545,6 +770,7 @@ def read_progress_snapshot(run_dir: str | Path, *, now: float | None = None) -> 
         stage_status=selected.status,
         stage_finished=timing.finished,
         training=training,
+        stage_observations=stage_observations,
     )
 
 
@@ -652,6 +878,11 @@ def render_progress_line(
                 label += " | pending"
         elif failure_status is not None:
             label += f" | {failure_status}"
+        elif snapshot.stage_status is None:
+            # A transition/retry can expose the active marker before its own
+            # attempt ledger entry.  Keep this as a refresh-only pending state;
+            # TerminalProgress never promotes it to completed history.
+            label += " | pending"
     if downloaded is not None:
         label = _format_download(downloaded, download_total)
         if download_total is not None and download_total > 0:
@@ -703,6 +934,10 @@ class TerminalProgress:
         self._display_started = False
         self._last_line = ""
         self._last_event: tuple[Any, ...] | None = None
+        self._plain_current_key: tuple[Any, ...] | None = None
+        self._stage_states: dict[str, _StageObservation] = {}
+        self._stage_snapshots: dict[str, ProgressSnapshot] = {}
+        self._emitted_terminal: dict[str, tuple[str | None, str]] = {}
         self._last_emit = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -776,107 +1011,251 @@ class TerminalProgress:
     def _has_stage(snapshot: ProgressSnapshot | None) -> bool:
         return snapshot is not None and snapshot.stage is not None
 
-    def _write_tty_transition(
+    @staticmethod
+    def _terminal_token(
+        observation: _StageObservation | None,
+    ) -> tuple[str | None, str] | None:
+        if observation is None or observation.status not in _TERMINAL_STATUSES:
+            return None
+        return observation.attempt, observation.status
+
+    def _record_snapshot(self, snapshot: ProgressSnapshot | None) -> None:
+        if snapshot is None:
+            return
+        observations = snapshot.stage_observations
+        if not observations and snapshot.stage is not None:
+            observations = (
+                _StageObservation(
+                    stage=snapshot.stage,
+                    attempt=snapshot.stage_attempt,
+                    status=snapshot.stage_status,
+                    active=snapshot.stage_active,
+                ),
+            )
+        for observation in observations:
+            previous = self._stage_states.get(observation.stage)
+            if previous is not None and previous.attempt != observation.attempt:
+                self._emitted_terminal.pop(observation.stage, None)
+            if (
+                previous is not None
+                and previous.attempt == observation.attempt
+                and previous.status in _TERMINAL_STATUSES
+                and observation.status not in _TERMINAL_STATUSES
+            ):
+                # Atomic writer races may expose an older/lighter view after a
+                # terminal record.  Terminal evidence is monotone for one
+                # attempt; never turn it back into pending.
+                observation = previous
+            self._stage_states[observation.stage] = observation
+        if snapshot.stage is not None:
+            self._stage_snapshots[snapshot.stage] = snapshot
+
+    def _display_ready(self, snapshot: ProgressSnapshot | None) -> bool:
+        if snapshot is None or snapshot.stage is None:
+            return True
+        try:
+            position = snapshot.stage_order.index(snapshot.stage)
+        except ValueError:
+            return True
+        for stage in snapshot.stage_order[:position]:
+            observation = self._stage_states.get(stage)
+            if observation is not None and observation.status not in _TERMINAL_STATUSES:
+                return False
+        return True
+
+    def _stage_line(
         self,
-        previous: ProgressSnapshot | None,
+        stage: str,
+        observation: _StageObservation,
+        *,
         current: ProgressSnapshot | None,
+        now: float,
+    ) -> str:
+        base = self._stage_snapshots.get(stage)
+        if base is None or base.stage != stage:
+            order = current.stage_order if current is not None else tuple(self._stage_states)
+            position = order.index(stage) + 1 if stage in order else None
+            base = ProgressSnapshot(
+                stage_order=order,
+                stage=stage,
+                stage_position=position,
+                run_started=current.run_started if current is not None else None,
+                stage_started=None,
+                status=None,
+                conversion=ConversionProgress(None, None, None),
+                downloaded_bytes=None,
+                download_total=None,
+                stage_active=False,
+                stage_attempt=observation.attempt,
+                stage_status=observation.status,
+                stage_finished=None,
+            )
+        else:
+            base = replace(
+                base,
+                stage_active=False,
+                stage_attempt=observation.attempt,
+                stage_status=observation.status,
+                status=(
+                    observation.status
+                    if observation.status in _FAILURE_STATUSES
+                    else base.status
+                ),
+            )
+        return render_progress_line(base, now=now, completed=True)
+
+    def _pending_terminal_lines(
+        self,
+        snapshot: ProgressSnapshot | None,
         *,
         now: float,
-        current_line: str,
-    ) -> str:
-        previous_active = self._has_stage(previous) and previous.stage_active
-        same_completed_stage = (
-            previous_active
-            and current is not None
-            and current.stage == previous.stage
-            and not current.stage_active
-        )
-        if previous_active:
-            completed_snapshot = current if same_completed_stage else previous
-            completed_line = render_progress_line(
-                completed_snapshot,
-                now=now,
-                download=None,
-                completed=True,
+        force: bool = False,
+    ) -> list[tuple[str, tuple[str | None, str], str]]:
+        if snapshot is not None and snapshot.stage is not None:
+            order = snapshot.stage_order
+            max_position = order.index(snapshot.stage) if snapshot.stage in order else -1
+        else:
+            order = self._last_snapshot.stage_order if self._last_snapshot is not None else tuple(self._stage_states)
+            positions = [order.index(stage) for stage in self._stage_states if stage in order]
+            max_position = max(positions, default=-1)
+        blocked_by_pending = False
+        pending: list[tuple[str, tuple[str | None, str], str]] = []
+        for stage in order[: max_position + 1]:
+            observation = self._stage_states.get(stage)
+            token = self._terminal_token(observation)
+            if token is None:
+                if observation is not None:
+                    blocked_by_pending = True
+                continue
+            if self._emitted_terminal.get(stage) == token:
+                continue
+            if blocked_by_pending and not force:
+                continue
+            pending.append(
+                (
+                    stage,
+                    token,
+                    self._stage_line(stage, observation, current=snapshot, now=now),
+                )
             )
-            padding = " " * max(0, len(self._last_line) - len(completed_line))
-            self.stream.write("\r" + completed_line + padding + "\n")
+        return pending
+
+    def _mark_terminal_lines(
+        self,
+        lines: list[tuple[str, tuple[str | None, str], str]],
+    ) -> None:
+        for stage, token, _line in lines:
+            self._emitted_terminal[stage] = token
+
+    def _write_tty_output(
+        self,
+        terminal_lines: list[tuple[str, tuple[str | None, str], str]],
+        current: ProgressSnapshot | None,
+        *,
+        current_line: str,
+        current_ready: bool,
+    ) -> None:
+        had_current_line = bool(self._last_line)
+        if terminal_lines:
+            for index, (_stage, _token, completed_line) in enumerate(terminal_lines):
+                if index == 0 and self._last_line:
+                    padding = " " * max(0, len(self._last_line) - len(completed_line))
+                    self.stream.write("\r" + completed_line + padding + "\n")
+                else:
+                    self.stream.write(completed_line + "\n")
             self._last_line = ""
-            if same_completed_stage:
-                return completed_line
-        if self._has_stage(current) and current.stage_active:
-            prefix = "\r" if self._last_line else ""
-            self.stream.write(prefix + current_line)
+
+        if not self._has_stage(current):
+            if not terminal_lines and (not self._display_started or self._last_line):
+                self.stream.write("\r" + current_line)
+                self._last_line = current_line
+            return
+
+        observation = self._stage_states.get(current.stage)
+        token = self._terminal_token(observation)
+        terminal_already_written = current.stage in {item[0] for item in terminal_lines} or (
+            token is not None and self._emitted_terminal.get(current.stage) == token
+        )
+        if terminal_already_written:
+            return
+
+        # A pending stage is allowed to remain a current TTY refresh, but it
+        # is deliberately never newline-frozen until its attempt settles.
+        if current_ready or not terminal_lines:
+            padding = " " * max(0, len(self._last_line) - len(current_line))
+            prefix = "" if terminal_lines and not had_current_line else (
+                "\r" if self._last_line or not self._display_started else ""
+            )
+            self.stream.write(prefix + current_line + padding)
             self._last_line = current_line
-            return current_line
-        if self._has_stage(current):
-            completed_line = render_progress_line(current, now=now, completed=True)
-            prefix = "\r" if self._last_line else ""
-            self.stream.write(prefix + completed_line + "\n")
-            self._last_line = ""
-            return completed_line
-        return current_line
 
     def _poll_once(self, *, force: bool = False) -> str | None:
         if not self.enabled:
             return None
-        previous = self._display_snapshot
         line = self._line()
         current = self._last_snapshot
+        self._record_snapshot(current)
         now = self.now_fn()
         with self._lock:
             download = self._download
-        stage_changed = self._display_started and self._stage_key(previous) != self._stage_key(current)
+        current_ready = self._display_ready(current)
+        terminal_lines = self._pending_terminal_lines(current, now=now, force=False)
         if self._tty:
-            if not self._display_started:
-                if self._has_stage(current) and not current.stage_active:
-                    line = render_progress_line(current, now=now, completed=True)
-                    self.stream.write(line + "\n")
-                    self._last_line = ""
-                elif self._has_stage(current):
-                    self.stream.write("\r" + line)
-                    self._last_line = line
-                else:
-                    self.stream.write("\r" + line)
-                    self._last_line = line
-            elif stage_changed:
-                line = self._write_tty_transition(previous, current, now=now, current_line=line)
-            else:
-                padding = " " * max(0, len(self._last_line) - len(line))
-                if self._has_stage(current) and not current.stage_active:
-                    # A completed line is already frozen; re-rendering it would
-                    # make a TTY look active again and would move the cursor.
-                    line = render_progress_line(current, now=now, completed=True)
-                elif self._last_line or not self._display_started:
-                    self.stream.write("\r" + line + padding)
-                    self._last_line = line
+            self._write_tty_output(
+                terminal_lines,
+                current,
+                current_line=line,
+                current_ready=current_ready,
+            )
+            if terminal_lines:
+                self._mark_terminal_lines(terminal_lines)
             self.stream.flush()
             self._display_snapshot = current
             self._display_started = True
             return line
         event = self._event_key(current, download)
         lines: list[str] = []
-        if not self._display_started:
-            lines.append(line)
-        elif stage_changed:
-            previous_active = self._has_stage(previous) and previous.stage_active
-            same_completed_stage = (
-                previous_active
-                and current is not None
-                and current.stage == previous.stage
-                and not current.stage_active
+        lines.extend(item[2] for item in terminal_lines)
+        pending_stage_names = {item[0] for item in terminal_lines}
+        current_observation = current.stage if current is not None else None
+        current_token = self._terminal_token(
+            self._stage_states.get(current_observation) if current_observation is not None else None
+        )
+        current_terminal_written = (
+            current_observation is not None
+            and current_token is not None
+            and (
+                current_observation in pending_stage_names
+                or self._emitted_terminal.get(current_observation) == current_token
             )
-            if previous_active and not same_completed_stage:
-                lines.append(render_progress_line(previous, now=now, completed=True))
-            if self._has_stage(current):
-                lines.append(render_progress_line(current, now=now, completed=not current.stage_active))
-        elif force or event != self._last_event or now - self._last_emit >= _HEARTBEAT_SECONDS:
+        )
+        should_refresh = force or event != self._last_event or now - self._last_emit >= _HEARTBEAT_SECONDS
+        if self._has_stage(current):
+            if current_ready and not current_terminal_written and current.stage_active:
+                # Plain/CI output has no in-place refresh cursor.  An active
+                # attempt with no authoritative ledger status is therefore
+                # kept silent until it settles; otherwise ``pending`` would
+                # become permanent history during the write race.
+                transient = current.stage_status in {None, "pending", "unknown"}
+                if not transient and (self._plain_current_key != event or should_refresh):
+                    lines.append(line)
+        elif not self._display_started or should_refresh:
             lines.append(line)
         if lines:
             self.stream.write("\n".join(lines) + "\n")
             self.stream.flush()
+            if terminal_lines:
+                self._mark_terminal_lines(terminal_lines)
             self._last_event = event
             self._last_emit = now
+            if (
+                self._has_stage(current)
+                and not current_terminal_written
+                and current_ready
+                and current.stage_active
+                and current.stage_status not in {None, "pending", "unknown"}
+            ):
+                self._plain_current_key = event
         self._display_snapshot = current
         self._display_started = True
         return line
@@ -899,6 +1278,28 @@ class TerminalProgress:
         while not self._stop.wait(self.interval):
             self.poll_once()
 
+    def _flush_terminal_on_close(self) -> None:
+        snapshot = self._last_snapshot
+        if snapshot is None:
+            return
+        now = self.now_fn()
+        terminal_lines = self._pending_terminal_lines(snapshot, now=now, force=True)
+        if not terminal_lines:
+            return
+        line = render_progress_line(snapshot, now=now)
+        if self._tty:
+            self._write_tty_output(
+                terminal_lines,
+                snapshot,
+                current_line=line,
+                current_ready=True,
+            )
+            self.stream.flush()
+        else:
+            self.stream.write("\n".join(item[2] for item in terminal_lines) + "\n")
+            self.stream.flush()
+        self._mark_terminal_lines(terminal_lines)
+
     def close(self) -> None:
         if not self.enabled:
             return
@@ -906,6 +1307,13 @@ class TerminalProgress:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5.0)
+        try:
+            # Capture a final authoritative snapshot if the caller closes the
+            # observer immediately after an executor writes its result.
+            self._poll_once()
+            self._flush_terminal_on_close()
+        except Exception:
+            pass
         if self._tty and self._last_line:
             try:
                 self.stream.write("\r" + (" " * len(self._last_line)) + "\r")

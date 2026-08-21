@@ -169,7 +169,11 @@ def _activate_stage(run_dir: Path, stage: str, *, attempt: str = "attempt-0001",
                 "status": "running",
                 "active_stage": stage,
                 "active_attempt": attempt,
-                "stages": {},
+                "stages": {
+                    stage: [
+                        {"attempt": attempt, "status": "running"},
+                    ],
+                },
             }
         ),
         encoding="utf-8",
@@ -415,6 +419,172 @@ def test_missing_terminal_attempt_status_is_pending_not_completion(tmp_path: Pat
     assert "colmap | 完成" not in line
 
 
+def test_pending_transition_is_not_frozen_and_later_flushes_canonical_completion(
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_status_run(
+        tmp_path / "pending-transition",
+        status="running",
+        stage_statuses={"frames": "running", "colmap": "running"},
+        active_stage="colmap",
+        last_stage="colmap",
+    )
+    stream = io.StringIO()
+    reporter = TerminalProgress("plain", stream=stream, env={"TERM": "x"})
+    reporter.bind_run(run_dir)
+    reporter.poll_once(force=True)
+    assert stream.getvalue() == ""
+
+    _write_status_run(
+        run_dir,
+        status="running",
+        stage_statuses={"frames": "passed", "colmap": "running"},
+        active_stage="colmap",
+        last_stage="colmap",
+    )
+    reporter.poll_once()
+    _write_status_run(
+        run_dir,
+        status="blocked",
+        stage_statuses={"frames": "passed", "colmap": "blocked"},
+        last_stage="colmap",
+    )
+    reporter.poll_once()
+
+    lines = stream.getvalue().splitlines()
+    assert lines[0].startswith("frames | 完成")
+    assert lines[1].startswith("colmap |")
+    assert "pending" not in lines[0]
+    assert "colmap | blocked" in lines[2]
+    assert "colmap | 完成" not in lines[2]
+    reporter.close()
+
+
+def test_active_retry_does_not_inherit_old_failed_attempt(tmp_path: Path) -> None:
+    run_dir = _write_status_run(
+        tmp_path / "retry",
+        status="running",
+        stage_statuses={"colmap": "failed"},
+        active_stage="colmap",
+        last_stage="colmap",
+    )
+    attempt = run_dir / "stages" / "colmap" / "attempt-0002"
+    (attempt / "executor").mkdir(parents=True)
+    (attempt / "request.json").write_text(
+        json.dumps({"started_at": _stamp(300)}),
+        encoding="utf-8",
+    )
+    summary = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    summary["active_attempt"] = "attempt-0002"
+    (run_dir / "run.json").write_text(json.dumps(summary, sort_keys=True), encoding="utf-8")
+
+    snapshot = read_progress_snapshot(run_dir, now=400)
+    line = render_progress_line(snapshot, now=400)
+
+    assert snapshot is not None
+    assert snapshot.stage == "colmap"
+    assert snapshot.stage_attempt == "attempt-0002"
+    assert snapshot.stage_status is None
+    assert "failed" not in line
+    assert "blocked" not in line
+    assert "完成" not in line
+
+
+def test_current_intended_retry_is_pending_until_its_own_attempt_is_recorded(
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_status_run(
+        tmp_path / "current-intended-retry",
+        status="blocked",
+        stage_statuses={"colmap": "failed"},
+        last_stage="colmap",
+    )
+    attempt = run_dir / "stages" / "colmap" / "attempt-0002"
+    (attempt / "executor").mkdir(parents=True)
+    (attempt / "request.json").write_text(
+        json.dumps({"started_at": _stamp(300)}),
+        encoding="utf-8",
+    )
+    summary = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    summary["current_intended_stage"] = "colmap"
+    summary["active_attempt"] = "attempt-0002"
+    (run_dir / "run.json").write_text(
+        json.dumps(summary, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    snapshot = read_progress_snapshot(run_dir, now=400)
+    line = render_progress_line(snapshot, now=400)
+
+    assert snapshot is not None
+    assert snapshot.stage == "colmap"
+    assert snapshot.stage_active is True
+    assert snapshot.stage_attempt == "attempt-0002"
+    assert snapshot.stage_status is None
+    assert "colmap | pending" in line
+    assert "failed" not in line
+    assert "完成" not in line
+
+    stream = io.StringIO()
+    reporter = TerminalProgress("plain", stream=stream, env={"TERM": "x"})
+    reporter.bind_run(run_dir)
+    reporter.poll_once(force=True)
+    reporter.close()
+    assert stream.getvalue() == ""
+
+
+def test_close_reads_last_authoritative_snapshot_without_duplicate_terminal_line(
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_status_run(
+        tmp_path / "close",
+        status="blocked",
+        stage_statuses={"colmap": "blocked"},
+        last_stage="colmap",
+    )
+    stream = io.StringIO()
+    reporter = TerminalProgress("plain", stream=stream, env={"TERM": "x"})
+    reporter.bind_run(run_dir)
+    reporter.close()
+
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("colmap | blocked")
+
+
+def test_tty_pending_is_refresh_only_and_passed_replaces_it(tmp_path: Path) -> None:
+    run_dir = _write_status_run(
+        tmp_path / "tty-pending",
+        status="running",
+        stage_statuses={"frames": "running"},
+        last_stage="frames",
+    )
+
+    class TTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = TTY()
+    reporter = TerminalProgress("auto", stream=stream, env={"TERM": "x"})
+    reporter.bind_run(run_dir)
+    reporter.poll_once(force=True)
+    assert "frames | pending" in stream.getvalue()
+    assert "\n" not in stream.getvalue()
+
+    _write_status_run(
+        run_dir,
+        status="passed",
+        stage_statuses={"frames": "passed"},
+        last_stage="frames",
+    )
+    reporter.poll_once()
+    output = stream.getvalue()
+    assert output.endswith("\n")
+    assert output.count("\n") == 1
+    assert "frames | 完成" in output
+    reporter.close()
+
+
 def test_raw_child_blocked_stage_overrides_stale_root_probe(tmp_path: Path) -> None:
     run_dir = _write_status_run(
         tmp_path / "child-blocked",
@@ -437,6 +607,31 @@ def test_raw_child_blocked_stage_overrides_stale_root_probe(tmp_path: Path) -> N
     assert snapshot.stage_status == "blocked"
     assert "colmap | blocked" in line
     assert "probe | 完成" not in line
+
+
+def test_raw_smoke_child_failure_keeps_root_history_in_canonical_order(tmp_path: Path) -> None:
+    run_dir = _write_status_run(
+        tmp_path / "raw-smoke-child",
+        status="running",
+        stage_statuses={"probe": "passed"},
+        last_stage="probe",
+    )
+    _write_status_run(
+        run_dir / "raw-smoke-input" / "smoke-input",
+        status="blocked",
+        stage_statuses={"colmap": "blocked"},
+        last_stage="colmap",
+    )
+    stream = io.StringIO()
+    reporter = TerminalProgress("plain", stream=stream, env={"TERM": "x"})
+    reporter.bind_run(run_dir)
+    reporter.poll_once(force=True)
+
+    lines = stream.getvalue().splitlines()
+    assert lines[0].startswith("probe | 完成")
+    assert lines[1].startswith("colmap | blocked")
+    assert all("probe | 完成" not in line for line in lines[1:])
+    reporter.close()
 
 
 def test_raw_child_completion_then_root_close_does_not_duplicate_or_reorder_lines(
@@ -479,12 +674,13 @@ def test_raw_child_completion_then_root_close_does_not_duplicate_or_reorder_line
     reporter.poll_once()
 
     lines = stream.getvalue().splitlines()
-    assert len(lines) == 2
-    assert lines[0].startswith("colmap |")
-    assert "完成" not in lines[0]
-    assert "colmap | 完成" in lines[1]
-    assert sum("完成" in line for line in lines) == 1
-    assert all("probe | 完成" not in line for line in lines)
+    assert len(lines) == 3
+    assert "probe | 完成" in lines[0]
+    assert lines[1].startswith("colmap |")
+    assert "完成" not in lines[1]
+    assert "colmap | 完成" in lines[2]
+    assert sum("完成" in line for line in lines) == 2
+    assert all("probe | 完成" not in line for line in lines[1:])
     reporter.close()
 
 
@@ -560,13 +756,13 @@ def test_plain_stage_switch_is_low_noise_but_keeps_completion_line(tmp_path: Pat
     clock[0] = 101.0
     reporter.poll_once()
     lines = stream.getvalue().splitlines()
-    assert len(lines) == 3
-    assert "完成" in lines[1]
-    assert "formal training" in lines[2]
+    assert len(lines) == 2
+    assert "colmap | 完成" in lines[0]
+    assert "formal training" in lines[1]
 
     clock[0] = 162.0
     reporter.poll_once()
-    assert len(stream.getvalue().splitlines()) == 4
+    assert len(stream.getvalue().splitlines()) == 3
 
 
 def test_training_sampling_telemetry_is_real_iteration_not_quality_progress(tmp_path: Path) -> None:
@@ -695,7 +891,14 @@ def test_tty_plain_off_no_color_and_stage_change_heartbeat_behavior(tmp_path: Pa
                 "status": "running",
                 "active_stage": "formal-training",
                 "active_attempt": "attempt-0001",
-                "stages": {},
+                "stages": {
+                    "conversion": [
+                        {"attempt": "attempt-0001", "status": "passed"},
+                    ],
+                    "formal-training": [
+                        {"attempt": "attempt-0001", "status": "running"},
+                    ],
+                },
             }
         ),
         encoding="utf-8",
@@ -705,7 +908,7 @@ def test_tty_plain_off_no_color_and_stage_change_heartbeat_behavior(tmp_path: Pa
     assert "formal training" in heartbeat_stream.getvalue()
     clock[0] = 162.0
     plain.poll_once()
-    assert heartbeat_stream.getvalue().count("\n") == 4
+    assert heartbeat_stream.getvalue().count("\n") == 3
 
 
 def test_download_callback_reports_only_sizes_without_url(tmp_path: Path) -> None:
