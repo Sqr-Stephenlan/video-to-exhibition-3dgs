@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from .pipeline_contract import PipelineBlocked
 from .publisher import PublishError, atomic_noreplace, sanitize_stem
+from .terminal_progress import TerminalProgress
 from .tool_provider import discover_workspace_root, load_provider_config, resolve_tool_provider
 
 
@@ -151,6 +152,7 @@ def download_direct_url(
     incoming_root: str | Path,
     opener: Callable[..., Any] = urlopen,
     max_download_bytes: int | str | None = None,
+    progress_callback: Callable[[int, int | None], None] | None = None,
 ) -> dict[str, Any]:
     """Download a direct video response using an append-safe ``.part`` file."""
 
@@ -195,6 +197,8 @@ def download_direct_url(
                     raise PipelineBlocked(
                         f"direct video URL exceeds the {size_limit}-byte download limit"
                     )
+            if progress_callback is not None:
+                progress_callback(0, declared_size)
             temporary = root / f".{stem}.{uuid.uuid4().hex}.part"
             flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
             if hasattr(os, "O_NOFOLLOW"):
@@ -214,6 +218,8 @@ def download_direct_url(
                             f"direct video URL exceeded the {size_limit}-byte download limit"
                         )
                     destination.write(chunk)
+                    if progress_callback is not None:
+                        progress_callback(downloaded_size, declared_size)
                 destination.flush()
                 os.fsync(destination.fileno())
             if declared_size is not None and declared_size != downloaded_size:
@@ -447,6 +453,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"direct URL byte limit (default: {DEFAULT_MAX_DOWNLOAD_BYTES}; env: {MAX_DOWNLOAD_BYTES_ENV})",
     )
     parser.add_argument("--plan", action="store_true", help="record a CPU-only canonical plan without GPU execution")
+    parser.add_argument(
+        "--progress",
+        choices=("auto", "plain", "off"),
+        default="auto",
+        help="stderr progress observer mode (default: auto)",
+    )
     return parser
 
 
@@ -454,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     route = Path(__file__).resolve().parents[2]
     runtime_root = _runtime_root(route)
+    progress = TerminalProgress(args.progress)
+    progress.start()
     incoming_root = runtime_root / INCOMING_DIRNAME
     run_root = runtime_root / RUNS_DIRNAME
     output_dir = Path(args.output_dir)
@@ -468,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.input,
                 incoming_root=incoming_root,
                 max_download_bytes=args.max_download_bytes,
+                progress_callback=progress.download_callback,
             )
             source = Path(source_metadata["path"])
             validate_downloaded_video(source, route_root=route, tool_paths=overrides)
@@ -485,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             source_stem = sanitize_stem(source.stem)
         run_id = _next_run_id(run_root, source_stem, source_sha256)
         run_reservation = (run_root, run_id)
+        progress.bind_run(run_root / run_id)
         delivery_name = sanitize_stem(args.name or source_stem)
 
         if not args.plan:
@@ -508,10 +524,13 @@ def main(argv: list[str] | None = None) -> int:
             delivery_name=delivery_name,
             source_metadata=source_metadata,
         )
+    except KeyboardInterrupt:
+        return 130
     except (PipelineBlocked, PublishError, ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     finally:
+        progress.close()
         if run_reservation is not None:
             _release_run_id_reservation(*run_reservation)
 

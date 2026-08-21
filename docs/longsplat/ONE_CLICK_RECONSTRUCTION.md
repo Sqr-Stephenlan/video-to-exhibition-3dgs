@@ -79,6 +79,49 @@ Useful options:
 ./video-to-3dgs --plan "/path/to/video.mp4"
 ```
 
+### Observational terminal progress
+
+The one-click command accepts `--progress auto|plain|off` (default `auto`).
+The reporter writes to stderr only, so the canonical stdout contract remains
+unchanged: successful runs still emit `SUCCESS`, `PLY:`, and `EVIDENCE:` in
+that order, while plan runs still emit `PLAN` and `EVIDENCE:`. `auto` uses a
+single refreshed line on a capable TTY; `plain` and CI/non-TTY runs append only
+stage changes plus an approximately 60-second heartbeat. `TERM=dumb`,
+`NO_COLOR`, or `off` never adds ANSI control sequences. Direct URL downloads
+report byte counts and `Content-Length` when available; without a length they
+report MiB only and never print the URL, query, fragment, or token.
+
+The UI is a read-only observer, not a second state machine. It reads the
+current run's `config.json` stage order, `run.json`, the two raw-stage
+`run.json` files, and the current conversion sidecar. The authoritative state
+remains `run.json`/RunLedger and the existing return-code, PLY-validator, and
+stage contracts. A missing conversion marker is shown as `conversion
+(unobserved)`; no percentage, iteration zero, total, ETA, or pass/fail state is
+invented. After 15 minutes without a new observed marker the UI may print
+`WARNING: no observed iteration heartbeat`; it never terminates or blocks the
+child automatically.
+
+For each conversion attempt, the executor creates three fresh files below that
+attempt's evidence directory:
+
+```text
+conversion-stdout-live.log       complete raw child stdout
+conversion-stderr-live.log       complete raw child stderr (separate stream)
+conversion-progress-v1.jsonl     append-only structured observations
+```
+
+The sidecar uses `schema_version: "conversion-progress-v1"`, `total`,
+`timestamp_utc`, and `elapsed_seconds`. It records `child_started`, valid
+strictly increasing integer `iteration` observations, and `child_exited` (or a
+parent-error record during cleanup). Iterations come only from the child's
+explicit `CONVERSION_SHAPE_TELEMETRY` marker; duplicate, regressing,
+malformed, or out-of-range markers remain in the raw log but are not written as
+normal progress. The reader consumes only a bounded tail of the append-only
+JSONL and ignores a final partial line. The files are exclusive, non-symlink
+observation artifacts contained within the current attempt; legacy final
+`stdout.log`/`stderr.log`, conversion records, telemetry summaries, validators,
+and resume semantics remain authoritative and unchanged.
+
 For a fresh remote checkout, the CPU workflow materializes the root LongSplat
 fork and exactly the four direct locked inner gitlinks with:
 

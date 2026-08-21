@@ -14,6 +14,7 @@ from scripts.longsplat.one_click import (
     _local_source,
     _next_run_id,
     _runtime_root,
+    main,
     download_direct_url,
     resolve_max_download_bytes,
     sanitize_url_origin,
@@ -231,3 +232,39 @@ def test_provider_discovery_uses_workspace_ancestor(tmp_path: Path) -> None:
     assert paths["ffprobe"] == str(media / "ffprobe")
     assert paths["backend_python"] == str(backend / "python")
     assert _runtime_root(route) == workspace / ".runtime"
+
+
+def test_one_click_progress_off_preserves_stdout_contract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fixture")
+    runtime = tmp_path / "runtime"
+    monkeypatch.setattr("scripts.longsplat.one_click._runtime_root", lambda _route: runtime)
+    monkeypatch.setattr(
+        "scripts.longsplat.reconstruct_pipeline.run_reconstruction",
+        lambda **kwargs: {"run_dir": str(Path(kwargs["output_root"]) / kwargs["run_id"])},
+    )
+
+    code = main([str(video), "--plan", "--progress", "off"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.out.startswith("PLAN\nEVIDENCE: ")
+    assert captured.err == ""
+
+
+def test_one_click_keyboard_interrupt_returns_130_without_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fixture")
+    runtime = tmp_path / "runtime"
+    monkeypatch.setattr("scripts.longsplat.one_click._runtime_root", lambda _route: runtime)
+    monkeypatch.setattr(
+        "scripts.longsplat.reconstruct_pipeline.run_reconstruction",
+        lambda **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+
+    code = main([str(video), "--plan", "--progress", "plain"])
+    captured = capsys.readouterr()
+
+    assert code == 130
+    assert captured.out == ""
+    assert "SUCCESS" not in captured.out
