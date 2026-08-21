@@ -19,10 +19,14 @@ from typing import Any, Mapping, Sequence
 
 from .acceptance_delivery import AcceptanceDeliveryError, create_candidate_delivery
 from .authority_manifest import AuthorityManifestError, load_authority_manifest
+from .conversion_evidence_schema import (
+    ConvertedEvaluationSchemaError,
+    normalize_converted_evaluation,
+)
 from .pipeline_contract import PipelineBlocked, resolve_contained_path, resolve_containment_root
 
 
-SCHEMA_VERSION = "longsplat-converted-eval-cpu-postprocess-v1"
+SCHEMA_VERSION = "longsplat-converted-eval-cpu-postprocess-v2"
 DEFAULT_CONTACT_INDICES = (0, 18, 36, 54, 72, 89, 107, 125, 143)
 _PNG_NAME_RE = re.compile(r"^(?P<ordinal>[0-9]{4})_(?P<token>.+)\.png$")
 
@@ -510,7 +514,7 @@ def run_postprocess(
     # being consumed.
     structural_pass = len(rows) == count and not no_usable_converted_views
     visual_quality_fail = bool(empty_views) or severe_converted or severe_native
-    full_pass = structural_pass and not visual_quality_fail
+    visual_quality_pass = not visual_quality_fail
     quality_advisories: list[str] = []
     if empty_views:
         quality_advisories.append("one or more views are empty/black; retained as visual-quality evidence")
@@ -567,11 +571,18 @@ def run_postprocess(
     result = {
         "schema_version": SCHEMA_VERSION,
         "stage": "converted-eval-postprocess",
-        "status": "technical_pass" if full_pass else "needs_review",
+        "status": (
+            "technical_pass"
+            if structural_pass and visual_quality_pass
+            else "needs_review"
+            if structural_pass
+            else "blocked"
+        ),
         "STRUCTURAL_CONVERSION_PASS": True,
         "STRUCTURAL_EVALUATION_PASS": structural_pass,
         "FULL_STREAM_VALIDATION_PASS": structural_pass,
-        "SAME_CAMERA_VISUAL_PASS": "fail" if visual_quality_fail else "pass",
+        "SAME_CAMERA_VISUAL_PASS": "pass" if visual_quality_pass else "fail",
+        "visual_quality_pass": visual_quality_pass,
         "accepted": False,
         "supersplat": False,
         "three_view_manual_acceptance_required": True,
@@ -598,7 +609,10 @@ def run_postprocess(
         },
         "native_render": {"root": str(native_root), "camera_order": native_names},
         "full_stream_validation": {
-            "pass": full_pass,
+            # ``pass`` is structural.  Visual quality is deliberately carried
+            # by visual_quality_pass/SAME_CAMERA_VISUAL_PASS instead.
+            "pass": structural_pass,
+            "structural_pass": structural_pass,
             "triples_processed": len(rows),
             "expected_triples": count,
             "resident_full_resolution_frame_max": (
@@ -618,7 +632,7 @@ def run_postprocess(
         "contact_sheet": contact,
         "quality_advisories": quality_advisories,
         "severe_degradation_policy": {"mse_threshold": severe_mse_threshold, "converted_vs_gt": severe_converted, "native_vs_converted": severe_native},
-        "candidate_delivery": {"eligible_after_manual_visual_review": full_pass, "evidence_files": evidence_files, "comparison_sheet": str(contact_path.resolve()), "provenance_context": provenance_context},
+        "candidate_delivery": {"eligible_after_manual_visual_review": visual_quality_pass, "structural_evaluation_pass": structural_pass, "visual_quality_pass": visual_quality_pass, "evidence_files": evidence_files, "comparison_sheet": str(contact_path.resolve()), "provenance_context": provenance_context},
         "known_limitations": known_limitations,
     }
     result_path = output / "postprocess_result.json"
@@ -640,7 +654,23 @@ def create_candidate_from_postprocess(
     manifest_path = _output_path(authority_manifest_path, outputs, "authority manifest", containment_root=containment_root)
     post_path = _output_path(postprocess_result_path, outputs, "postprocess result", containment_root=containment_root)
     result = _load_json(post_path, "postprocess result")
-    if result.get("SAME_CAMERA_VISUAL_PASS") != "pass" or result.get("FULL_STREAM_VALIDATION_PASS") is not True:
+    try:
+        authority = load_authority_manifest(
+            manifest_path,
+            route_root=route,
+            containment_root=containment_root,
+        )
+        normalized = normalize_converted_evaluation(
+            result,
+            expected_identity={
+                "camera_count": authority["camera_count"],
+                "camera_order": authority["camera_order"],
+                "camera_dimensions": authority["camera_dimensions"],
+            },
+        )
+    except (AuthorityManifestError, ConvertedEvaluationSchemaError) as exc:
+        _fail(str(exc))
+    if normalized["STRUCTURAL_EVALUATION_PASS"] is not True or normalized["visual_quality_pass"] is not True:
         _fail("candidate delivery requires a complete passing CPU postprocess")
     if manual_visual_decision != "pass":
         _fail("candidate delivery requires an explicit manual visual pass; no automatic acceptance is provided")

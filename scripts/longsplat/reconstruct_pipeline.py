@@ -3332,6 +3332,7 @@ def _converted_eval_postprocess_stage(
     )
     try:
         from .converted_eval_postprocess import run_postprocess
+        from .conversion_evidence_schema import normalize_converted_evaluation
 
         conversion_result_path = Path(conversion_root) / "conversion_result.json"
         converted_ply = _conversion_ply_from_result(conversion)
@@ -3344,15 +3345,23 @@ def _converted_eval_postprocess_stage(
             route_root=route,
             containment_root=ledger.run_dir,
         )
+        normalized = normalize_converted_evaluation(
+            result,
+            expected_identity={
+                "camera_count": authority["camera_count"],
+                "camera_order": authority["camera_order"],
+                "camera_dimensions": authority["camera_dimensions"],
+            },
+        )
         stage = _stage_result(
             stage="converted-eval-postprocess",
-            status="passed" if result.get("STRUCTURAL_EVALUATION_PASS") is True else "blocked",
+            status="passed" if normalized["STRUCTURAL_EVALUATION_PASS"] is True else "blocked",
             # The CPU recovery gate is structural: complete ordered finite
             # triples and a usable candidate.  Severe/black-view metrics are
             # retained as visual-quality evidence and do not gate the
             # automated technical delivery path.
-            computed_pass=result.get("STRUCTURAL_EVALUATION_PASS") is True,
-            reason="CPU streaming postprocess passed structural validation" if result.get("STRUCTURAL_EVALUATION_PASS") is True else "CPU streaming postprocess has no usable structural candidate",
+            computed_pass=normalized["STRUCTURAL_EVALUATION_PASS"] is True,
+            reason="CPU streaming postprocess passed structural validation" if normalized["STRUCTURAL_EVALUATION_PASS"] is True else "CPU streaming postprocess has no usable structural candidate",
             plan=False,
             artifacts=_artifacts([attempt / "postprocess_result.json", attempt / "metrics.json", attempt / "png_hashes.json", attempt / "fixed_gt_native_converted_contact_sheet.png"]),
             gpu_invoked=False,
@@ -3360,6 +3369,8 @@ def _converted_eval_postprocess_stage(
             cuda_rerun=False,
             postprocess_result_path=str(attempt / "postprocess_result.json"),
             postprocess_result=result,
+            visual_quality_pass=normalized["visual_quality_pass"],
+            legacy_compatibility_warnings=normalized["legacy_compatibility_warnings"],
         )
         status = "passed" if stage["computed_pass"] else "blocked"
         ledger.finish_attempt(stage="converted-eval-postprocess", attempt=attempt, status=status, result=stage)
@@ -3820,7 +3831,11 @@ def _run_default_formal_delivery(
                 render_reused=False,
                 cuda_rerun=False,
                 postprocess_required=False,
-                full_stream_validation_pass=True,
+                STRUCTURAL_EVALUATION_PASS=True,
+                FULL_STREAM_VALIDATION_PASS=True,
+                SAME_CAMERA_VISUAL_PASS="needs_review",
+                visual_quality_pass=None,
+                full_stream_validation={"pass": True, "structural_pass": True},
             )
             _record_stage(ledger, "converted-eval-postprocess", postprocess, status="passed")
             status = "passed"
@@ -3944,9 +3959,28 @@ def _candidate_delivery(
         _record_stage(ledger, "candidate-delivery", result, status="blocked")
         return result, "blocked"
     eval_result = evaluation.get("executor_result", {})
-    structural_evaluation = eval_result.get("STRUCTURAL_EVALUATION_PASS") is True
+    try:
+        from .conversion_evidence_schema import normalize_converted_evaluation
+
+        normalized_eval_result = normalize_converted_evaluation(
+            eval_result,
+            expected_identity={
+                "camera_count": authority["camera_count"],
+                "camera_order": authority["camera_order"],
+                "camera_dimensions": authority["camera_dimensions"],
+            },
+        )
+    except (ValueError, TypeError) as exc:
+        normalized_eval_result = None
+        normalization_error = str(exc)
+    structural_evaluation = bool(
+        normalized_eval_result is not None
+        and normalized_eval_result["STRUCTURAL_EVALUATION_PASS"] is True
+    )
     if not structural_evaluation:
         result = _stage_result(stage="candidate-delivery", status="blocked", computed_pass=False, reason="converted evaluation has no structural pass; visual quality is advisory only after structural validation", plan=False)
+        if normalized_eval_result is None:
+            result["reason"] = f"converted evaluation schema is invalid: {normalization_error}"
         _record_stage(ledger, "candidate-delivery", result, status="blocked")
         return result, "blocked"
     attempt = ledger.begin_attempt("candidate-delivery", {"authority_manifest": authority["authority_manifest_path"], "conversion_stage": conversion["stage"], "evaluation_stage": evaluation["stage"]})
@@ -3975,6 +4009,7 @@ def _candidate_delivery(
         "authority_manifest": authority["authority_manifest_path"],
         "conversion_profile_id": authority.get("authority", {}).get("profile_id", "standard30000-v1"),
         "same_camera_visual_pass": eval_result.get("SAME_CAMERA_VISUAL_PASS"),
+        "visual_quality_pass": normalized_eval_result["visual_quality_pass"],
         "accepted": False,
         "supersplat": False,
         "held_out": False,
@@ -4005,6 +4040,7 @@ def _candidate_delivery(
         vertices=candidate_manifest["vertices"],
         authority_manifest_path=authority["authority_manifest_path"],
         same_camera_visual_pass=eval_result.get("SAME_CAMERA_VISUAL_PASS"),
+        visual_quality_pass=normalized_eval_result["visual_quality_pass"],
         accepted=False,
         supersplat=False,
     )
@@ -5647,6 +5683,11 @@ def run_reconstruction(
                 render_reused=False,
                 cuda_rerun=False,
                 postprocess_required=False,
+                STRUCTURAL_EVALUATION_PASS=True,
+                FULL_STREAM_VALIDATION_PASS=True,
+                SAME_CAMERA_VISUAL_PASS="needs_review",
+                visual_quality_pass=None,
+                full_stream_validation={"pass": True, "structural_pass": True},
             )
             _record_stage(ledger, "converted-eval-postprocess", postprocess, status="passed")
             status = "passed"
@@ -5767,7 +5808,29 @@ def _execute_authority_stage(
         # Converted evaluation has its own structural marker.  A visual
         # failure remains evidence/advisory and must not gate the downstream
         # technical chain once the ordered render set was safely validated.
-        passed = child.get("STRUCTURAL_EVALUATION_PASS") is True
+        from .conversion_evidence_schema import normalize_converted_evaluation
+
+        try:
+            expected_identity = None
+            if all(
+                key in authority_result
+                for key in ("camera_count", "camera_order", "camera_dimensions")
+            ):
+                expected_identity = {
+                    "camera_count": authority_result["camera_count"],
+                    "camera_order": authority_result["camera_order"],
+                    "camera_dimensions": authority_result["camera_dimensions"],
+                }
+            normalized_child = normalize_converted_evaluation(
+                child,
+                expected_identity=expected_identity,
+            )
+        except (ValueError, TypeError):
+            normalized_child = None
+        passed = bool(
+            normalized_child is not None
+            and normalized_child["STRUCTURAL_EVALUATION_PASS"] is True
+        )
     child_status = "passed" if passed else ("failed" if child.get("exit_code") not in (0, None) else "blocked")
     result = _stage_result(stage=stage, status=child_status, computed_pass=passed, reason="authority executor passed" if passed else str(child.get("reason", "authority executor failed")), plan=plan, artifacts=_artifacts([executor_root / "conversion_result.json", executor_root / "evaluation_result.json", executor_root / "request.json", executor_root / "argv.json", executor_root / "same_camera_eval" / "evaluator_result.json", authority_result["authority_manifest_path"]]), gpu_invoked=True, executor_root=str(executor_root), executor_result=child, authority_manifest_path=authority_result["authority_manifest_path"], plan_path=authority_result["authority"]["manifest"]["plan"]["path"], static_contract_path=authority_result["authority"]["manifest"]["static_contract"]["path"])
     ledger.finish_attempt(stage=stage, attempt=attempt, status=child_status, result=result)

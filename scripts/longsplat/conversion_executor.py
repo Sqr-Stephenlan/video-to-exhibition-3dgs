@@ -763,10 +763,12 @@ def postprocess_evaluation(
     if severe:
         quality_advisories.append("converted-vs-GT MSE exceeded the visual advisory threshold; structural evaluation remains valid")
     return {
-        "schema_version": "longsplat-generic-conversion-ab-v1",
+        "schema_version": "longsplat-generic-conversion-ab-v2",
         "STRUCTURAL_CONVERSION_PASS": True,
         "STRUCTURAL_EVALUATION_PASS": True,
+        "FULL_STREAM_VALIDATION_PASS": True,
         "SAME_CAMERA_VISUAL_PASS": "fail" if severe else "needs_review",
+        "visual_quality_pass": not severe,
         "accepted": False,
         "supersplat": False,
         "held_out": authority["status"]["held_out"],

@@ -83,12 +83,16 @@ def test_streaming_postprocess_uses_dynamic_order_and_marks_cpu_reuse(tmp_path: 
         route_root=route,
     )
 
+    assert result["STRUCTURAL_EVALUATION_PASS"] is True
     assert result["FULL_STREAM_VALIDATION_PASS"] is True
     assert result["SAME_CAMERA_VISUAL_PASS"] == "pass"
+    assert result["visual_quality_pass"] is True
     assert result["gpu_invoked"] is False
     assert result["render_reused"] is True
     assert result["cuda_rerun"] is False
     assert result["full_stream_validation"]["triples_processed"] == 2
+    assert result["full_stream_validation"]["pass"] is True
+    assert result["full_stream_validation"]["structural_pass"] is True
     # Legacy conversion evidence has no runtime residency telemetry, so no
     # theoretical full-resolution-frame estimate is reported.
     assert result["full_stream_validation"]["resident_full_resolution_frame_max"] is None
@@ -96,6 +100,61 @@ def test_streaming_postprocess_uses_dynamic_order_and_marks_cpu_reuse(tmp_path: 
     assert Path(result["contact_sheet"]["path"]).is_file()
     rows = json.loads((Path(result["metrics"]["path"])).read_text(encoding="utf-8"))["per_view"]
     assert [row["camera_name"] for row in rows] == camera_names
+
+
+def test_visual_quality_advisory_does_not_clear_structural_pass(tmp_path: Path) -> None:
+    camera_names = ["first-view", "second-view"]
+    width, height = 23, 15
+    _manifest, authority_path, route = _fixture(
+        tmp_path,
+        "visual-advisory",
+        camera_names=camera_names,
+        width=width,
+        height=height,
+    )
+    failed_root, _gt_root, converted_root = _write_reused_eval_evidence(
+        route, "visual-advisory", camera_names, width, height
+    )
+    assert cv2.imwrite(
+        str(converted_root / "0000_first-view.png"),
+        np.zeros((height, width, 3), dtype=np.uint8),
+    )
+    conversion_root = route / "outputs" / "visual-advisory" / "conversion"
+    conversion_root.mkdir(parents=True)
+    ply = conversion_root / "point_cloud.ply"
+    ply.write_bytes(b"technical-ply")
+    conversion_result = conversion_root / "conversion_result.json"
+    conversion_result.write_text(
+        json.dumps(
+            {
+                "STRUCTURAL_CONVERSION_PASS": True,
+                "structural_pass": True,
+                "structural": {
+                    "path": str(ply),
+                    "sha256": hashlib.sha256(ply.read_bytes()).hexdigest(),
+                    "file_size": ply.stat().st_size,
+                    "vertex_count": 2,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_postprocess(
+        authority_manifest_path=authority_path,
+        conversion_result_path=conversion_result,
+        converted_ply_path=ply,
+        failed_evaluation_root=failed_root,
+        output_root=route / "outputs" / "visual-advisory" / "postprocess",
+        route_root=route,
+    )
+
+    assert result["STRUCTURAL_EVALUATION_PASS"] is True
+    assert result["FULL_STREAM_VALIDATION_PASS"] is True
+    assert result["full_stream_validation"]["pass"] is True
+    assert result["visual_quality_pass"] is False
+    assert result["SAME_CAMERA_VISUAL_PASS"] == "fail"
+    assert result["status"] == "needs_review"
 
 
 def test_explicit_contract_extension_mapping_is_not_fuzzy() -> None:

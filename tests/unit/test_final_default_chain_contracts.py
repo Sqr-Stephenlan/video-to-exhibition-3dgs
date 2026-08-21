@@ -237,7 +237,7 @@ def test_component_inventory_records_tie_inside_unique_winner_as_provenance(tmp_
     assert provenance["selected_segment_tie_policy"].startswith("provenance_only")
 
 
-def test_component_inventory_blocks_equal_candidates_and_equal_sets(tmp_path: Path) -> None:
+def test_component_inventory_resolves_equal_candidates_stably_and_preserves_ties(tmp_path: Path) -> None:
     selected = [{"staged_name": f"capture_{index:03d}.jpg"} for index in range(6)]
     first = _component(
         tmp_path / "equal" / "first",
@@ -247,8 +247,41 @@ def test_component_inventory_blocks_equal_candidates_and_equal_sets(tmp_path: Pa
         tmp_path / "equal" / "second",
         ["capture_003.jpg", "capture_004.jpg", "capture_005.jpg"],
     )
-    with pytest.raises(PipelineBlocked, match="equal contiguous segments"):
-        _select_mapper_component([first, second], selected)
+    chosen, names, inventory = _select_mapper_component([first, second], selected)
+    assert chosen == first.resolve()
+    assert names == ["capture_000.jpg", "capture_001.jpg", "capture_002.jpg"]
+    assert inventory["selection_confidence"] == "low"
+    assert inventory["selection_ties"] == [
+        {
+            "kind": "equal_quality_active_candidates",
+            "components": [first.name, second.name],
+            "quality": {
+                "longest_contiguous_run_count": 3,
+                "registered_image_count": 3,
+                "coverage_ratio": 0.5,
+            },
+            "resolution": "stable_component_name_then_path_tiebreak; one_model_no_merge",
+        }
+    ]
+    assert {item["selection_status"] for item in inventory["components"]} == {"selected", "not_selected"}
+
+    overlap_first = _component(
+        tmp_path / "equal-overlap" / "first",
+        ["capture_000.jpg", "capture_001.jpg", "capture_002.jpg"],
+    )
+    overlap_second = _component(
+        tmp_path / "equal-overlap" / "second",
+        ["capture_002.jpg", "capture_003.jpg", "capture_004.jpg"],
+    )
+    overlap_chosen, _, overlap_inventory = _select_mapper_component(
+        [overlap_second, overlap_first], selected
+    )
+    assert overlap_chosen == overlap_first.resolve()
+    assert any(
+        relation["relation"] == "non_subset_overlap"
+        for item in overlap_inventory["components"]
+        for relation in item["relationships"]
+    )
 
     same_first = _component(
         tmp_path / "same" / "first",
@@ -258,8 +291,12 @@ def test_component_inventory_blocks_equal_candidates_and_equal_sets(tmp_path: Pa
         tmp_path / "same" / "second",
         ["capture_000.jpg", "capture_001.jpg"],
     )
-    with pytest.raises(PipelineBlocked, match="equal contiguous segments"):
-        _select_mapper_component([same_first, same_second], selected)
+    same_forward = _select_mapper_component([same_first, same_second], selected)
+    same_reverse = _select_mapper_component([same_second, same_first], selected)
+    assert same_forward[0] == same_first.resolve()
+    assert same_reverse[0] == same_first.resolve()
+    assert same_forward[2]["selection_ties"] == same_reverse[2]["selection_ties"]
+    assert same_forward[2]["selection_confidence"] == "low"
 
 
 def test_component_inventory_preserves_one_component_and_name_validation(tmp_path: Path) -> None:

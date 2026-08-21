@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .authority_manifest import AuthorityManifestError, validate_authority_manifest
+from .conversion_evidence_schema import (
+    ConvertedEvaluationSchemaError,
+    normalize_converted_evaluation,
+)
 
 
 class AcceptanceDeliveryError(ValueError):
@@ -508,10 +512,18 @@ def create_candidate_delivery(
     if evaluation_value is None:
         _fail("candidate delivery requires evaluation_result evidence")
     evaluation = _load_json(Path(evaluation_value), "converted evaluation result")
-    structural_evaluation = evaluation.get("STRUCTURAL_EVALUATION_PASS")
-    if structural_evaluation is None:
-        structural_evaluation = evaluation.get("FULL_STREAM_VALIDATION_PASS") is True
-    if structural_evaluation is not True:
+    try:
+        normalized_evaluation = normalize_converted_evaluation(
+            evaluation,
+            expected_identity={
+                "camera_count": authority["camera_count"],
+                "camera_order": authority["camera_order"],
+                "camera_dimensions": authority["camera_dimensions"],
+            },
+        )
+    except ConvertedEvaluationSchemaError as exc:
+        _fail(f"candidate delivery requires a structural converted-evaluation pass: {exc}")
+    if normalized_evaluation["STRUCTURAL_EVALUATION_PASS"] is not True:
         _fail("candidate delivery requires a structural converted-evaluation pass; visual quality remains advisory")
     root = Path(output_dir)
     if root.exists() or root.is_symlink():
@@ -565,6 +577,8 @@ def create_candidate_delivery(
         "camera_dimensions": dimensions,
         "conversion_profile_id": authority["profile_id"],
         "same_camera_visual_pass": evaluation.get("SAME_CAMERA_VISUAL_PASS"),
+        "visual_quality_pass": normalized_evaluation["visual_quality_pass"],
+        "structural_evaluation_pass": normalized_evaluation["STRUCTURAL_EVALUATION_PASS"],
         "quality_advisories": evaluation.get("quality_advisories", []),
         "known_limitations": known_limitations,
         "comparison_sheet": comparison["destination"],
@@ -617,6 +631,8 @@ def create_candidate_delivery(
         "evaluation": {
             "result": _identity(Path(evaluation_value), "evaluation result"),
             "same_camera_visual_pass": evaluation.get("SAME_CAMERA_VISUAL_PASS"),
+            "visual_quality_pass": normalized_evaluation["visual_quality_pass"],
+            "structural_evaluation_pass": normalized_evaluation["STRUCTURAL_EVALUATION_PASS"],
             "quality_advisories": evaluation.get("quality_advisories", []),
             "held_out": False,
             "metrics_scope": "training_views_only",

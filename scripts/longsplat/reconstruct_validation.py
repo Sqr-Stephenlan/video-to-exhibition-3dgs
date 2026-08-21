@@ -16,6 +16,10 @@ from typing import Any, Mapping
 
 from .authority_manifest import AuthorityManifestError, load_authority_manifest
 from .converted_eval_postprocess import _expected_converted_names
+from .conversion_evidence_schema import (
+    ConvertedEvaluationSchemaError,
+    normalize_converted_evaluation,
+)
 from .pipeline_contract import PipelineBlocked, sha256_file, stable_sha256
 
 
@@ -450,7 +454,18 @@ def validate_existing_run(
         # CPU recovery is a technical contract.  Manual/rough visual review
         # remains separate and must not be reintroduced into validate-only or
         # automated delivery reachability.
-        post_pass = postprocess.get("FULL_STREAM_VALIDATION_PASS") is True
+        try:
+            normalized_postprocess = normalize_converted_evaluation(
+                postprocess,
+                expected_identity={
+                    "camera_count": authority["camera_count"],
+                    "camera_order": authority["camera_order"],
+                    "camera_dimensions": authority["camera_dimensions"],
+                },
+            )
+        except ConvertedEvaluationSchemaError as exc:
+            _fail(str(exc))
+        post_pass = normalized_postprocess["STRUCTURAL_EVALUATION_PASS"] is True
         stage_results["converted-eval-postprocess"] = _stage(
             "converted-eval-postprocess",
             "passed" if post_pass else "needs_review",
@@ -461,6 +476,8 @@ def validate_existing_run(
             gpu_invoked=False,
             render_reused=postprocess.get("render_reused"),
             cuda_rerun=postprocess.get("cuda_rerun"),
+            visual_quality_pass=normalized_postprocess["visual_quality_pass"],
+            legacy_compatibility_warnings=normalized_postprocess["legacy_compatibility_warnings"],
             resident_full_resolution_frame_max=postprocess.get("full_stream_validation", {}).get("resident_full_resolution_frame_max") if isinstance(postprocess.get("full_stream_validation"), Mapping) else None,
         )
     else:

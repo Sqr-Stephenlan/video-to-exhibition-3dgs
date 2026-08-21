@@ -553,26 +553,44 @@ def _select_mapper_component(
         )
         == winner_quality
     ]
+    selection_ties: list[dict[str, Any]] = []
+    selection_advisories: list[str] = []
     if len(tied_quality) > 1:
-        snapshot = {
-            "schema_version": "colmap-component-inventory-v1",
-            "mapper_component_count": len(components),
-            "active_model_component_count": 0,
-            "active_candidate_component_count": len(active_indices),
-            "components": inventory,
-            "selection_ambiguity": {
-                "reason": "equal_component_quality",
-                "components": [inventory[index]["component_name"] for index in tied_quality],
-                "quality": winner_quality,
-            },
-            "selected_component_name": None,
-            "selected_component_path": None,
-            "selection_rule": "complete inventory; dynamic quality ranking; true equal-quality candidate tie",
+        tie_quality = {
+            "longest_contiguous_run_count": winner_quality[0],
+            "registered_image_count": winner_quality[1],
+            "coverage_ratio": winner_quality[2],
         }
-        raise MapperComponentSelectionBlocked(
-            "COLMAP mapper component selection is ambiguous: equal contiguous segments/component quality",
-            inventory=snapshot,
+        tied_names = [inventory[index]["component_name"] for index in tied_quality]
+        selection_ties.append(
+            {
+                "kind": "equal_quality_active_candidates",
+                "components": tied_names,
+                "quality": tie_quality,
+                "resolution": "stable_component_name_then_path_tiebreak; one_model_no_merge",
+            }
         )
+        selection_advisories.append(
+            "equal_quality_active_candidate_tie_resolved_by_stable_component_name_path"
+        )
+        for index in tied_quality:
+            item = inventory[index]
+            item["selection_advisories"].append(
+                "equal_quality_active_candidate_tie; stable_component_name_path_tiebreak"
+            )
+            for other_index in tied_quality:
+                if other_index == index:
+                    continue
+                other = inventory[other_index]
+                item["relationships"].append(
+                    {
+                        "relation": "equal_quality_candidate_tie",
+                        "other_component": other["component_name"],
+                        "overlap_count": len(name_sets[index] & name_sets[other_index]),
+                        "overlap_names": sorted(name_sets[index] & name_sets[other_index]),
+                        "quality": tie_quality,
+                    }
+                )
 
     selected_index = ranked[0]
     selected = inventory[selected_index]
@@ -604,12 +622,13 @@ def _select_mapper_component(
         "components": inventory,
         "selected_component_name": selected["component_name"],
         "selected_component_path": str(selected_path),
-        "selection_confidence": "low" if selected.get("selection_advisories") else "high",
-        "selection_advisories": list(selected.get("selection_advisories", [])),
+        "selection_confidence": "low" if selection_ties or selected.get("selection_advisories") else "high",
+        "selection_ties": selection_ties,
+        "selection_advisories": selection_advisories + list(selected.get("selection_advisories", [])),
         "selection_rule": (
             "complete component inventory; rank longest temporally contiguous registered segment, "
             "then registered count and coverage; strict registered-name subsets are dominated/redundant; "
-            "component relationships are evidence only; no merge"
+            "exact equal-quality ties use stable component name then path; component relationships are evidence only; no merge"
         ),
     }
 

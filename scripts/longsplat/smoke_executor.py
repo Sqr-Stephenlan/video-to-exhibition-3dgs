@@ -42,6 +42,7 @@ try:
         stable_sha256,
     )
     from .gate_schema import GateSchemaBlocked, normalize_gate_evidence
+    from .conversion_evidence_schema import ConvertedEvaluationSchemaError, normalize_converted_evaluation
 except ImportError:  # direct ``dev.sh python scripts/...`` invocation
     from scripts.longsplat.longsplat_input import (  # type: ignore
         _nested_backend_code_identity,
@@ -58,6 +59,7 @@ except ImportError:  # direct ``dev.sh python scripts/...`` invocation
         stable_sha256,
     )
     from scripts.longsplat.gate_schema import GateSchemaBlocked, normalize_gate_evidence  # type: ignore
+    from scripts.longsplat.conversion_evidence_schema import ConvertedEvaluationSchemaError, normalize_converted_evaluation  # type: ignore
 
 
 class SmokeExecutorBlocked(RuntimeError):
@@ -2012,7 +2014,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if result.get("validated"):
         return 0
     if result.get("stage") in {"converted-eval", "converted-eval-postprocess"}:
-        return 0 if result.get("SAME_CAMERA_VISUAL_PASS") in {"pass", "needs_review"} else 1
+        try:
+            normalized = normalize_converted_evaluation(result)
+        except ConvertedEvaluationSchemaError:
+            return 1
+        return 0 if normalized["STRUCTURAL_EVALUATION_PASS"] is True else 1
     if result.get("stage") == "conversion":
         return 0 if result.get("exit_code") == 0 and result.get("structural_pass") else 1
     return 0 if result.get("exit_code") == 0 and result.get("structural_pass") else 1
