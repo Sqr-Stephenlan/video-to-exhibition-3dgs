@@ -60,6 +60,68 @@ def test_candidate_delivery_is_explicitly_not_accepted(tmp_path: Path, monkeypat
     assert "point_cloud.ply" in (root / "SHA256SUMS.txt").read_text(encoding="utf-8")
 
 
+def test_candidate_delivery_consumes_canonical_provenance_without_static_video_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _manifest, authority_path, route = _fixture(
+        tmp_path,
+        "canonical-provenance",
+        camera_names=["cam-z", "cam-a"],
+        width=11,
+        height=7,
+    )
+    evidence_root = route / "outputs" / "canonical-provenance" / "evidence"
+    evidence_root.mkdir(parents=True)
+    converted = evidence_root / "converted.ply"
+    converted.write_bytes(b"technical-ply")
+    evaluation = evidence_root / "evaluation.json"
+    evaluation.write_text(
+        json.dumps(
+            {
+                "STRUCTURAL_EVALUATION_PASS": True,
+                "SAME_CAMERA_VISUAL_PASS": "pass",
+                "quality_advisories": [{"code": "camera-gap", "camera_order": ["cam-z", "cam-a"]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    comparison = evidence_root / "comparison.png"
+    assert cv2.imwrite(str(comparison), np.zeros((7, 11, 3), dtype=np.uint8))
+    segment_source = {
+        "path": str((evidence_root / "segment.json").resolve()),
+        "sha256": "segment-sha",
+        "size_bytes": 17,
+    }
+    provenance_context = {
+        "known_limitations": ["canonical evaluator failure reason: fixture-only"],
+        "quality_advisories": [{"code": "camera-gap", "camera_order": ["cam-z", "cam-a"]}],
+        "segment_provenance": {"selected_segment": {"frame_names": ["cam-z"]}},
+        "segment_provenance_source": segment_source,
+    }
+
+    monkeypatch.setattr("scripts.longsplat.acceptance_delivery._point_count", lambda _path: 2)
+    result = create_candidate_delivery(
+        converted_ply=converted,
+        output_dir=route / "outputs" / "canonical-provenance" / "candidate_delivery",
+        authority_manifest=authority_path,
+        evidence_files={"evaluation_result.json": evaluation},
+        comparison_sheet=comparison,
+        provenance_context=provenance_context,
+    )
+
+    root = Path(result["root"])
+    manifest = json.loads((root / "candidate_manifest.json").read_text(encoding="utf-8"))
+    provenance = json.loads((root / "PROVENANCE.json").read_text(encoding="utf-8"))
+    assert manifest["known_limitations"] == provenance_context["known_limitations"]
+    assert manifest["quality_advisories"] == provenance_context["quality_advisories"]
+    assert provenance["segment_provenance"] == provenance_context["segment_provenance"]
+    assert provenance["segment_provenance_source"] == segment_source
+    serialized = json.dumps({"manifest": manifest, "provenance": provenance}, sort_keys=True)
+    forbidden = ("frame_" + "000140", "2" + ".982", "dynamic-" + "person")
+    assert all(token not in serialized for token in forbidden)
+
+
 def test_failed_same_camera_visual_is_advisory_after_structural_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _manifest, authority_path, route = _fixture(
         tmp_path,
@@ -181,7 +243,24 @@ def _automated_delivery_deps(tmp_path: Path):
     comparison_png = run_dir / "comparison.png"
     cv2.imwrite(str(comparison_png), np.zeros((8, 8, 3), dtype=np.uint8))
     evaluation_result = eval_root / "evaluation_result.json"
-    evaluation_result.write_text(json.dumps({"candidate_delivery": {"comparison_sheet": str(comparison_png)}}), encoding="utf-8")
+    evaluation_result.write_text(
+        json.dumps(
+            {
+                "known_limitations": ["canonical evaluator failure reason: fixture-only"],
+                "quality_advisories": [{"code": "fixture-quality", "camera_order": ["public-west", "public-east"]}],
+                "candidate_delivery": {
+                    "comparison_sheet": str(comparison_png),
+                    "provenance_context": {
+                        "known_limitations": ["canonical evaluator failure reason: fixture-only"],
+                        "quality_advisories": [{"code": "fixture-quality", "camera_order": ["public-west", "public-east"]}],
+                        "segment_provenance": {"selected_segment": {"frame_names": ["public-west"]}},
+                        "segment_provenance_source": {"path": str((run_dir / "segment.json").resolve()), "sha256": "fixture", "size_bytes": 1},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     early_gate_path = run_dir / "early_gate.json"
     formal_gate_path = run_dir / "formal_gate.json"
     postcheck_path = run_dir / "postcheck.json"
@@ -202,8 +281,10 @@ def test_automated_technical_delivery_artifacts_consume_comparison_sheet_path(tm
     dict-typed comparison_sheet must not raise TypeError in _artifacts - the
     artifacts list must use comparison_sheet['path'] (a str), not the dict."""
     (run_dir, ledger, authority, conversion, evaluation, postprocess, early_gate, formal_gate, native_postcheck, ply, comparison_png) = _automated_delivery_deps(tmp_path)
+    seen: dict[str, object] = {}
 
     def fake_create(**kwargs):
+        seen.update(kwargs)
         manifest_path = run_dir / "candidate_manifest.json"
         provenance = run_dir / "PROVENANCE.json"
         report = run_dir / "CANDIDATE_REPORT.md"
@@ -237,6 +318,9 @@ def test_automated_technical_delivery_artifacts_consume_comparison_sheet_path(tm
         plan=False,
     )
     assert status == "passed"
+    assert seen["provenance_context"]["known_limitations"] == ["canonical evaluator failure reason: fixture-only"]
+    assert seen["provenance_context"]["quality_advisories"] == [{"code": "fixture-quality", "camera_order": ["public-west", "public-east"]}]
+    assert seen["provenance_context"]["segment_provenance"] == {"selected_segment": {"frame_names": ["public-west"]}}
     artifact_paths = [a["path"] for a in result.get("artifacts", [])]
     assert str(comparison_png.resolve()) in artifact_paths
 

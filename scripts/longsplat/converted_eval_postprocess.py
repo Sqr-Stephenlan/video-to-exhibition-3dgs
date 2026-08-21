@@ -80,6 +80,48 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def _segment_provenance_evidence(
+    *,
+    manifest: Mapping[str, Any],
+    explicit_path: str | Path | None,
+    outputs: Path,
+    containment_root: str | Path | None,
+) -> dict[str, Any] | None:
+    """Load only source-bound segment provenance for downstream advisory use."""
+
+    run_scope = manifest.get("run_scope")
+    declared: Mapping[str, Any] | None = None
+    value: str | Path | None = explicit_path
+    if value is None and isinstance(run_scope, Mapping):
+        candidate = run_scope.get("segment_provenance")
+        if isinstance(candidate, Mapping) and isinstance(candidate.get("path"), str):
+            declared = candidate
+            value = str(candidate["path"])
+    if value is None:
+        return None
+    path = _output_path(
+        value,
+        outputs,
+        "segment provenance",
+        containment_root=containment_root,
+    )
+    source = _identity(path, "segment provenance")
+    if declared is not None:
+        for key in ("sha256", "size_bytes"):
+            if key in declared and declared[key] != source[key]:
+                _fail(f"segment provenance source identity differs at {key}")
+    document = _load_json(path, "segment provenance")
+    payload: Any = document
+    result = document.get("result")
+    if isinstance(result, Mapping) and isinstance(result.get("segment_provenance"), (Mapping, list)):
+        payload = result["segment_provenance"]
+    elif isinstance(document.get("segment_provenance"), (Mapping, list)):
+        payload = document["segment_provenance"]
+    if not isinstance(payload, (Mapping, list)):
+        _fail("segment provenance must contain a mapping or list")
+    return {"value": payload, "source": source}
+
+
 def _route_outputs(
     route_root: str | Path,
     *,
@@ -533,6 +575,12 @@ def run_postprocess(
         if value is not None:
             path = _output_path(value, outputs, name)
             optional_evidence[name] = str(path.resolve())
+    segment_evidence = _segment_provenance_evidence(
+        manifest=manifest,
+        explicit_path=segment_provenance,
+        outputs=outputs,
+        containment_root=containment_root,
+    )
     evidence_files = {
         "authority_manifest.json": str(manifest_path.resolve()),
         "conversion_result.json": str(conversion_path.resolve()),
@@ -547,20 +595,14 @@ def run_postprocess(
     evaluator_failure_reason = failed["original_failure_reason"]
     known_limitations = [
         "training views only; no held-out evaluation",
-        "dynamic-person ghosting",
-        "local breakage/ghosting around the 2.982s frame_000140 to frame_000146 cross-gap",
         f"the original converted evaluator exited with nonzero code {evaluator_exit_code!r}; its recorded reason was preserved without inference: {evaluator_failure_reason!r}",
         "the converted render PNGs were reused; no CUDA evaluator rerun was performed",
         "no real SuperSplat three-view manual acceptance has been imported",
     ]
-    run_scope = manifest.get("run_scope", {})
+    run_scope = manifest.get("run_scope")
+    if not isinstance(run_scope, Mapping):
+        run_scope = {}
     provenance_context = {
-        "current_video_only": True,
-        "selected_camera_count": run_scope.get("selected_camera_count"),
-        "registered_camera_count": run_scope.get("registered_camera_count", count),
-        "selected_not_registered": run_scope.get("selected_not_registered", []),
-        "segment_provenance": run_scope.get("segment_provenance"),
-        "historical_exclusions": manifest.get("historical_exclusions", []),
         "postprocess_recovery": {
             "gpu_invoked": False,
             "render_reused": True,
@@ -569,7 +611,20 @@ def run_postprocess(
             "original_evaluator_failure_reason": evaluator_failure_reason,
         },
         "known_limitations": known_limitations,
+        "quality_advisories": quality_advisories,
     }
+    if quality_advisories:
+        provenance_context["quality_advisories_source"] = _identity(metrics_path, "postprocess metrics")
+    for key in ("selected_camera_count", "registered_camera_count", "selected_not_registered"):
+        value = run_scope.get(key)
+        if value is not None:
+            provenance_context[key] = value
+    historical_exclusions = manifest.get("historical_exclusions")
+    if isinstance(historical_exclusions, list) and historical_exclusions:
+        provenance_context["historical_exclusions"] = historical_exclusions
+    if segment_evidence is not None:
+        provenance_context["segment_provenance"] = segment_evidence["value"]
+        provenance_context["segment_provenance_source"] = segment_evidence["source"]
     result = {
         "schema_version": SCHEMA_VERSION,
         "stage": "converted-eval-postprocess",
@@ -724,7 +779,10 @@ def create_candidate_from_postprocess(
     evidence_files["manual_visual_review.json"] = review_path
     context = dict(converted) if isinstance(converted, Mapping) else {}
     context["manual_visual_review"] = _identity(review_path, "manual visual review")
-    context["known_limitations"] = list(result.get("known_limitations", []))
+    if "known_limitations" in result:
+        context["known_limitations"] = result["known_limitations"]
+    if "quality_advisories" in result:
+        context["quality_advisories"] = result["quality_advisories"]
     try:
         return create_candidate_delivery(
             converted_ply=result["conversion"]["technical_ply"]["path"],

@@ -3529,12 +3529,15 @@ def _latest_declared_passed_stage_result(
     summary: Mapping[str, Any],
     run_dir: Path,
     stage: str,
+    *,
+    require_identity: bool = False,
 ) -> dict[str, Any] | None:
     latest = _latest_declared_stage_attempt(
         summary,
         run_dir,
         stage,
         required_status="passed",
+        require_identity=require_identity,
     )
     return None if latest is None else latest["result"]
 
@@ -3792,6 +3795,20 @@ def _automated_technical_delivery(
                 comparison_sheet = candidate
         if comparison_sheet is None or not comparison_sheet.is_file() or comparison_sheet.is_symlink():
             raise PipelineBlocked("automated technical delivery lacks same-camera comparison contact sheet")
+        canonical_context: dict[str, Any] = {}
+        if isinstance(candidate_info, Mapping) and isinstance(candidate_info.get("provenance_context"), Mapping):
+            canonical_context.update(dict(candidate_info["provenance_context"]))
+        for key in ("known_limitations", "quality_advisories"):
+            if isinstance(post_result, Mapping) and key in post_result:
+                canonical_context[key] = post_result[key]
+        canonical_context.update(
+            {
+                "automated_technical_gate": True,
+                "manual_visual_review": False,
+                "supersplat_runtime_verified": False,
+                "screenshot_evidence": "not_required_by_current_user",
+            }
+        )
         evidence_files: dict[str, Path] = {
             "authority_manifest.json": authority_path,
             "conversion_result.json": conversion_root / "conversion_result.json",
@@ -3821,17 +3838,7 @@ def _automated_technical_delivery(
                 "manual_visual_review": False,
                 "held_out": False,
             },
-            provenance_context={
-                "automated_technical_gate": True,
-                "manual_visual_review": False,
-                "supersplat_runtime_verified": False,
-                "screenshot_evidence": "not_required_by_current_user",
-                "known_limitations": [
-                    "training-view-only evaluation; held_out=false",
-                    "automated policy is local evidence-driven and is not human visual acceptance",
-                    "SuperSplat format compatibility was checked from the standard 3DGS PLY schema; runtime loading was not performed",
-                ],
-            },
+            provenance_context=canonical_context,
         )
         published_ply = None
         published_ply_receipt: Path | None = None
@@ -4628,7 +4635,12 @@ def _mid_consumer_resume_allowed(
         summary_identity = summary.get("identity")
         if not isinstance(summary_identity, Mapping) or dict(summary_identity) != dict(existing_identity):
             return False
-        authority_result = _latest_declared_passed_stage_result(summary, run_dir, "authority-manifest")
+        authority_result = _latest_declared_passed_stage_result(
+            summary,
+            run_dir,
+            "authority-manifest",
+            require_identity=True,
+        )
         if authority_result is None or _recover_failed_converted_evaluation(
             summary=summary,
             run_dir=run_dir,

@@ -520,6 +520,15 @@ def test_failed_evaluator_artifacts_allow_cpu_postprocess_resume_without_gpu_ret
     assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config, execute_gpu=False)) is True
 
 
+def test_failed_evaluator_recovery_requires_authority_attempt_identity(tmp_path: Path) -> None:
+    run_dir, summary, identity, config, _ = _recovery_fixture(tmp_path)
+    authority_result = run_dir / "stages" / "authority-manifest" / "attempt-0001" / "result.json"
+    envelope = json.loads(authority_result.read_text(encoding="utf-8"))
+    envelope.pop("identity")
+    authority_result.write_text(json.dumps(envelope), encoding="utf-8")
+    assert _mid_consumer_resume_allowed(**_gate_kwargs(run_dir, identity, config, execute_gpu=False)) is False
+
+
 def test_failed_evaluator_recovery_rejects_incomplete_png_inventory(tmp_path: Path) -> None:
     run_dir, summary, identity, config, _ = _recovery_fixture(tmp_path)
     (run_dir / "stages" / "converted-eval" / "attempt-0001" / "executor" / "same_camera_eval" / "evaluator_result_renders" / "0001_view-b.png").unlink()

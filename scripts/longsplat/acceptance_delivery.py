@@ -72,6 +72,85 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def _validated_string_list(value: Any, label: str) -> list[str]:
+    """Accept only an explicit JSON list of non-empty advisory strings."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        _fail(f"{label} must be a list of non-empty strings")
+    return list(value)
+
+
+def _validated_advisory_list(value: Any, label: str) -> list[Any]:
+    """Preserve canonical string/object advisories without inventing facts."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        _fail(f"{label} must be a list")
+    advisories: list[Any] = []
+    for item in value:
+        if isinstance(item, str):
+            if not item.strip():
+                _fail(f"{label} contains an empty string")
+            advisories.append(item)
+        elif isinstance(item, Mapping):
+            advisories.append(dict(item))
+        else:
+            _fail(f"{label} contains an unsupported item")
+    return advisories
+
+
+def _validated_source_binding(value: Any, label: str) -> dict[str, Any]:
+    """Keep only a complete path/hash/size binding from canonical evidence."""
+
+    if not isinstance(value, Mapping):
+        _fail(f"{label} must be a source binding object")
+    path = value.get("path")
+    sha256 = value.get("sha256")
+    size_bytes = value.get("size_bytes")
+    if (
+        not isinstance(path, str)
+        or not path
+        or not isinstance(sha256, str)
+        or not sha256
+        or isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes < 0
+    ):
+        _fail(f"{label} must contain path, sha256, and non-negative size_bytes")
+    return {"path": path, "sha256": sha256, "size_bytes": size_bytes}
+
+
+def _canonical_delivery_context(
+    evaluation: Mapping[str, Any],
+    provenance_context: Mapping[str, Any] | None,
+    *,
+    automated: bool,
+) -> tuple[dict[str, Any], list[str], list[Any]]:
+    """Use postprocess-owned provenance before applying contract-only defaults."""
+
+    context = dict(provenance_context or {})
+    known_value = context.get("known_limitations", evaluation.get("known_limitations"))
+    known_limitations = _validated_string_list(known_value, "known_limitations")
+    if not known_limitations:
+        known_limitations = ["training-view-only evaluation; held_out=false"]
+        known_limitations.append(
+            "automated policy does not import human visual acceptance"
+            if automated
+            else "no real SuperSplat three-view manual acceptance has been imported"
+        )
+    quality_value = context.get("quality_advisories", evaluation.get("quality_advisories"))
+    quality_advisories = _validated_advisory_list(quality_value, "quality_advisories")
+    for source_key in ("segment_provenance_source", "quality_advisories_source"):
+        if source_key in context:
+            context[source_key] = _validated_source_binding(context[source_key], source_key)
+    context["known_limitations"] = known_limitations
+    context["quality_advisories"] = quality_advisories
+    return context, known_limitations, quality_advisories
+
+
 def _point_count(path: Path) -> int:
     try:
         from plyfile import PlyData
@@ -191,6 +270,11 @@ def create_accepted_delivery(
     status = authority["status"]
     if status["held_out"]:
         _fail("accepted delivery cannot claim held-out evidence in this slice")
+    context = dict(provenance_context or {})
+    limitations = _validated_string_list(context.get("known_limitations"), "known_limitations")
+    if not limitations:
+        limitations = ["no held-out evaluation"]
+    context["known_limitations"] = limitations
     acceptance = {
         "schema_version": "longsplat-supersplat-acceptance-v1",
         "accepted": True,
@@ -208,14 +292,7 @@ def create_accepted_delivery(
         "camera_dimensions": dimensions,
         "screenshot_records": [record["destination"] for record in screenshot_records],
         "contact_sheet": contact,
-        "limitations": [
-            "outer/peripheral stretching",
-            "local floating points",
-            "some highlights are over-bright",
-            "screenshots include auxiliary grid/axes",
-            "viewer object may have been renamed by the user",
-            "no held-out evaluation",
-        ],
+        "limitations": limitations,
     }
     _write_json(root / "SUPERSPLAT_ACCEPTANCE.json", acceptance)
 
@@ -242,7 +319,7 @@ def create_accepted_delivery(
             "external_fixed_pose": True,
             "depth_source": "disabled",
             "mast3r_dust3r_vda": "not in production chain",
-            **dict(provenance_context or {}),
+            **context,
         },
         "checkpoint": authority["manifest"]["checkpoint"],
         "mlp_identities": authority["manifest"]["checkpoint"]["files"],
@@ -352,13 +429,14 @@ def create_user_asserted_accepted_delivery(
     dimensions = authority["camera_dimensions"]
     profile = authority["profile"]
     status = "ACCEPTED_BY_USER_PENDING_SCREENSHOT_ARCHIVE"
-    limitations = [
-        "dynamic-person ghosting",
-        "local breakage/ghosting around the 2.982s frame_000140 to frame_000146 cross-gap",
-        "training-view-only evaluation; held-out is false",
-        "the original converted evaluator exited with SIGKILL (-9); the cause is unknown, while its complete PNG output passed CPU streaming postprocess",
-        "screenshot file evidence for this candidate is missing; no screenshot or contact sheet was fabricated",
-    ]
+    context = dict(provenance_context or {})
+    limitations = _validated_string_list(context.get("known_limitations"), "known_limitations")
+    if not limitations:
+        limitations = ["training-view-only evaluation; held_out=false"]
+    screenshot_limitation = "screenshot file evidence for this candidate is missing; no screenshot or contact sheet was fabricated"
+    if screenshot_limitation not in limitations:
+        limitations.append(screenshot_limitation)
+    context["known_limitations"] = limitations
     acceptance = {
         "schema_version": "longsplat-supersplat-acceptance-v2",
         "status": status,
@@ -384,7 +462,6 @@ def create_user_asserted_accepted_delivery(
     }
     _write_json(root / "SUPERSPLAT_ACCEPTANCE.json", acceptance)
 
-    context = dict(provenance_context or {})
     provenance = {
         "schema_version": "longsplat-final-delivery-provenance-v2",
         "status": status,
@@ -545,19 +622,12 @@ def create_candidate_delivery(
     manifest = authority["manifest"]
     dimensions = authority["camera_dimensions"]
     profile = authority["profile"]
-    context = dict(provenance_context or {})
-    known_limitations = list(
-        context.pop(
-            "known_limitations",
-            [
-                "training-view-only evaluation; held-out is false",
-                "dynamic-person ghosting",
-                "local breakage/ghosting around the 2.982s frame_000140 to frame_000146 cross-gap",
-                "no real SuperSplat three-view manual acceptance has been imported",
-            ],
-        )
-    )
     automated = automated_policy is not None
+    context, known_limitations, quality_advisories = _canonical_delivery_context(
+        evaluation,
+        provenance_context,
+        automated=automated,
+    )
     candidate = {
         "schema_version": "longsplat-candidate-delivery-v2",
         "status": "AUTOMATED_TECHNICAL_DELIVERY" if automated else "TECHNICAL_CANDIDATE_PENDING_SUPERSPLAT",
@@ -579,7 +649,7 @@ def create_candidate_delivery(
         "same_camera_visual_pass": evaluation.get("SAME_CAMERA_VISUAL_PASS"),
         "visual_quality_pass": normalized_evaluation["visual_quality_pass"],
         "structural_evaluation_pass": normalized_evaluation["STRUCTURAL_EVALUATION_PASS"],
-        "quality_advisories": evaluation.get("quality_advisories", []),
+        "quality_advisories": quality_advisories,
         "known_limitations": known_limitations,
         "comparison_sheet": comparison["destination"],
         "authority_manifest": authority["manifest_path"] or str(authority_manifest),
@@ -633,7 +703,7 @@ def create_candidate_delivery(
             "same_camera_visual_pass": evaluation.get("SAME_CAMERA_VISUAL_PASS"),
             "visual_quality_pass": normalized_evaluation["visual_quality_pass"],
             "structural_evaluation_pass": normalized_evaluation["STRUCTURAL_EVALUATION_PASS"],
-            "quality_advisories": evaluation.get("quality_advisories", []),
+            "quality_advisories": quality_advisories,
             "held_out": False,
             "metrics_scope": "training_views_only",
         },

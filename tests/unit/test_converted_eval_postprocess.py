@@ -192,6 +192,12 @@ def test_streaming_postprocess_uses_dynamic_order_and_marks_cpu_reuse(tmp_path: 
     assert ledger.latest_result("converted-eval-postprocess") is not None
     rows = json.loads((Path(result["metrics"]["path"])).read_text(encoding="utf-8"))["per_view"]
     assert [row["camera_name"] for row in rows] == camera_names
+    context = result["candidate_delivery"]["provenance_context"]
+    assert "segment_provenance" not in context
+    assert context["quality_advisories"] == result["quality_advisories"]
+    serialized = json.dumps(result, sort_keys=True)
+    forbidden = ("frame_" + "000140", "2" + ".982", "dynamic-" + "person")
+    assert all(token not in serialized for token in forbidden)
 
 
 def test_visual_quality_advisory_does_not_clear_structural_pass(tmp_path: Path) -> None:
@@ -356,3 +362,66 @@ def test_postprocess_child_symlink_or_escape_is_blocked(tmp_path: Path, kind: st
             output_root=output,
             route_root=route,
         )
+
+
+@pytest.mark.parametrize(
+    ("name", "camera_names", "width", "height", "segment"),
+    [
+        (
+            "dynamic-provenance-a",
+            ["cam-west-9", "cam-east-2"],
+            31,
+            19,
+            {"candidate_segments": [{"frame_names": ["cam-west-9"]}], "excluded_time_intervals": []},
+        ),
+        (
+            "dynamic-provenance-b",
+            ["view-r", "view-q", "view-p"],
+            17,
+            23,
+            {"candidate_segments": [{"frame_names": ["view-r", "view-q", "view-p"]}], "excluded_time_intervals": []},
+        ),
+    ],
+)
+def test_structured_segment_provenance_is_source_bound_and_dynamic(
+    tmp_path: Path,
+    name: str,
+    camera_names: list[str],
+    width: int,
+    height: int,
+    segment: dict[str, object],
+) -> None:
+    authority_path, route, failed_root, ply, conversion_result = _postprocess_inputs(
+        tmp_path, name, camera_names, width, height
+    )
+    run_dir = route / "outputs" / name
+    segment_path = run_dir / "segment-provenance.json"
+    segment_path.write_text(
+        json.dumps({"schema_version": "segment-fixture-v1", "result": {"segment_provenance": segment}}),
+        encoding="utf-8",
+    )
+    result = run_postprocess(
+        authority_manifest_path=authority_path,
+        conversion_result_path=conversion_result,
+        converted_ply_path=ply,
+        failed_evaluation_root=failed_root,
+        output_root=run_dir / "postprocess-attempt",
+        route_root=route,
+        containment_root=run_dir,
+        segment_provenance=segment_path,
+    )
+
+    context = result["candidate_delivery"]["provenance_context"]
+    assert context["segment_provenance"] == segment
+    source = context["segment_provenance_source"]
+    assert source["path"] == str(segment_path.resolve())
+    assert source["sha256"] == hashlib.sha256(segment_path.read_bytes()).hexdigest()
+    if context["quality_advisories"]:
+        quality_source = context["quality_advisories_source"]
+        metrics_path = Path(result["metrics"]["path"])
+        assert quality_source["path"] == str(metrics_path.resolve())
+        assert quality_source["sha256"] == hashlib.sha256(metrics_path.read_bytes()).hexdigest()
+    assert json.loads(Path(result["metrics"]["path"]).read_text())["camera_order"] == camera_names
+    serialized = json.dumps(result, sort_keys=True)
+    forbidden = ("frame_" + "000140", "2" + ".982", "dynamic-" + "person")
+    assert all(token not in serialized for token in forbidden)
