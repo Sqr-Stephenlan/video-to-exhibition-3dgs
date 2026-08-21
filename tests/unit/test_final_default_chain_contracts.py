@@ -151,6 +151,117 @@ def test_component_inventory_requires_unambiguous_segment_and_overlap_is_blocked
         _select_mapper_component([overlap, overlap2], selected)
 
 
+def test_component_inventory_dominates_strict_subset_before_segment_tie_checks(tmp_path: Path) -> None:
+    selected = [{"staged_name": f"frame_{index:06d}.png"} for index in range(8)]
+    dominant = _component(
+        tmp_path / "mapper" / "large",
+        [f"frame_{index:06d}.png" for index in range(8)],
+    )
+    redundant_subset = _component(
+        tmp_path / "mapper" / "small",
+        ["frame_000002.png", "frame_000006.png"],
+    )
+
+    chosen, names, inventory = _select_mapper_component(
+        [redundant_subset, dominant],
+        selected,
+    )
+
+    assert chosen == dominant.resolve()
+    assert names == [f"frame_{index:06d}.png" for index in range(8)]
+    assert inventory["mapper_component_count"] == 2
+    assert inventory["active_candidate_component_count"] == 1
+    assert inventory["active_model_component_count"] == 1
+    by_name = {item["component_name"]: item for item in inventory["components"]}
+    assert by_name[redundant_subset.name]["selection_status"] == "dominated"
+    assert by_name[redundant_subset.name]["dominated_by_components"] == [dominant.name]
+    assert by_name[redundant_subset.name]["longest_contiguous_run_count_tie"] is True
+    assert by_name[dominant.name]["selection_status"] == "selected"
+    assert "strict registered-name subsets" in inventory["selection_rule"]
+
+
+def test_component_inventory_does_not_let_shorter_active_segment_tie_block_winner(tmp_path: Path) -> None:
+    selected = [{"staged_name": f"sample_{index:03d}.jpg"} for index in range(8)]
+    winner = _component(
+        tmp_path / "fragments" / "winner",
+        ["sample_000.jpg", "sample_001.jpg", "sample_002.jpg", "sample_003.jpg"],
+    )
+    shorter_tied = _component(
+        tmp_path / "fragments" / "shorter-tied",
+        ["sample_005.jpg", "sample_007.jpg"],
+    )
+
+    chosen, _, inventory = _select_mapper_component([winner, shorter_tied], selected)
+
+    assert chosen == winner.resolve()
+    by_name = {item["component_name"]: item for item in inventory["components"]}
+    assert by_name[shorter_tied.name]["longest_contiguous_run_count_tie"] is True
+    assert by_name[shorter_tied.name]["selection_status"] == "not_selected"
+    assert by_name[shorter_tied.name]["exclusion_reasons"] == [
+        "shorter_longest_contiguous_registered_segment"
+    ]
+
+
+def test_component_inventory_blocks_tie_inside_unique_winner(tmp_path: Path) -> None:
+    selected = [{"staged_name": f"sample_{index:03d}.jpg"} for index in range(8)]
+    tied_winner = _component(
+        tmp_path / "winner-tie" / "component",
+        ["sample_000.jpg", "sample_001.jpg", "sample_004.jpg", "sample_005.jpg"],
+    )
+    shorter = _component(tmp_path / "winner-tie" / "shorter", ["sample_007.jpg"])
+
+    with pytest.raises(PipelineBlocked, match="ambiguous non-contiguous"):
+        _select_mapper_component([tied_winner, shorter], selected)
+
+
+def test_component_inventory_blocks_equal_candidates_and_equal_sets(tmp_path: Path) -> None:
+    selected = [{"staged_name": f"capture_{index:03d}.jpg"} for index in range(6)]
+    first = _component(
+        tmp_path / "equal" / "first",
+        ["capture_000.jpg", "capture_001.jpg", "capture_002.jpg"],
+    )
+    second = _component(
+        tmp_path / "equal" / "second",
+        ["capture_003.jpg", "capture_004.jpg", "capture_005.jpg"],
+    )
+    with pytest.raises(PipelineBlocked, match="equal contiguous segments"):
+        _select_mapper_component([first, second], selected)
+
+    same_first = _component(
+        tmp_path / "same" / "first",
+        ["capture_000.jpg", "capture_001.jpg"],
+    )
+    same_second = _component(
+        tmp_path / "same" / "second",
+        ["capture_000.jpg", "capture_001.jpg"],
+    )
+    with pytest.raises(PipelineBlocked, match="overlap"):
+        _select_mapper_component([same_first, same_second], selected)
+
+
+def test_component_inventory_preserves_one_component_and_name_validation(tmp_path: Path) -> None:
+    selected = [{"staged_name": "single.png"}]
+    one = _component(tmp_path / "one" / "component", ["single.png"])
+    chosen, names, inventory = _select_mapper_component([one], selected)
+    assert chosen == one.resolve()
+    assert names == ["single.png"]
+    assert inventory["mapper_component_count"] == 1
+    assert inventory["active_model_component_count"] == 1
+
+    empty = tmp_path / "empty" / "component"
+    empty.mkdir(parents=True)
+    for file_name in ("cameras.bin", "images.bin", "points3D.bin"):
+        (empty / file_name).write_bytes(b"fixture")
+    chosen_empty, names_empty, empty_inventory = _select_mapper_component([empty], selected)
+    assert chosen_empty == empty.resolve()
+    assert names_empty == []
+    assert empty_inventory["components"][0]["registered_image_names"] is None
+
+    duplicate = _component(tmp_path / "duplicate" / "component", ["single.png", "single.png"])
+    with pytest.raises(PipelineBlocked, match="duplicate COLMAP image NAME"):
+        _select_mapper_component([duplicate], selected)
+
+
 def test_stage_migration_distinguishes_exact_stale_and_unsafe() -> None:
     expected = {
         "schema_version": "v2",

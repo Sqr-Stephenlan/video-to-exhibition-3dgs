@@ -300,10 +300,12 @@ def _select_mapper_component(
 ) -> tuple[Path, list[str], dict[str, Any]]:
     """Choose one unambiguous temporally contiguous COLMAP component.
 
-    The mapper inventory remains authoritative.  A component is selected only
-    by its longest registered run in the current ordered frame contract; ties,
-    cross-component duplicates, or an empty/non-contiguous ambiguous choice are
-    hard stops.  No component is merged and no count is rewritten.
+    The mapper inventory remains authoritative.  Every component is inspected
+    before selection or conflict checks are applied.  A component whose
+    registered-name set is a strict subset of another component is retained in
+    the inventory as a dominated/redundant model, but it cannot create a
+    conflict or win selection.  No component is merged and no count is
+    rewritten.
     """
 
     if len(components) == 1:
@@ -332,16 +334,34 @@ def _select_mapper_component(
             }
 
     inventory: list[dict[str, Any]] = []
-    owners: dict[str, str] = {}
+    name_sets: list[set[str]] = []
+    parse_errors: list[PipelineBlocked] = []
+    invalid_components: list[Path] = []
     for component in components:
-        names = _component_image_names(component)
-        if not names or len(names) != len(set(names)):
-            raise PipelineBlocked(f"COLMAP component has missing or duplicate registered names: {component}")
-        duplicate = sorted(set(names) & set(owners))
-        if duplicate:
-            raise PipelineBlocked(f"COLMAP components overlap registered names: {duplicate}")
-        for name in names:
-            owners[name] = component.name
+        resolved_component = component.resolve()
+        try:
+            names = _component_image_names(resolved_component)
+        except PipelineBlocked as exc:
+            # Continue inventory construction so a malformed component cannot
+            # prevent the other mapper outputs from being recorded.  The
+            # original parser error remains a hard stop after the scan.
+            parse_errors.append(exc)
+            inventory.append(
+                {
+                    "component_name": resolved_component.name,
+                    "component_path": str(resolved_component),
+                    "registered_image_names": None,
+                    "registered_image_names_source": "parse_error",
+                    "selection_status": "invalid",
+                    "exclusion_reasons": ["registered_name_parse_error"],
+                    "dominated_by_components": [],
+                }
+            )
+            name_sets.append(set())
+            continue
+        unique_names = len(names) == len(set(names))
+        if not names or not unique_names:
+            invalid_components.append(resolved_component)
         positions = [
             index
             for index, record in enumerate(selected_records)
@@ -358,37 +378,112 @@ def _select_mapper_component(
             runs.append(current)
         longest = max((len(run) for run in runs), default=0)
         best_runs = [run for run in runs if len(run) == longest and longest > 0]
+        name_set = set(names)
         inventory.append(
             {
-                "component_name": component.name,
-                "component_path": str(component.resolve()),
+                "component_name": resolved_component.name,
+                "component_path": str(resolved_component),
                 "registered_image_names": names,
                 "registered_image_count": len(names),
+                "registered_image_names_source": (
+                    "images.txt"
+                    if (resolved_component / "images.txt").is_file()
+                    else "images.bin"
+                    if (resolved_component / "images.bin").is_file()
+                    else "unavailable"
+                ),
                 "selected_frame_positions": positions,
                 "candidate_contiguous_runs": [
                     {"start_index": run[0], "end_index": run[-1], "count": len(run)}
                     for run in runs
                 ],
                 "longest_contiguous_run_count": longest,
+                "longest_contiguous_run_count_tie": len(best_runs) > 1,
+                "selection_status": "candidate" if names and unique_names else "invalid",
+                "exclusion_reasons": [],
+                "dominated_by_components": [],
             }
         )
-        if len(best_runs) > 1:
-            raise PipelineBlocked(f"COLMAP component has ambiguous non-contiguous registered segments: {component}")
-    ranked = sorted(inventory, key=lambda item: (-int(item["longest_contiguous_run_count"]), str(item["component_name"])))
-    if not ranked or int(ranked[0]["longest_contiguous_run_count"]) <= 0:
+        name_sets.append(name_set)
+    if parse_errors:
+        raise parse_errors[0]
+    if invalid_components:
+        raise PipelineBlocked(
+            "COLMAP component has missing or duplicate registered names: "
+            f"{invalid_components[0]}"
+        )
+
+    # Classify strict registered-name subsets only after every component has
+    # been inventoried.  This intentionally lets a small redundant component
+    # have ambiguous internal runs without blocking its clearly larger parent.
+    for index, current_names in enumerate(name_sets):
+        dominating = sorted(
+            inventory[other_index]["component_name"]
+            for other_index, other_names in enumerate(name_sets)
+            if index != other_index and current_names < other_names
+        )
+        if dominating:
+            inventory[index]["selection_status"] = "dominated"
+            inventory[index]["dominated_by_components"] = dominating
+            inventory[index]["exclusion_reasons"] = [
+                "registered_name_set_strict_subset_of_other_component"
+            ]
+
+    active_indices = [
+        index
+        for index, item in enumerate(inventory)
+        if item["selection_status"] == "candidate"
+    ]
+    for left_offset, left_index in enumerate(active_indices):
+        for right_index in active_indices[left_offset + 1 :]:
+            overlap = sorted(name_sets[left_index] & name_sets[right_index])
+            if overlap:
+                raise PipelineBlocked(
+                    "COLMAP active mapper components have non-subset overlap in "
+                    f"registered names between {inventory[left_index]['component_name']} "
+                    f"and {inventory[right_index]['component_name']}: {overlap}"
+                )
+
+    ranked = sorted(
+        active_indices,
+        key=lambda index: (
+            -int(inventory[index]["longest_contiguous_run_count"]),
+            str(inventory[index]["component_name"]),
+        ),
+    )
+    if not ranked or int(inventory[ranked[0]]["longest_contiguous_run_count"]) <= 0:
         raise PipelineBlocked("COLMAP mapper components have no registered member in the selected frame contract")
-    if len(ranked) > 1 and ranked[0]["longest_contiguous_run_count"] == ranked[1]["longest_contiguous_run_count"]:
+    if len(ranked) > 1 and inventory[ranked[0]]["longest_contiguous_run_count"] == inventory[ranked[1]]["longest_contiguous_run_count"]:
         raise PipelineBlocked("COLMAP mapper component selection is ambiguous: equal contiguous segments")
-    selected = ranked[0]
+    selected_index = ranked[0]
+    if bool(inventory[selected_index]["longest_contiguous_run_count_tie"]):
+        raise PipelineBlocked(
+            "COLMAP component has ambiguous non-contiguous registered segments: "
+            f"{inventory[selected_index]['component_path']}"
+        )
+    for index in active_indices:
+        if index == selected_index:
+            inventory[index]["selection_status"] = "selected"
+        else:
+            inventory[index]["selection_status"] = "not_selected"
+            inventory[index]["exclusion_reasons"] = [
+                "shorter_longest_contiguous_registered_segment"
+            ]
+    selected = inventory[selected_index]
     selected_path = Path(str(selected["component_path"])).resolve()
     return selected_path, list(selected["registered_image_names"]), {
         "schema_version": "colmap-component-inventory-v1",
         "mapper_component_count": len(components),
         "active_model_component_count": 1,
+        "active_candidate_component_count": len(active_indices),
         "components": inventory,
         "selected_component_name": selected["component_name"],
         "selected_component_path": str(selected_path),
-        "selection_rule": "longest_temporally_contiguous registered segment; ties/overlap blocked; no merge",
+        "selection_rule": (
+            "longest_temporally_contiguous registered segment among active components; "
+            "strict registered-name subsets are dominated/redundant; "
+            "non-subset overlap and ties blocked; no merge"
+        ),
     }
 
 
