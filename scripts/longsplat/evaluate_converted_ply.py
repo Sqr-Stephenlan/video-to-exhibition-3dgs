@@ -15,6 +15,7 @@ import hashlib
 import json
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -98,6 +99,111 @@ def _load_args(model_path: Path, source_path: Path) -> argparse.Namespace:
     return cfg
 
 
+def _write_contact_sheet_from_pngs(
+    *,
+    rows: Sequence[Mapping[str, object]],
+    output: Path,
+    source_dimensions: tuple[int, int] | None,
+    columns: int = 4,
+    tile_width: int = 320,
+    max_tile_height: int = 320,
+    padding: int = 4,
+) -> dict[str, object]:
+    """Build the render/GT sheet by streaming the already-written PNGs.
+
+    The evaluator's metrics and full-resolution PNGs remain unchanged.  The
+    contact sheet is only presentation evidence, so it uses fixed-size
+    letterboxed thumbnails and keeps no full-resolution image collection in
+    memory.  A row contains the rendered PNG followed by its GT PNG, matching
+    the former per-camera ``cat(render, target)`` ordering.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - route environment supplies cv2
+        raise RuntimeError(f"OpenCV/numpy are required for contact sheet: {exc}") from exc
+
+    if not rows:
+        raise ValueError("cannot build a contact sheet without evaluated views")
+    if columns <= 0 or tile_width <= 0 or max_tile_height <= 0 or padding < 0:
+        raise ValueError("contact sheet layout dimensions must be positive")
+    columns = min(columns, len(rows))
+
+    if source_dimensions is not None:
+        source_width, source_height = source_dimensions
+        if source_width <= 0 or source_height <= 0:
+            raise ValueError(f"invalid source dimensions: {source_dimensions!r}")
+        tile_height = min(
+            max_tile_height,
+            max(1, round(tile_width * source_height / source_width)),
+        )
+    else:
+        source_width = source_height = None
+        tile_height = min(max_tile_height, 240)
+
+    pair_width = tile_width * 2
+    row_count = (len(rows) + columns - 1) // columns
+    canvas_width = padding + columns * (pair_width + padding)
+    canvas_height = padding + row_count * (tile_height + padding)
+    canvas = np.full((canvas_height, canvas_width, 3), 255, dtype=np.uint8)
+
+    def fit_into_tile(image: np.ndarray) -> np.ndarray:
+        image_height, image_width = image.shape[:2]
+        scale = min(tile_width / image_width, tile_height / image_height)
+        resized_width = max(1, round(image_width * scale))
+        resized_height = max(1, round(image_height * scale))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=interpolation,
+        )
+        tile = np.full((tile_height, tile_width, 3), 255, dtype=np.uint8)
+        offset_x = (tile_width - resized_width) // 2
+        offset_y = (tile_height - resized_height) // 2
+        tile[offset_y : offset_y + resized_height, offset_x : offset_x + resized_width] = resized
+        del resized
+        return tile
+
+    for ordinal, row in enumerate(rows):
+        row_index, column_index = divmod(ordinal, columns)
+        x = padding + column_index * (pair_width + padding)
+        y = padding + row_index * (tile_height + padding)
+        for side, key in enumerate(("render_path", "gt_path")):
+            path = Path(str(row[key]))
+            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"contact sheet cannot decode {key}: {path}")
+            tile = fit_into_tile(image)
+            tile_x = x + side * tile_width
+            canvas[y : y + tile_height, tile_x : tile_x + tile_width] = tile
+            del image, tile
+
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output), canvas):
+        raise ValueError(f"cannot write contact sheet: {output}")
+    del canvas
+    return {
+        "schema": "converted-evaluator-contact-sheet-v1",
+        "policy": "cpu-streaming-png-thumbnails-v1",
+        "ordering": "camera_order_row_major_render_then_ground_truth",
+        "source_count": len(rows),
+        "columns": columns,
+        "tile_width": tile_width,
+        "tile_height": tile_height,
+        "padding": padding,
+        "source_dimensions": (
+            None
+            if source_width is None or source_height is None
+            else {"width": source_width, "height": source_height}
+        ),
+        "source": "per_view_png_on_disk",
+        "resident_full_resolution_frame_max": 1,
+        "path": str(output),
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Evaluate a converted standard 3DGS PLY")
     parser.add_argument("--authority-manifest", type=Path)
@@ -161,7 +267,7 @@ def main(argv: list[str] | None = None) -> None:
 
     import numpy as np
     import torch
-    from torchvision.utils import make_grid, save_image
+    from torchvision.utils import save_image
 
     from gaussian_renderer import render3dgs
     from scene import GaussianModel, Scene
@@ -217,8 +323,8 @@ def main(argv: list[str] | None = None) -> None:
     gt_dir = output.parent / (output.stem + "_gt")
     render_dir.mkdir(parents=True, exist_ok=True)
     gt_dir.mkdir(parents=True, exist_ok=True)
-    pairs: list[torch.Tensor] = []
     records: list[dict[str, object]] = []
+    image_dimensions: tuple[int, int] | None = None
     lpips_available = lpips is not None
 
     with torch.no_grad():
@@ -228,6 +334,10 @@ def main(argv: list[str] | None = None) -> None:
                 actual_dimensions = (int(view.original_image.shape[-1]), int(view.original_image.shape[-2]))
                 if actual_dimensions != (expected_dimensions["width"], expected_dimensions["height"]):
                     parser.error(f"camera dimensions differ at ordinal {ordinal}")
+            else:
+                actual_dimensions = (int(view.original_image.shape[-1]), int(view.original_image.shape[-2]))
+            if image_dimensions is None:
+                image_dimensions = actual_dimensions
             torch.cuda.synchronize()
             started = time.perf_counter()
             rendering = render3dgs(view, gaussians, pipeline, background)["render"]
@@ -254,9 +364,12 @@ def main(argv: list[str] | None = None) -> None:
             stem = f"{ordinal:04d}_{view.image_name}"
             render_path = render_dir / f"{stem}.png"
             gt_path = gt_dir / f"{stem}.png"
-            save_image(rendered.cpu(), str(render_path))
-            save_image(target.cpu(), str(gt_path))
-            pairs.append(torch.cat([rendered.cpu(), target.cpu()], dim=2))
+            rendered_cpu = rendered.detach().cpu()
+            save_image(rendered_cpu, str(render_path))
+            del rendered_cpu
+            target_cpu = target.detach().cpu()
+            save_image(target_cpu, str(gt_path))
+            del target_cpu
             records.append(
                 {
                     "ordinal": ordinal,
@@ -270,10 +383,13 @@ def main(argv: list[str] | None = None) -> None:
                     "lpips": lpips_value,
                 }
             )
+            del rendering, rendered, target
 
-    contact = make_grid(pairs, nrow=4, padding=4, pad_value=1.0)
-    args.contact_sheet.resolve().parent.mkdir(parents=True, exist_ok=True)
-    save_image(contact, str(args.contact_sheet.resolve()))
+    contact_layout = _write_contact_sheet_from_pngs(
+        rows=records,
+        output=args.contact_sheet,
+        source_dimensions=image_dimensions,
+    )
 
     def mean_metric(name: str) -> float | None:
         values = [record[name] for record in records if record[name] is not None]
@@ -301,6 +417,7 @@ def main(argv: list[str] | None = None) -> None:
             "lpips_error": locals().get("lpips_error"),
         },
         "contact_sheet": str(args.contact_sheet.resolve()),
+        "contact_sheet_layout": contact_layout,
         "renders_dir": str(render_dir),
         "ground_truth_dir": str(gt_dir),
         "per_view": records,
