@@ -22,6 +22,7 @@ _SCHEMA = "conversion-progress-v1"
 _SAMPLING_SCHEMA = "camera-sampling-telemetry-v1"
 _SAMPLING_EVENTS_NAME = "camera_sampling_telemetry-v1.jsonl"
 _TRAINING_STAGES = {"convergence-smoke-training", "formal-training"}
+_FAILURE_STATUSES = {"blocked", "failed"}
 
 
 @dataclass(frozen=True)
@@ -237,9 +238,7 @@ def _latest_summary_stage(
     stages = summary.get("stages")
     if not isinstance(stages, Mapping):
         return None, None
-    for value in reversed(list(stages)):
-        if value not in stage_order:
-            continue
+    for value in reversed(stage_order):
         entries = stages.get(value)
         if not isinstance(entries, list) or not entries:
             continue
@@ -247,6 +246,73 @@ def _latest_summary_stage(
         status = entry.get("status") if isinstance(entry, Mapping) else None
         return value, status if isinstance(status, str) else None
     return None, None
+
+
+def _latest_stage_status(summary: Mapping[str, Any], stage: str) -> str | None:
+    stages = summary.get("stages")
+    entries = stages.get(stage) if isinstance(stages, Mapping) else None
+    if not isinstance(entries, list) or not entries:
+        return None
+    entry = entries[-1]
+    status = entry.get("status") if isinstance(entry, Mapping) else None
+    return status if isinstance(status, str) else None
+
+
+def _terminal_summary_stage(
+    summary: Mapping[str, Any],
+    stage_order: tuple[str, ...],
+) -> tuple[str | None, str | None]:
+    overall_status = summary.get("status")
+    if overall_status not in _FAILURE_STATUSES:
+        return None, None
+    marker = summary.get(overall_status)
+    marker_stage = marker.get("stage") if isinstance(marker, Mapping) else None
+    stage = marker_stage if isinstance(marker_stage, str) else summary.get("last_stage")
+    if not isinstance(stage, str) or stage not in stage_order:
+        return None, None
+    attempt_status = _latest_stage_status(summary, stage)
+    if attempt_status in _FAILURE_STATUSES:
+        return stage, attempt_status
+    return stage, overall_status
+
+
+def _summary_selection(
+    summary: Mapping[str, Any],
+    *,
+    stage_order: tuple[str, ...],
+    root: Path | None,
+) -> _StageSelection:
+    terminal_stage, terminal_status = _terminal_summary_stage(summary, stage_order)
+    if terminal_stage is not None:
+        return _StageSelection(
+            terminal_stage,
+            root,
+            summary,
+            False,
+            terminal_status,
+        )
+
+    direct_stage = _active_summary_stage(summary, stage_order)
+    if direct_stage is not None:
+        status = _latest_stage_status(summary, direct_stage) or summary.get("status")
+        return _StageSelection(
+            direct_stage,
+            root,
+            summary,
+            True,
+            status if isinstance(status, str) else None,
+        )
+
+    completed_stage, completed_status = _latest_summary_stage(summary, stage_order)
+    if completed_stage is not None:
+        return _StageSelection(
+            completed_stage,
+            root,
+            summary,
+            False,
+            completed_status,
+        )
+    return _StageSelection(None, root, summary, False, None)
 
 
 def _stage_selection(
@@ -259,59 +325,31 @@ def _stage_selection(
     raw_smoke: Mapping[str, Any] | None,
     raw_smoke_dir: Path | None,
 ) -> _StageSelection:
-    direct_stage = _active_summary_stage(summary, stage_order)
-    if direct_stage is not None:
-        status = summary.get("status")
-        return _StageSelection(
-            direct_stage,
-            root,
-            summary,
-            True,
-            status if isinstance(status, str) else None,
-        )
-
+    selections = [
+        _summary_selection(summary, stage_order=stage_order, root=root),
+    ]
     for child, child_dir in (
         (raw_camera, raw_camera_dir),
         (raw_smoke, raw_smoke_dir),
     ):
-        if not isinstance(child, Mapping):
-            continue
-        child_stage = _active_summary_stage(child, stage_order)
-        if child_stage is not None:
-            status = child.get("status")
-            return _StageSelection(
-                child_stage,
-                child_dir,
-                child,
-                True,
-                status if isinstance(status, str) else None,
-            )
+        if isinstance(child, Mapping):
+            selections.append(_summary_selection(child, stage_order=stage_order, root=child_dir))
 
-    completed_stage, completed_status = _latest_summary_stage(summary, stage_order)
-    if completed_stage is not None:
-        return _StageSelection(
-            completed_stage,
-            root,
-            summary,
-            False,
-            completed_status,
-        )
-    for child, child_dir in (
-        (raw_camera, raw_camera_dir),
-        (raw_smoke, raw_smoke_dir),
-    ):
-        if not isinstance(child, Mapping):
-            continue
-        child_stage, child_status = _latest_summary_stage(child, stage_order)
-        if child_stage is not None:
-            return _StageSelection(
-                child_stage,
-                child_dir,
-                child,
-                False,
-                child_status,
-            )
-    return _StageSelection(None, root, summary, False, None)
+    available = [selection for selection in selections if selection.stage is not None]
+    if not available:
+        return _StageSelection(None, root, summary, False, None)
+
+    def stage_rank(selection: _StageSelection) -> int:
+        return stage_order.index(selection.stage) if selection.stage is not None else -1
+
+    failures = [selection for selection in available if selection.status in _FAILURE_STATUSES]
+    if failures:
+        return max(failures, key=stage_rank)
+
+    active = [selection for selection in available if selection.active]
+    if active:
+        return max(active, key=stage_rank)
+    return max(available, key=stage_rank)
 
 
 def _active_stage(
@@ -597,14 +635,23 @@ def render_progress_line(
             and current - snapshot.conversion.marker_timestamp > _CONVERSION_WARNING_SECONDS
         ):
             label += " | WARNING: no observed iteration heartbeat"
+        failure_status = next(
+            (
+                status
+                for status in (snapshot.stage_status, snapshot.status)
+                if status in _FAILURE_STATUSES
+            ),
+            None,
+        )
         if is_completed:
-            completion_status = snapshot.stage_status or snapshot.status
-            if completion_status in {"blocked", "failed"}:
-                label += f" | {completion_status}"
-            else:
+            if failure_status is not None:
+                label += f" | {failure_status}"
+            elif snapshot.stage_status == "passed":
                 label += " | 完成"
-        elif snapshot.status in {"blocked", "failed"}:
-            label += f" | {snapshot.status}"
+            else:
+                label += " | pending"
+        elif failure_status is not None:
+            label += f" | {failure_status}"
     if downloaded is not None:
         label = _format_download(downloaded, download_total)
         if download_total is not None and download_total > 0:
