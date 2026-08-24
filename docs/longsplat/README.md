@@ -1,5 +1,9 @@
 # LongSplat module
 
+中文用户从 [一键视频转标准 3DGS PLY 使用说明](ONE_CLICK_RECONSTRUCTION_ZH.md)
+开始。该文档是当前 production checkout 的单视频/单 URL 用户入口；本文件其余
+章节保留模块级背景和库调用说明。
+
 Thin runner for pose-free 3DGS reconstruction of long videos via
 [NVlabs/LongSplat](https://github.com/NVlabs/LongSplat).
 

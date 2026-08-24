@@ -1,0 +1,5 @@
+# Minimal Python runtime for video-to-3dgs and the root CPU orchestration
+# closure. CUDA/PyTorch packages belong to the independent LongSplat backend.
+numpy
+opencv-python
+plyfile

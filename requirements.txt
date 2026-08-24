@@ -1,13 +1,8 @@
-# === CPU CI 依赖 ===
-# 仅包含 tests/unit 和 tests/integration 所需的包。
-# GPU 训练依赖 (torch, gsplat 等) 需在 GPU 节点上单独安装。
-
-# 测试框架
+# Existing ./dev.sh bootstrap aggregate for the CPU route and repository tests.
+# This is not the minimal user-facing runtime; use requirements-route.txt for that.
+#
+# The user-facing one-click route itself needs only the packages in
+# requirements-route.txt.  pytest is kept here because ./dev.sh bootstrap is
+# also the environment used by the repository's CPU test workflow.
+-r requirements-route.txt
 pytest
-
-# 科学计算
-numpy
-opencv-python
-
-# 3D 文件解析
-plyfile
