@@ -22,17 +22,19 @@ def _requirement_entries(path: Path) -> set[str]:
 
 
 def _requirement_name(entry: str) -> str:
-    return re.split(r"[<>=!~;\s]", entry, maxsplit=1)[0].strip().lower()
+    name = re.split(r"[<>=!~;\s]", entry, maxsplit=1)[0].strip().lower()
+    return re.sub(r"[-_.]+", "-", name)
 
 
 def test_route_requirements_include_core_and_exclude_optional_stacks() -> None:
     route = _requirement_entries(ROUTE_REQUIREMENTS)
-    core = {
-        "numpy",
-        "opencv-python",
-        "plyfile",
+    route_names = {
+        _requirement_name(entry)
+        for entry in route
+        if not entry.startswith("-")
     }
-    assert core <= route
+    assert {"numpy", "plyfile"} <= route_names
+    assert len(route_names & {"opencv-python", "opencv-python-headless"}) == 1
 
     default = _requirement_entries(DEFAULT_REQUIREMENTS)
     assert "-r requirements-route.txt" in default
@@ -43,11 +45,8 @@ def test_route_requirements_include_core_and_exclude_optional_stacks() -> None:
         "vda",
         "depth",
         "depth-anything",
-        "depth_anything",
         "video-depth-anything",
-        "video_depth_anything",
         "pose-search",
-        "pose_search",
     }
     declared = {
         _requirement_name(entry)
@@ -137,6 +136,36 @@ def test_root_gitlink_and_runner_lock_match_without_network() -> None:
         ).stdout.strip()
         assert line.split()[2] == expected
 
-    gitmodules = (ROOT / ".gitmodules").read_text(encoding="utf-8")
-    assert "https://github.com/Sqr-Stephenlan/LongSplat.git" in gitmodules
-    assert "research/external-fixed-pose-clean-closure" in gitmodules
+    gitmodules = ROOT / ".gitmodules"
+    submodule_path = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "config",
+            "-f",
+            str(gitmodules),
+            "--get",
+            "submodule.third_party/LongSplat.path",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    submodule_url = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "config",
+            "-f",
+            str(gitmodules),
+            "--get",
+            "submodule.third_party/LongSplat.url",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert submodule_path == "third_party/LongSplat"
+    assert submodule_url

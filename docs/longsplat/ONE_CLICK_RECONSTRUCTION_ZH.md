@@ -53,9 +53,9 @@ git rev-parse HEAD:third_party/LongSplat
 ```
 
 该检查是显式的 direct-submodule 检查，不会为默认一键链递归拉取可选的
-MASt3R/DUSt3R 后代。新 checkout 不要手工再初始化这些可选后代；nested fork
-保留 `submodules/mast3r` 这个锁定 gitlink，不等于默认训练/渲染/转换会加载
-MASt3R 或 DUSt3R 几何路线。
+MASt3R/DUSt3R 后代。新 checkout 不要手工再初始化这些可选后代；即使当前
+nested checkout 记录了 `submodules/mast3r` gitlink，也不等于默认训练/渲染/转换
+会加载 MASt3R 或 DUSt3R 几何路线。
 
 ## 环境分层
 
@@ -63,8 +63,8 @@ MASt3R 或 DUSt3R 几何路线。
 
 | 层 | 用途 | 需要的内容 |
 | --- | --- | --- |
-| checkout `.venv` | root route、视频契约、COLMAP/camera staging、PLY 校验、进度与发布 | `requirements-route.txt` 的 `numpy`、`opencv-python`、`plyfile`；CPU 测试另加 `pytest` |
-| 独立 CUDA backend | LongSplat 的 train/render/convert 与 GPU converted-eval | Python/CUDA/PyTorch/torchvision、锁定 fork 自身 requirements、四个已编译直接 gitlink；不要安装到 checkout `.venv` |
+| checkout `.venv` | root route、视频契约、COLMAP/camera staging、PLY 校验、进度与发布 | `numpy`、`plyfile`，以及提供 `cv2` 的 `opencv-python` 或 `opencv-python-headless`（当前声明选前者）；CPU 测试另加 `pytest` |
+| 独立 CUDA backend | LongSplat 的 train/render/convert 与 GPU converted-eval | Python/CUDA/PyTorch/torchvision、当前 checkout 对应 fork 的 requirements、四个已编译直接 gitlink；不要安装到 checkout `.venv` |
 | media tools | 视频探测、规范化和抽帧 | `ffmpeg`、`ffprobe`；优先使用 workspace 下的 `backend-envs/media-tools/bin/` |
 | 系统与驱动 | COLMAP 和 GPU 启动条件 | `colmap` 在 `PATH` 或 provider 配置中；WSL2 的 NVIDIA 驱动/CUDA 能力供 GPU backend 使用 |
 
@@ -99,7 +99,7 @@ cp configs/provider.local.example.json configs/provider.local.json
 
 它根据 `requirements.txt` 准备 root CPU route + 测试环境；只想查看最小运行闭包
 时，使用 `requirements-route.txt`。GPU backend 不由这个命令安装或升级，应使用
-已经准备好的独立 CUDA 环境和锁定 nested fork。
+已经准备好的、与当前 checkout 版本一致的独立 CUDA 环境和 nested fork。
 
 安装或复用现有环境后，先做不运行真实媒体的检查：
 
@@ -271,7 +271,8 @@ mismatch。
 - external fixed-pose RGB-only；
 - 自动化技术交付，不等于人工视觉验收；
 - 单视频/单 URL 输入，不等于多视频融合；
-- nested fork 和 gitlink SHA 必须保持锁定，不修改 nested LongSplat 代码或 gitlink。
+- 单个发布或运行内，checkout、root gitlink、runner lock 和 direct gitlinks 必须彼此一致；
+  维护者可以通过审阅后的 root/nested commit 升级来推进版本，不应在一次运行中混用版本。
 
 不推荐：
 
