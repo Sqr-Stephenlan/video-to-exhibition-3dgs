@@ -1,0 +1,487 @@
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index e962118..b54c78f 100755
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -162,6 +162,7 @@ class OptimizationParams(ParamGroup):
+         self.depth_loss_weight = 0.1
+         self.ssi_loss_weight = 0.05
+         self.grad_loss_weight = 0.02
++        self.plane_normal_loss_weight = 0.0
+         self.depth_l1_weight_init = 0.1
+         self.depth_l1_weight_final = 0.1
+         self.reproj_loss_weight_init = 1.0
+diff --git a/train.py b/train.py
+index ec7ccaa..2408642 100755
+--- a/train.py
++++ b/train.py
+@@ -22,7 +22,7 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
+ import torch
+ import torch.nn.functional as F
+ from random import randint
+-from utils.loss_utils import l1_loss, ssim, depth_loss, ssi_loss, gradient_loss
++from utils.loss_utils import l1_loss, ssim, depth_loss, ssi_loss, gradient_loss, make_depth_quality_mask, normal_consistency_loss
+ from gaussian_renderer import render, network_gui
+ import sys
+ from scene import Scene, GaussianModel
+@@ -71,6 +71,55 @@ def reprojection_error(params, points_3d, points_2d, K):
+     return residuals.flatten()
+ 
+ 
++def compute_plane_normal_loss(opt, viewpoint_cam, rendered_depth, iteration, stage):
++    """Edge-aware plane normal loss shared across all four training stages.
++
++    Returns ``(loss_tensor, normal_loss_value)`` where *loss_tensor* is
++    already multiplied by the (warmed-up) weight and *normal_loss_value* is
++    the unweighted normal-consistency scalar for telemetry.
++    """
++    weight = getattr(opt, "plane_normal_loss_weight", 0.0)
++    if weight == 0.0:
++        return torch.tensor(0.0, device=rendered_depth.device), 0.0
++
++    midas_depth = viewpoint_cam.depth_map.detach()
++    intrinsic = viewpoint_cam.intrinsic
++
++    mask = make_depth_quality_mask(midas_depth, viewpoint_cam.original_image)
++    if mask.sum() < 1000:
++        normal_loss = torch.tensor(0.0, device=rendered_depth.device)
++    else:
++        normal_loss = normal_consistency_loss(
++            rendered_depth, midas_depth, intrinsic, mask,
++        )
++
++    warmup_frac = min(1.0, iteration / max(1, int(0.2 * opt.iterations)))
++    effective_weight = weight * warmup_frac
++
++    return normal_loss * effective_weight, normal_loss.item()
++
++
++def _emit_loss_telemetry(iteration, stage, total, photo, depth, normal, anisotropy):
++    finite = bool(
++        torch.isfinite(total)
++        and torch.isfinite(photo)
++        and torch.isfinite(depth)
++        and torch.isfinite(normal)
++        and torch.isfinite(anisotropy)
++    )
++    payload = json.dumps({
++        "stage": stage,
++        "iteration": int(iteration),
++        "total": float(total.item()) if finite else None,
++        "photo": float(photo.item()) if torch.isfinite(photo) else None,
++        "depth": float(depth.item()) if torch.isfinite(depth) else None,
++        "normal": float(normal.item()) if torch.isfinite(normal) else None,
++        "anisotropy": float(anisotropy.item()) if torch.isfinite(anisotropy) else None,
++        "finite": finite,
++    })
++    print(f"LOSS_TELEMETRY {payload}")
++
++
+ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+     tb_writer = prepare_output_and_logger(dataset)
+     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
+@@ -134,16 +183,28 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+ 
+         # Depth loss
++        depth_loss_val = torch.tensor(0.0, device="cuda")
+         if opt.depth_loss_weight > 0:
+             midas_depth = viewpoint_cam.depth_map.detach().cuda()
+             Ldepth = depth_loss(midas_depth, rendered_depth)
+-            loss += Ldepth * opt.depth_loss_weight
++            contrib_d = Ldepth * opt.depth_loss_weight
++            depth_loss_val = depth_loss_val + contrib_d
++            loss += contrib_d
+             if opt.ssi_loss_weight > 0:
+                 Lssi = ssi_loss(midas_depth, rendered_depth)
+-                loss += Lssi * opt.ssi_loss_weight
++                contrib_s = Lssi * opt.ssi_loss_weight
++                depth_loss_val = depth_loss_val + contrib_s
++                loss += contrib_s
+             if opt.grad_loss_weight > 0:
+                 Lgrad = gradient_loss(midas_depth, rendered_depth)
+-                loss += Lgrad * opt.grad_loss_weight
++                contrib_g = Lgrad * opt.grad_loss_weight
++                depth_loss_val = depth_loss_val + contrib_g
++                loss += contrib_g
++
++        # Plane normal loss (shared helper)
++        Lnormal, _normal_loss_val = compute_plane_normal_loss(
++            opt, viewpoint_cam, rendered_depth, iteration, "init")
++        loss += Lnormal
+ 
+         # 2D correspondence loss
+         if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid > 0:
+@@ -170,8 +231,19 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+             loss += loss_2d_2 * opt.loss_2d_correspondence_weight
+ 
+-        if not torch.isnan(loss) and not torch.isinf(loss):
+-            loss.backward()
++        if iteration % 100 == 0:
++            _emit_loss_telemetry(
++                iteration, "init", loss,
++                (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg,
++                depth_loss_val, Lnormal,
++                torch.tensor(0.0, device="cuda"),
++            )
++
++        if not torch.isfinite(loss):
++            raise RuntimeError(
++                f"Non-finite total loss at iteration {iteration} stage=init"
++            )
++        loss.backward()
+ 
+         with torch.no_grad():
+             # Progress bar
+@@ -409,6 +481,9 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                     )
+                     corr_threshold = getattr(dataset, 'vda_corr_threshold', 0.3)
+                     outlier_sigma = getattr(dataset, 'vda_outlier_sigma', 2.5)
++                    min_correlation = getattr(dataset, 'min_correlation', 0.90)
++                    min_vda_inlier_ratio = getattr(dataset, 'min_vda_inlier_ratio', 0.95)
++                    max_normalized_rmse_vda = getattr(dataset, 'max_normalized_rmse', 0.10)
+                     if os.path.exists(depth_file):
+                         vda_v = torch.from_numpy(np.load(depth_file)).float().cuda()
+                         vda_v = F.interpolate(
+@@ -419,8 +494,10 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                         D_vda, vda_stats = align_vda_depth_with_stats(
+                             vda_v,
+                             viewpoint_cam.depth_map,
+-                            corr_threshold=corr_threshold,
++                            corr_threshold=min_correlation,
+                             outlier_sigma=outlier_sigma,
++                            min_inlier_ratio=min_vda_inlier_ratio,
++                            max_normalized_rmse=max_normalized_rmse_vda,
+                         )
+                         vda_stats.update({
+                             "stage": "incremental",
+@@ -548,16 +625,28 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+ 
+             # Depth loss
++            depth_loss_val = torch.tensor(0.0, device="cuda")
+             if opt.depth_loss_weight > 0:
+                 midas_depth = viewpoint_cam.depth_map.detach().cuda()
+                 Ldepth = depth_loss(midas_depth, rendered_depth)
+-                loss += Ldepth * opt.depth_loss_weight
++                contrib_d = Ldepth * opt.depth_loss_weight
++                depth_loss_val = depth_loss_val + contrib_d
++                loss += contrib_d
+                 if opt.ssi_loss_weight > 0:
+                     Lssi = ssi_loss(midas_depth, rendered_depth)
+-                    loss += Lssi * opt.ssi_loss_weight
++                    contrib_s = Lssi * opt.ssi_loss_weight
++                    depth_loss_val = depth_loss_val + contrib_s
++                    loss += contrib_s
+                 if opt.grad_loss_weight > 0:
+                     Lgrad = gradient_loss(midas_depth, rendered_depth)
+-                    loss += Lgrad * opt.grad_loss_weight
++                    contrib_g = Lgrad * opt.grad_loss_weight
++                    depth_loss_val = depth_loss_val + contrib_g
++                    loss += contrib_g
++
++            # Plane normal loss (shared helper)
++            Lnormal, _normal_loss_val = compute_plane_normal_loss(
++                opt, viewpoint_cam, rendered_depth, iteration, "local")
++            loss += Lnormal
+ 
+             # 2D correspondence loss (local)
+             if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid > 0:
+@@ -572,7 +661,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+                 loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+                 loss += loss_2d * opt.loss_2d_correspondence_weight
+-            
++
+             if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid < end_view_id - 2:
+                 view1 = viewpoint_cam
+                 view2 = scene.getTrainCameras()[viewpoint_cam.uid + 1]
+@@ -586,8 +675,19 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+                 loss += loss_2d_2 * opt.loss_2d_correspondence_weight
+ 
+-            if not torch.isnan(loss) and not torch.isinf(loss):
+-                loss.backward()
++            if iteration % 100 == 0:
++                _emit_loss_telemetry(
++                    iteration, "local", loss,
++                    (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg,
++                    depth_loss_val, Lnormal,
++                    torch.tensor(0.0, device="cuda"),
++                )
++
++            if not torch.isfinite(loss):
++                raise RuntimeError(
++                    f"Non-finite total loss at iteration {iteration} stage=local"
++                )
++            loss.backward()
+ 
+             with torch.no_grad():
+                 # Progress bar
+@@ -667,16 +767,28 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+ 
+             # Depth loss
++            depth_loss_val = torch.tensor(0.0, device="cuda")
+             if opt.depth_loss_weight > 0:
+                 midas_depth = viewpoint_cam.depth_map.detach().cuda()
+                 Ldepth = depth_loss(midas_depth, rendered_depth)
+-                loss += Ldepth * opt.depth_loss_weight
++                contrib_d = Ldepth * opt.depth_loss_weight
++                depth_loss_val = depth_loss_val + contrib_d
++                loss += contrib_d
+                 if opt.ssi_loss_weight > 0:
+                     Lssi = ssi_loss(midas_depth, rendered_depth)
+-                    loss += Lssi * opt.ssi_loss_weight
++                    contrib_s = Lssi * opt.ssi_loss_weight
++                    depth_loss_val = depth_loss_val + contrib_s
++                    loss += contrib_s
+                 if opt.grad_loss_weight > 0:
+                     Lgrad = gradient_loss(midas_depth, rendered_depth)
+-                    loss += Lgrad * opt.grad_loss_weight
++                    contrib_g = Lgrad * opt.grad_loss_weight
++                    depth_loss_val = depth_loss_val + contrib_g
++                    loss += contrib_g
++
++            # Plane normal loss (shared helper)
++            Lnormal, _normal_loss_val = compute_plane_normal_loss(
++                opt, viewpoint_cam, rendered_depth, iteration, "global")
++            loss += Lnormal
+ 
+             # # 2D correspondence loss
+             if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid > 0:
+@@ -691,7 +803,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+                 loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+                 loss += loss_2d * opt.loss_2d_correspondence_weight
+-            
++
+             if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid < end_view_id - 2:
+                 view1 = viewpoint_cam
+                 view2 = scene.getTrainCameras()[viewpoint_cam.uid + 1]
+@@ -704,9 +816,20 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+                 loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+                 loss += loss_2d_2 * opt.loss_2d_correspondence_weight
+-            
+-            if not torch.isnan(loss) and not torch.isinf(loss):
+-                loss.backward()
++
++            if iteration % 100 == 0:
++                _emit_loss_telemetry(
++                    iteration, "global", loss,
++                    (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg,
++                    depth_loss_val, Lnormal,
++                    torch.tensor(0.0, device="cuda"),
++                )
++
++            if not torch.isfinite(loss):
++                raise RuntimeError(
++                    f"Non-finite total loss at iteration {iteration} stage=global"
++                )
++            loss.backward()
+ 
+             with torch.no_grad():
+                 # Progress bar
+@@ -866,16 +989,28 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+ 
+         # Depth loss
++        depth_loss_val = torch.tensor(0.0, device="cuda")
+         if opt.depth_loss_weight > 0:
+             midas_depth = viewpoint_cam.depth_map.detach().cuda()
+             Ldepth = depth_loss(midas_depth, rendered_depth)
+-            loss += Ldepth * opt.depth_loss_weight
++            contrib_d = Ldepth * opt.depth_loss_weight
++            depth_loss_val = depth_loss_val + contrib_d
++            loss += contrib_d
+             if opt.ssi_loss_weight > 0:
+                 Lssi = ssi_loss(midas_depth, rendered_depth)
+-                loss += Lssi * opt.ssi_loss_weight
++                contrib_s = Lssi * opt.ssi_loss_weight
++                depth_loss_val = depth_loss_val + contrib_s
++                loss += contrib_s
+             if opt.grad_loss_weight > 0:
+                 Lgrad = gradient_loss(midas_depth, rendered_depth)
+-                loss += Lgrad * opt.grad_loss_weight
++                contrib_g = Lgrad * opt.grad_loss_weight
++                depth_loss_val = depth_loss_val + contrib_g
++                loss += contrib_g
++
++        # Plane normal loss (shared helper)
++        Lnormal, _normal_loss_val = compute_plane_normal_loss(
++            opt, viewpoint_cam, rendered_depth, iteration, "refinement")
++        loss += Lnormal
+ 
+         # # 2D correspondence loss
+         if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid > 0:
+@@ -889,7 +1024,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+             loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+             loss += loss_2d * opt.loss_2d_correspondence_weight
+-        
++
+         if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid < end_view_id - 2:
+             view1 = viewpoint_cam
+             view2 = scene.getTrainCameras()[viewpoint_cam.uid + 1]
+@@ -902,8 +1037,19 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
+             loss += loss_2d_2 * opt.loss_2d_correspondence_weight
+ 
+-        if not torch.isnan(loss) and not torch.isinf(loss):
+-            loss.backward()
++        if iteration % 100 == 0:
++            _emit_loss_telemetry(
++                iteration, "refinement", loss,
++                (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg,
++                depth_loss_val, Lnormal,
++                torch.tensor(0.0, device="cuda"),
++            )
++
++        if not torch.isfinite(loss):
++            raise RuntimeError(
++                f"Non-finite total loss at iteration {iteration} stage=refinement"
++            )
++        loss.backward()
+ 
+         with torch.no_grad():
+             # Progress bar
+diff --git a/utils/loss_utils.py b/utils/loss_utils.py
+index fafd5e5..e7fed8b 100755
+--- a/utils/loss_utils.py
++++ b/utils/loss_utils.py
+@@ -110,3 +110,134 @@ def gradient_loss(depth_gt, depth_pred, weight=None):
+     return grad_consistency(d_gt, d_pred)
+ 
+ 
++def make_depth_quality_mask(
++    reference_depth: torch.Tensor,
++    rgb: torch.Tensor,
++    *,
++    depth_edge_quantile: float = 0.90,
++    rgb_edge_quantile: float = 0.95,
++    erosion_radius: int = 2,
++) -> torch.Tensor:
++    """Exclude depth/RGB edges from a valid-depth base mask.
++
++    Returns a (H, W) boolean mask where:
++    - depth is positive and finite,
++    - depth gradient magnitude is below the ``depth_edge_quantile`` quantile,
++    - RGB gradient magnitude is below the ``rgb_edge_quantile`` quantile,
++    - and ``erosion_radius`` px of morphological erosion have been applied.
++    """
++    H, W = reference_depth.shape
++    device = reference_depth.device
++
++    valid = (reference_depth > 0) & torch.isfinite(reference_depth)
++    if valid.sum() == 0:
++        return torch.zeros(H, W, dtype=torch.bool, device=device)
++
++    # Depth gradient magnitude (forward differences + padding)
++    dx_d = torch.zeros(H, W, dtype=reference_depth.dtype, device=device)
++    dy_d = torch.zeros(H, W, dtype=reference_depth.dtype, device=device)
++    dx_d[:, :-1] = (reference_depth[:, 1:] - reference_depth[:, :-1]).abs()
++    dy_d[:-1, :] = (reference_depth[1:, :] - reference_depth[:-1, :]).abs()
++    depth_edge = dx_d + dy_d
++
++    # RGB gradient magnitude (luminance proxy)
++    rgb_gray = rgb.mean(dim=0)
++    dx_r = torch.zeros(H, W, dtype=rgb.dtype, device=device)
++    dy_r = torch.zeros(H, W, dtype=rgb.dtype, device=device)
++    dx_r[:, :-1] = (rgb_gray[:, 1:] - rgb_gray[:, :-1]).abs()
++    dy_r[:-1, :] = (rgb_gray[1:, :] - rgb_gray[:-1, :]).abs()
++    rgb_edge = dx_r + dy_r
++
++    depth_thresh = torch.quantile(depth_edge[valid], depth_edge_quantile)
++    rgb_thresh = torch.quantile(rgb_edge[valid], rgb_edge_quantile)
++
++    mask = valid & (depth_edge <= depth_thresh) & (rgb_edge <= rgb_thresh)
++
++    # Morphological erosion (4-connected)
++    for _ in range(erosion_radius):
++        eroded = mask.clone()
++        eroded[:-1, :] &= mask[1:, :]
++        eroded[1:, :] &= mask[:-1, :]
++        eroded[:, :-1] &= mask[:, 1:]
++        eroded[:, 1:] &= mask[:, :-1]
++        mask = eroded
++
++    return mask
++
++
++def _compute_normals_from_depth(
++    depth: torch.Tensor,
++    intrinsic: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Return (nx, ny, nz) normal components for interior pixels (H-2, W-2)."""
++    H, W = depth.shape
++    fx = intrinsic[0, 0]
++    fy = intrinsic[1, 1]
++    cx = intrinsic[0, 2]
++    cy = intrinsic[1, 2]
++
++    v, u = torch.meshgrid(
++        torch.arange(H, device=depth.device, dtype=depth.dtype),
++        torch.arange(W, device=depth.device, dtype=depth.dtype),
++        indexing="ij",
++    )
++
++    x = (u - cx) / fx * depth
++    y = (v - cy) / fy * depth
++
++    # Pad tensors for central differences
++    x_pad = F.pad(x.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode="replicate")[0, 0]
++    y_pad = F.pad(y.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode="replicate")[0, 0]
++    z_pad = F.pad(depth.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode="replicate")[0, 0]
++
++    # Central differences on interior (H, W) region
++    dx_du = (x_pad[1:-1, 2:] - x_pad[1:-1, :-2]) / 2.0
++    dy_du = (y_pad[1:-1, 2:] - y_pad[1:-1, :-2]) / 2.0
++    dz_du = (z_pad[1:-1, 2:] - z_pad[1:-1, :-2]) / 2.0
++
++    dx_dv = (x_pad[2:, 1:-1] - x_pad[:-2, 1:-1]) / 2.0
++    dy_dv = (y_pad[2:, 1:-1] - y_pad[:-2, 1:-1]) / 2.0
++    dz_dv = (z_pad[2:, 1:-1] - z_pad[:-2, 1:-1]) / 2.0
++
++    # Cross product
++    nx = dy_du * dz_dv - dz_du * dy_dv
++    ny = dz_du * dx_dv - dx_du * dz_dv
++    nz = dx_du * dy_dv - dy_du * dx_dv
++
++    norm = torch.sqrt(nx * nx + ny * ny + nz * nz).clamp_min(1e-8)
++    return nx / norm, ny / norm, nz / norm
++
++
++def normal_consistency_loss(
++    predicted_depth: torch.Tensor,
++    reference_depth: torch.Tensor,
++    intrinsic: torch.Tensor,
++    mask: torch.Tensor,
++) -> torch.Tensor:
++    """1 - cosine-similarity between surface normals inside *mask*.
++
++    Returns a scalar; strictly 0 when fewer than 1,000 pixels are valid.
++    """
++    # Interior of the depth quality mask (exclude border where gradients are
++    # unavailable)
++    interior = mask[1:-1, 1:-1]
++    if interior.sum() < 1000:
++        return torch.tensor(0.0, device=predicted_depth.device, dtype=predicted_depth.dtype)
++
++    nx_pred, ny_pred, nz_pred = _compute_normals_from_depth(predicted_depth, intrinsic)
++    nx_ref, ny_ref, nz_ref = _compute_normals_from_depth(reference_depth, intrinsic)
++
++    # Select masked interior pixels
++    nx_pred = nx_pred[interior]
++    ny_pred = ny_pred[interior]
++    nz_pred = nz_pred[interior]
++    nx_ref = nx_ref[interior]
++    ny_ref = ny_ref[interior]
++    nz_ref = nz_ref[interior]
++
++    cos_sim = (
++        nx_pred * nx_ref + ny_pred * ny_ref + nz_pred * nz_ref
++    ).clamp(-1.0, 1.0)
++    return (1.0 - cos_sim).mean()
++
++

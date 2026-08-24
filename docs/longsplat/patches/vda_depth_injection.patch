@@ -1,0 +1,207 @@
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index 109213e..ab76b2b 100755
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -54,6 +54,9 @@ class ModelParams(ParamGroup):
+         self.update_init_factor = 16
+         self.update_hierachy_factor = 4
+         self.init_frame_num = 3
++        self.depth_source = "mast3r"
++        self.vda_corr_threshold = 0.3
++        self.vda_outlier_sigma = 2.5
+
+         self.use_feat_bank = False
+         self._source_path = ""
+diff --git a/scene/__init__.py b/scene/__init__.py
+index 5d87fc8..5efe180 100755
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -8,6 +8,7 @@
+
+
+ import os
++import numpy as np
+ from utils.system_utils import searchForMaxIteration
+ from scene.dataset_readers import sceneLoadTypeCallbacks
+ from scene.gaussian_model import GaussianModel
+@@ -17,6 +18,7 @@ import torch
+ from utils.mast3r_utils import Mast3rMatcher
+ from scene.gaussian_model import BasicPointCloud
+ from torch.nn import functional as F
++from utils.graphics_utils import align_vda_depth
+
+ class Scene:
+
+@@ -149,6 +151,33 @@ class Scene:
+                                                                 align_corners=False).squeeze(0).squeeze(0)
+                 cur_viewpoint_cam.is_registered = True
+
++            # Optionally override depth maps with external sources (e.g., Video-Depth-Anything)
++            if hasattr(args, 'depth_source') and args.depth_source != "mast3r":
++                depth_dir = os.path.join(args.source_path, "depths")
++                corr_threshold = getattr(args, 'vda_corr_threshold', 0.3)
++                outlier_sigma = getattr(args, 'vda_outlier_sigma', 2.5)
++                for cam in self.getTrainCameras():
++                    if cam.depth_map is None:
++                        continue
++                    depth_file = os.path.join(depth_dir, os.path.splitext(cam.image_name)[0] + "_depth.npy")
++                    if os.path.exists(depth_file):
++                        ext_depth = torch.from_numpy(np.load(depth_file)).float().cuda()
++                        ext_depth = F.interpolate(
++                            ext_depth.unsqueeze(0).unsqueeze(0),
++                            size=(cam.image_height, cam.image_width),
++                            mode='bilinear',
++                            align_corners=False
++                        ).squeeze(0).squeeze(0)
++                        D_vda = align_vda_depth(ext_depth, cam.depth_map,
++                                                corr_threshold=corr_threshold,
++                                                outlier_sigma=outlier_sigma)
++                        if D_vda is not None:
++                            cam.depth_map = D_vda
++                            print(f"VDA_USAGE result=aligned stage=scene_init frame={cam.image_name}", flush=True)
++                        else:
++                            print(f"VDA_USAGE result=rejected stage=scene_init frame={cam.image_name}", flush=True)
++                    else:
++                        print(f"VDA_USAGE result=missing stage=scene_init frame={cam.image_name}", flush=True)
+
+             self.cameras_extent = 10.0
+             print(f'self.cameras_extent: {self.cameras_extent}')
+diff --git a/train.py b/train.py
+index f4d850c..4afaa66 100755
+--- a/train.py
++++ b/train.py
+@@ -19,6 +19,7 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
+
+
+ import torch
++import torch.nn.functional as F
+ from random import randint
+ from utils.loss_utils import l1_loss, ssim, depth_loss, ssi_loss, gradient_loss
+ from gaussian_renderer import render, network_gui
+@@ -31,7 +32,7 @@ from utils.image_utils import psnr
+ from argparse import ArgumentParser, Namespace
+ from arguments import ModelParams, PipelineParams, OptimizationParams
+ from utils.pose_utils import save_transforms, update_pose
+-from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute_scale
++from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute_scale, align_vda_depth
+ from utils.mast3r_utils import Mast3rMatcher
+ import cv2
+ from scipy.optimize import least_squares
+@@ -275,6 +276,31 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 scale, offset = compute_scale(pre_rendered_depth, viewpoint_cam.pre_depth_map, viewpoint_cam.kp0)
+                 viewpoint_cam.depth_map = viewpoint_cam.depth_map * scale + offset
+
++                if hasattr(dataset, 'depth_source') and dataset.depth_source != "mast3r":
++                    depth_dir = os.path.join(dataset.source_path, "depths")
++                    depth_file = os.path.join(
++                        depth_dir,
++                        os.path.splitext(viewpoint_cam.image_name)[0] + "_depth.npy"
++                    )
++                    corr_threshold = getattr(dataset, 'vda_corr_threshold', 0.3)
++                    outlier_sigma = getattr(dataset, 'vda_outlier_sigma', 2.5)
++                    if os.path.exists(depth_file):
++                        vda_v = torch.from_numpy(np.load(depth_file)).float().cuda()
++                        vda_v = F.interpolate(
++                            vda_v.unsqueeze(0).unsqueeze(0),
++                            size=(viewpoint_cam.image_height, viewpoint_cam.image_width),
++                            mode='bilinear', align_corners=False
++                        ).squeeze(0).squeeze(0)
++                        D_vda = align_vda_depth(vda_v, viewpoint_cam.depth_map,
++                                                corr_threshold=corr_threshold,
++                                                outlier_sigma=outlier_sigma)
++                        if D_vda is not None:
++                            viewpoint_cam.depth_map = D_vda
++                            print(f"VDA_USAGE result=aligned stage=incremental frame={viewpoint_cam.image_name}", flush=True)
++                        else:
++                            print(f"VDA_USAGE result=rejected stage=incremental frame={viewpoint_cam.image_name}", flush=True)
++                    else:
++                        print(f"VDA_USAGE result=missing stage=incremental frame={viewpoint_cam.image_name}", flush=True)
+
+             pose_optimizer = torch.optim.Adam([{"params": [viewpoint_cam.cam_trans_delta], "lr": opt.translation_lr_init}, {"params": [viewpoint_cam.cam_rot_delta], "lr": opt.rotation_lr_init}])
+             gt_image = viewpoint_cam.original_image.cuda()
+diff --git a/utils/graphics_utils.py b/utils/graphics_utils.py
+index 66727d6..e2657f5 100755
+--- a/utils/graphics_utils.py
++++ b/utils/graphics_utils.py
+@@ -230,6 +230,81 @@ def compute_scale(depth1, depth2, keypoint):
+     return scale, offset
+
+
++def align_vda_depth(v, D_ref, corr_threshold=0.3, outlier_sigma=2.5):
++    """Align VDA relative depth (disparity-like, higher=near) to scene z-depth.
++
++    Fits ``a·v + b ≈ 1/D_ref`` in inverse-depth space via least squares,
++    applies one round of ``outlier_sigma`` rejection, then produces an
++    aligned z-depth ``D_vda = 1 / clamp(a·v + b, eps)``.
++
++    Args:
++        v: VDA disparity tensor (H, W), raw values from NPZ.
++        D_ref: Reference scene-scale z-depth tensor (H, W), higher=far.
++        corr_threshold: Minimum Pearson |ρ| between 1/D_vda and 1/D_ref;
++            if the fit is weaker the function returns None (caller falls back).
++        outlier_sigma: Residual threshold (in σ) for re-fit rejection.
++
++    Returns:
++        Aligned z-depth tensor (H, W) with the same dtype/device as D_ref,
++        or **None** if the alignment fails the correlation safety check.
++    """
++    eps = 1e-6
++    inv_ref = 1.0 / (D_ref + eps)
++
++    # Mask: both v and D_ref must be finite and positive
++    mask = torch.isfinite(v) & torch.isfinite(D_ref) & (D_ref > eps) & (v > eps)
++    v_flat = v[mask].reshape(-1, 1).float()
++    inv_flat = inv_ref[mask].reshape(-1, 1).float()
++    inlier_indices = torch.nonzero(mask.reshape(-1), as_tuple=True)[0]
++
++    if v_flat.numel() < 100:
++        return None
++
++    # --- first fit ---
++    A = torch.cat([v_flat, torch.ones_like(v_flat)], dim=1)  # [N, 2]
++    sol, *_ = torch.linalg.lstsq(A, inv_flat)
++    a, b = sol[0, 0], sol[1, 0]
++
++    # --- outlier rejection ---
++    residual = torch.abs(A @ sol - inv_flat).squeeze()
++    threshold = float(residual.std()) * outlier_sigma + float(residual.mean())
++    keep = residual <= threshold
++
++    # --- re-fit on inliers ---
++    used_indices = inlier_indices  # for correlation check
++    if keep.sum() >= 100:
++        A2, inv2 = A[keep], inv_flat[keep]
++        sol2, *_ = torch.linalg.lstsq(A2, inv2)
++        a, b = float(sol2[0, 0]), float(sol2[1, 0])
++        used_indices = inlier_indices[keep]
++
++    # --- slope safety valve: negative a means VDA and reference point in
++    #     opposite directions (higher v → lower 1/D), which violates the
++    #     disparity → z-depth model ---
++    if a <= 0:
++        print(f"[align_vda_depth] WARNING: negative slope a={a:.4f}, falling back")
++        return None
++
++    # --- correlation safety valve ---
++    if used_indices.numel() < 100:
++        return None
++    inv_vda_flat2 = (a * v.reshape(-1).float()[used_indices] + b)
++    inv_ref_flat2 = inv_ref.reshape(-1).float()[used_indices]
++    stacked = torch.stack([inv_vda_flat2, inv_ref_flat2], dim=0)
++    corr = torch.corrcoef(stacked)[0, 1]
++
++    if torch.isnan(corr) or corr < corr_threshold:
++        print(f"[align_vda_depth] WARNING: low correlation ρ={float(corr):.4f}, falling back")
++        return None
++
++    # --- produce output, filling invalid pixels with reference depth ---
++    D_vda = 1.0 / torch.clamp(a * v + b, min=eps)
++    # Sanitise: non-finite outputs replaced by reference
++    bad = ~torch.isfinite(D_vda)
++    D_vda[bad] = D_ref[bad]
++    return D_vda.to(device=D_ref.device, dtype=D_ref.dtype)
++
++
+ def get_depth_from_3d_points(pts_3d, w2c_pose):
+     pts_camera_h = geom_transform_points(pts_3d, w2c_pose)
+     depth = pts_camera_h[:, 2]  # The z-coordinate gives the depth

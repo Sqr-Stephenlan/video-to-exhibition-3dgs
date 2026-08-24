@@ -1,0 +1,18 @@
+{
+  "schema_version": "automated-early-gate-v2",
+  "policy_id": "automated-technical-v1",
+  "automated_technical_gate": true,
+  "manual_visual_review": false,
+  "computed_pass": true,
+  "formal_release_eligible": true,
+  "formal_auto_release": true,
+  "held_out": false,
+  "training_views_only": true,
+  "decision": "pass",
+  "reasons": [],
+  "warnings": [],
+  "policy": {
+    "schema_version": "automated-technical-policy-v1",
+    "policy_id": "automated-technical-v1"
+  }
+}

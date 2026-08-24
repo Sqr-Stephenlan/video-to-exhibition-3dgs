@@ -1,0 +1,400 @@
+{
+  "frames": [
+    {
+      "blur_score": 3723.511,
+      "calibrated_blur_score": 692.138468,
+      "duplicate_score": null,
+      "frame_index": 1,
+      "height": 120,
+      "id": "segment_0001_frame_000001",
+      "keyframe": {
+        "adaptive_blur_threshold": 646.889896,
+        "bridge": false,
+        "component_id": 0,
+        "motion": null,
+        "policy": "coverage_v1",
+        "quality_score": 1.0,
+        "reference_frame_id": null,
+        "selected_by_policy": true
+      },
+      "matched_frame_id": null,
+      "motion_score": null,
+      "overexposed_ratio": 0.10599,
+      "path": "data/frames/coverage_fixture/selected/segment_0001/frame_000001_t000000.000.jpg",
+      "reject_reasons": [],
+      "segment_id": "segment_0001",
+      "selected": true,
+      "sha256": "7bfcc82d6d88a2679ee01b8129e97c4419d5ff5817d34e7a33ca0adc73878641",
+      "timestamp_sec": 0.0,
+      "underexposed_ratio": 0.119167,
+      "width": 160
+    },
+    {
+      "blur_score": 3943.059,
+      "calibrated_blur_score": 730.336904,
+      "duplicate_score": 2,
+      "frame_index": 6,
+      "height": 120,
+      "id": "segment_0001_frame_000002",
+      "keyframe": {
+        "adaptive_blur_threshold": 646.889896,
+        "bridge": false,
+        "component_id": 0,
+        "motion": {
+          "affine_rotation_deg": 0.016045,
+          "affine_scale": 0.999946,
+          "grid_coverage": 0.75,
+          "inlier_count": 72,
+          "inlier_ratio": 0.96,
+          "median_displacement_diag_ratio": 7.2e-05,
+          "reason": null,
+          "residual_rmse_diag_ratio": 0.000425,
+          "tracked_count": 75,
+          "valid": true
+        },
+        "policy": "coverage_v1",
+        "quality_score": 1.0,
+        "reference_frame_id": "segment_0001_frame_000001",
+        "selected_by_policy": true
+      },
+      "matched_frame_id": null,
+      "motion_score": null,
+      "overexposed_ratio": 0.103802,
+      "path": "data/frames/coverage_fixture/selected/segment_0001/frame_000002_t000000.500.jpg",
+      "reject_reasons": [],
+      "segment_id": "segment_0001",
+      "selected": true,
+      "sha256": "51910f5f7db8b9d508859b1c01f013ba37258ebf21f7942a63314aad661b99e4",
+      "timestamp_sec": 0.5,
+      "underexposed_ratio": 0.118333,
+      "width": 160
+    },
+    {
+      "blur_score": 3326.903,
+      "calibrated_blur_score": 627.49765,
+      "duplicate_score": 1,
+      "frame_index": 11,
+      "height": 120,
+      "id": "segment_0001_frame_000003",
+      "keyframe": {
+        "adaptive_blur_threshold": 646.889896,
+        "bridge": false,
+        "component_id": null,
+        "motion": {
+          "affine_rotation_deg": 0.014826,
+          "affine_scale": 1.000095,
+          "grid_coverage": 0.75,
+          "inlier_count": 69,
+          "inlier_ratio": 0.932432,
+          "median_displacement_diag_ratio": 7e-06,
+          "reason": null,
+          "residual_rmse_diag_ratio": 0.001062,
+          "tracked_count": 74,
+          "valid": true
+        },
+        "policy": "coverage_v1",
+        "quality_score": 0.970022,
+        "reference_frame_id": "segment_0001_frame_000002",
+        "selected_by_policy": false
+      },
+      "matched_frame_id": null,
+      "motion_score": null,
+      "overexposed_ratio": 0.103646,
+      "path": null,
+      "reject_reasons": [
+        "blur"
+      ],
+      "segment_id": "segment_0001",
+      "selected": false,
+      "sha256": null,
+      "timestamp_sec": 1.0,
+      "underexposed_ratio": 0.12224,
+      "width": 160
+    },
+    {
+      "blur_score": 3897.351,
+      "calibrated_blur_score": 726.153707,
+      "duplicate_score": null,
+      "frame_index": 1,
+      "height": 120,
+      "id": "segment_0002_frame_000001",
+      "keyframe": {
+        "adaptive_blur_threshold": 601.273436,
+        "bridge": false,
+        "component_id": 0,
+        "motion": null,
+        "policy": "coverage_v1",
+        "quality_score": 1.0,
+        "reference_frame_id": null,
+        "selected_by_policy": true
+      },
+      "matched_frame_id": null,
+      "motion_score": null,
+      "overexposed_ratio": 0.104271,
+      "path": "data/frames/coverage_fixture/selected/segment_0002/frame_000001_t000000.500.jpg",
+      "reject_reasons": [],
+      "segment_id": "segment_0002",
+      "selected": true,
+      "sha256": "bc498699629a7467e3f47e427be0ae10ecfff40145c847716d4802173350f9e4",
+      "timestamp_sec": 0.5,
+      "underexposed_ratio": 0.117656,
+      "width": 160
+    },
+    {
+      "blur_score": 3317.838,
+      "calibrated_blur_score": 626.481191,
+      "duplicate_score": 1,
+      "frame_index": 6,
+      "height": 120,
+      "id": "segment_0002_frame_000002",
+      "keyframe": {
+        "adaptive_blur_threshold": 601.273436,
+        "bridge": false,
+        "component_id": 0,
+        "motion": {
+          "affine_rotation_deg": 0.014249,
+          "affine_scale": 1.000117,
+          "grid_coverage": 0.8125,
+          "inlier_count": 72,
+          "inlier_ratio": 0.935065,
+          "median_displacement_diag_ratio": 9e-06,
+          "reason": null,
+          "residual_rmse_diag_ratio": 0.00114,
+          "tracked_count": 77,
+          "valid": true
+        },
+        "policy": "coverage_v1",
+        "quality_score": 1.0,
+        "reference_frame_id": "segment_0002_frame_000001",
+        "selected_by_policy": true
+      },
+      "matched_frame_id": null,
+      "motion_score": null,
+      "overexposed_ratio": 0.103438,
+      "path": "data/frames/coverage_fixture/selected/segment_0002/frame_000002_t000001.000.jpg",
+      "reject_reasons": [],
+      "segment_id": "segment_0002",
+      "selected": true,
+      "sha256": "634eabf8107b51e9a34fd8dcf2085225bf5d927d10eea7d9c65b626ba51d14d1",
+      "timestamp_sec": 1.0,
+      "underexposed_ratio": 0.122396,
+      "width": 160
+    },
+    {
+      "blur_score": 3161.969,
+      "calibrated_blur_score": 590.470113,
+      "duplicate_score": 1,
+      "frame_index": 11,
+      "height": 120,
+      "id": "segment_0002_frame_000003",
+      "keyframe": {
+        "adaptive_blur_threshold": 601.273436,
+        "bridge": false,
+        "component_id": null,
+        "motion": {
+          "affine_rotation_deg": -0.013667,
+          "affine_scale": 0.999942,
+          "grid_coverage": 0.8125,
+          "inlier_count": 75,
+          "inlier_ratio": 0.974026,
+          "median_displacement_diag_ratio": 1e-06,
+          "reason": null,
+          "residual_rmse_diag_ratio": 0.000849,
+          "tracked_count": 77,
+          "valid": true
+        },
+        "policy": "coverage_v1",
+        "quality_score": 0.982033,
+        "reference_frame_id": "segment_0002_frame_000002",
+        "selected_by_policy": false
+      },
+      "matched_frame_id": null,
+      "motion_score": null,
+      "overexposed_ratio": 0.103542,
+      "path": null,
+      "reject_reasons": [
+        "blur"
+      ],
+      "segment_id": "segment_0002",
+      "selected": false,
+      "sha256": null,
+      "timestamp_sec": 1.5,
+      "underexposed_ratio": 0.122552,
+      "width": 160
+    }
+  ],
+  "normalized": {
+    "codec": "h264",
+    "duration_sec": 2.0,
+    "fps": 10.0,
+    "height": 120,
+    "is_vfr": false,
+    "path": "data/segments/coverage_fixture/normalized.mp4",
+    "rotation_degrees": 0,
+    "sha256": "1978fe05e4591021f3b7639a79234e09542dcf9083ad100ca81bbf93e7adf217",
+    "width": 160
+  },
+  "run": {
+    "code": {
+      "commit": "unknown",
+      "working_tree_dirty": true
+    },
+    "command": [
+      "./dev.sh",
+      "python",
+      "scripts/preprocess_video.py",
+      "synthetic.mp4",
+      "--video-id",
+      "coverage_fixture",
+      "--output-root",
+      "data",
+      "--segment-method",
+      "time",
+      "--segment-length-sec",
+      "1.5",
+      "--segment-overlap-sec",
+      "0",
+      "--target-fps",
+      "2",
+      "--blur-threshold",
+      "0",
+      "--keyframe-policy",
+      "coverage_v1",
+      "--selection-target-gap-sec",
+      "0.5",
+      "--selection-max-gap-sec",
+      "1.0",
+      "--force"
+    ],
+    "config": {
+      "path": null,
+      "sha256": null
+    },
+    "id": "coverage_fixture-a82d2828fa3a-6e7a8bc434b2",
+    "settings_fingerprint": "6e7a8bc434b2f86a71a0d5ea4bbbb6edbab154ed0a486f28c2a013ae520e90e3",
+    "source_sha256": "a82d2828fa3acc22e2e2f3ae404cc72f3f43a2063a92a51f69d8825cc1721120",
+    "tools": {
+      "ffmpeg": "ffmpeg version 8.1.2-essentials_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
+      "ffprobe": "ffprobe version 8.1.2-essentials_build-www.gyan.dev Copyright (c) 2007-2026 the FFmpeg developers",
+      "opencv": "5.0.0",
+      "python": "3.13.5"
+    }
+  },
+  "schema_version": "2.0",
+  "segments": [
+    {
+      "duration_sec": 1.5,
+      "end_sec": 1.5,
+      "height": 120,
+      "id": "segment_0001",
+      "index": 1,
+      "path": "data/segments/coverage_fixture/segment_0001.mp4",
+      "reason": "time",
+      "sha256": "9d6874f99f7bb8b2246838b894fc6ee68482742e1daec926ab6e6d363d09d37a",
+      "start_sec": 0.0,
+      "width": 160
+    },
+    {
+      "duration_sec": 1.5,
+      "end_sec": 2.0,
+      "height": 120,
+      "id": "segment_0002",
+      "index": 2,
+      "path": "data/segments/coverage_fixture/segment_0002.mp4",
+      "reason": "time",
+      "sha256": "ac583c883e81b3230c4894543451fe9a6055f8d5df85e9566265eac5da33315e",
+      "start_sec": 0.5,
+      "width": 160
+    }
+  ],
+  "settings": {
+    "adaptive_blur_percentile": 15.0,
+    "blur_threshold": 0.0,
+    "duplicate_hash_threshold": 4,
+    "duplicate_time_window_sec": 2.0,
+    "duplicate_window_sec": 2.0,
+    "flow_analysis_long_edge": 320,
+    "frame_format": "jpg",
+    "frame_source": "segment",
+    "keyframe_policy": "coverage_v1",
+    "max_affine_rotation_deg": 12.0,
+    "max_affine_scale": 1.25,
+    "max_long_edge": 1600,
+    "max_median_displacement_diag_ratio": 0.25,
+    "max_motion_residual_diag_ratio": 0.015,
+    "max_selected_gap_sec": 2.0,
+    "min_affine_scale": 0.8,
+    "min_motion_grid_coverage": 0.375,
+    "min_motion_inlier_ratio": 0.65,
+    "min_segment_sec": 2.0,
+    "min_tracked_points": 64,
+    "overexposed_ratio": 0.6,
+    "preset": "baseline",
+    "quality_analysis_long_edge": 512,
+    "save_rejected": false,
+    "segment_length_sec": 1.5,
+    "segment_method": "time",
+    "segment_overlap_sec": 0.0,
+    "selection_max_gap_sec": 1.0,
+    "selection_min_gap_sec": 0.1,
+    "selection_target_gap_sec": 0.5,
+    "target_fps": 2.0,
+    "underexposed_ratio": 0.6
+  },
+  "source": {
+    "codec": "h264",
+    "duration_sec": 2.0,
+    "fps": 10.0,
+    "height": 120,
+    "is_vfr": false,
+    "path": "synthetic.mp4",
+    "rotation_degrees": 0,
+    "sha256": "a82d2828fa3acc22e2e2f3ae404cc72f3f43a2063a92a51f69d8825cc1721120",
+    "size_bytes": 7685,
+    "width": 160
+  },
+  "summary": {
+    "coverage_by_segment": {
+      "segment_0001": {
+        "exceeds_target": false,
+        "max_selected_gap_sec": 0.5
+      },
+      "segment_0002": {
+        "exceeds_target": false,
+        "max_selected_gap_sec": 0.5
+      }
+    },
+    "coverage_target_max_selected_gap_sec": 2.0,
+    "frames_by_segment": {
+      "segment_0001": {
+        "rejected": 1,
+        "selected": 2,
+        "total": 3
+      },
+      "segment_0002": {
+        "rejected": 1,
+        "selected": 2,
+        "total": 3
+      }
+    },
+    "keyframe_quality": {
+      "bridge_frames": 0,
+      "component_count": 1,
+      "failed_segments": [],
+      "max_selected_gap_sec": 1.0,
+      "min_motion_grid_coverage": 0.375,
+      "min_motion_inlier_ratio": 0.65,
+      "policy": "coverage_v1",
+      "selected_frames": 4,
+      "status": "passed"
+    },
+    "reject_reasons": {
+      "blur": 2
+    },
+    "rejected_frames": 2,
+    "selected_frames": 4,
+    "total_frames": 6,
+    "total_segments": 2
+  },
+  "video_id": "coverage_fixture"
+}

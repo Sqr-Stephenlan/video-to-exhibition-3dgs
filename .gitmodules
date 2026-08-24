@@ -1,0 +1,4 @@
+[submodule "third_party/LongSplat"]
+	path = third_party/LongSplat
+	url = https://github.com/Sqr-Stephenlan/LongSplat.git
+	branch = research/external-fixed-pose-clean-closure

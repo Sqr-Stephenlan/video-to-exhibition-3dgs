@@ -1,0 +1,469 @@
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index ab76b2b..e962118 100755
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -57,6 +57,21 @@ class ModelParams(ParamGroup):
+         self.depth_source = "mast3r"
+         self.vda_corr_threshold = 0.3
+         self.vda_outlier_sigma = 2.5
++        # Pose quality gate parameters
++        self.min_match_count = 128
++        self.min_inlier_count = 64
++        self.min_inlier_ratio = 0.80
++        self.max_reprojection_rmse_px = 2.0
++        self.min_grid_coverage = 0.375
++        self.min_positive_depth_ratio = 0.95
++        self.max_rotation_step_deg = 25.0
++        self.max_translation_step_ratio = 6.0
++        self.reference_lookback = 3
++        # VDA quality gate parameters
++        self.min_correlation = 0.90
++        self.min_vda_inlier_ratio = 0.95
++        self.max_normalized_rmse = 0.10
++        self.min_aligned_fraction = 0.98
+ 
+         self.use_feat_bank = False
+         self._source_path = ""
+diff --git a/scene/__init__.py b/scene/__init__.py
+index 60e36b8..96ae9a8 100755
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -114,11 +114,28 @@ class Scene:
+                 for cam in self.getAllCameras():
+                     cam.update_focal(focal_length)
+ 
++            from utils.pose_utils import project_to_so3
++
+             for i, Rt in enumerate(world2cam):
+                 R = Rt[:3, :3].t()
+                 T = Rt[:3, 3]
++                R = project_to_so3(R)
+                 cur_viewpoint_cam = self.getTrainCameras()[i]
+                 cur_viewpoint_cam.update_RT(R, T)
++                print(
++                    "POSE_TELEMETRY "
++                    + json.dumps(
++                        {
++                            "stage": "scene_init",
++                            "frame": cur_viewpoint_cam.image_name,
++                            "accepted": True,
++                            "method": "mast3r_global_align",
++                        },
++                        sort_keys=True,
++                        allow_nan=False,
++                    ),
++                    flush=True,
++                )
+                 if i == 0:
+                     next_viewpoint_cam = self.getTrainCameras()[i + 1]
+                     intrinsic_np = cur_viewpoint_cam.intrinsic.detach().cpu().numpy()
+diff --git a/scene/cameras.py b/scene/cameras.py
+index e4d7e0a..4eeef4f 100755
+--- a/scene/cameras.py
++++ b/scene/cameras.py
+@@ -143,6 +143,22 @@ class Camera(nn.Module):
+             self.depth_map = torch.nn.functional.interpolate(self.depth_map.unsqueeze(0).unsqueeze(0), size=(self.image_height_final, self.image_width_final), mode='bilinear', align_corners=True).squeeze(0).squeeze(0)
+ 
+     def update_RT(self, R, t):
++        # Validate shape
++        if not (isinstance(R, torch.Tensor) and R.shape == (3, 3)):
++            raise ValueError(f"R must be a (3, 3) tensor, got shape {getattr(R, 'shape', None)}")
++        if not (isinstance(t, torch.Tensor) and t.shape == (3,)):
++            raise ValueError(f"t must be a (3,) tensor, got shape {getattr(t, 'shape', None)}")
++        # Validate finiteness
++        if not (torch.isfinite(R).all() and torch.isfinite(t).all()):
++            raise ValueError("R and t must be finite")
++        # Validate SO(3): orthogonality and determinant
++        ortho_err = (R @ R.T - torch.eye(3, device=R.device, dtype=R.dtype)).abs().max().item()
++        det_err = abs(torch.det(R).item() - 1.0)
++        if ortho_err > 1e-3 or det_err > 1e-3:
++            raise ValueError(
++                f"R is not SO(3): max ortho error={ortho_err:.6f}, "
++                f"|det-1|={det_err:.6f}"
++            )
+         self.R = R.to(device=self.data_device)
+         self.T = t.to(device=self.data_device)
+ 
+diff --git a/train.py b/train.py
+index 93f7fa3..ec7ccaa 100755
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,10 @@ from tqdm import tqdm
+ from utils.image_utils import psnr
+ from argparse import ArgumentParser, Namespace
+ from arguments import ModelParams, PipelineParams, OptimizationParams
+-from utils.pose_utils import save_transforms, update_pose
++from utils.pose_utils import (
++    save_transforms, update_pose, project_to_so3,
++    keypoint_grid_coverage, rotation_step_deg, reprojection_error,
++)
+ from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute_scale, align_vda_depth_with_stats
+ from utils.mast3r_utils import Mast3rMatcher
+ import cv2
+@@ -202,9 +205,14 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+ 
+     end_view_id += 1
+ 
+-    # PnP retry limit to avoid infinite loop
+-    pnp_retry_count = {}
+-    max_pnp_retries = 15
++    # Build list of already-accepted camera indices for reference lookback
++    accepted_camera_indices = list(range(0, end_view_id - 1))
++    accepted_rotation_history = []
++    accepted_translation_history = []
++    for accepted_idx in accepted_camera_indices:
++        accepted_cam = scene.getTrainCameras()[accepted_idx]
++        accepted_rotation_history.append(accepted_cam.R.detach().cpu().numpy())
++        accepted_translation_history.append(accepted_cam.T.detach().cpu().numpy())
+ 
+     while start_view_id < num_views:
+         ## pose estimation ##
+@@ -215,100 +223,180 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+ 
+         viewpoint_stack = None
+         ema_loss_for_log = 0.0
+-        
++
+         if scene.getTrainCameras()[end_view_id-1].is_registered == False:
+             with torch.no_grad():
+-                pre_viewpoint_cam1 = scene.getTrainCameras()[end_view_id-2]
+-                viewpoint_cam = scene.getTrainCameras()[end_view_id-1]
+-
+-                pre_render_pkg = render(pre_viewpoint_cam1, gaussians, pipe, background, retain_grad=False)
+-                pre_rendered_depth = pre_render_pkg["depth"][0]
+-
++                viewpoint_cam = scene.getTrainCameras()[end_view_id - 1]
+                 intrinsic_np = viewpoint_cam.intrinsic.detach().cpu().numpy()
+-                viewpoint_cam.kp0, viewpoint_cam.kp1, _, _, _, _, _, _, viewpoint_cam.pre_depth_map, viewpoint_cam.depth_map = matcher._forward(pre_viewpoint_cam1.original_image, viewpoint_cam.original_image, intrinsic_np)
+-                viewpoint_cam.conf = torch.ones(viewpoint_cam.kp0.shape[0], device=viewpoint_cam.kp0.device)
+-                viewpoint_cam.kp0 = viewpoint_cam.kp0.cuda()
+-                viewpoint_cam.kp1 = viewpoint_cam.kp1.cuda()
+-                viewpoint_cam.depth_map = viewpoint_cam.depth_map.cuda()
+-                viewpoint_cam.pre_depth_map = viewpoint_cam.pre_depth_map.cuda()
+-
+-                pre_pts = unporject(pre_rendered_depth, pre_viewpoint_cam1.view_world_transform, pre_viewpoint_cam1.intrinsic, viewpoint_cam.kp0)
+-                
+-                kp1 = viewpoint_cam.kp1 / 2 + .5
+-                kp1[:, 0] *= viewpoint_cam.original_image.shape[2]
+-                kp1[:, 1] *= viewpoint_cam.original_image.shape[1]
+-                pre_pts_np = pre_pts.detach().cpu().numpy()
+-                kp1_np = kp1.detach().cpu().numpy()
+-
+-                success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(pre_pts_np, kp1_np, intrinsic_np, None, iterationsCount=300,reprojectionError=8.0,confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
+-
+-                match_count = int(pre_pts_np.shape[0])
+-                inlier_count = int(len(inliers)) if inliers is not None else 0
+-                pnp_success = bool(success and inlier_count >= 4)
+-                reprojection_rmse_px = None
+-                frame_id = end_view_id - 1
+-
+-                if pnp_success:
+-                    pre_pts_inliers = pre_pts_np[inliers].reshape(-1, 3)
+-                    kp1_inliers = kp1_np[inliers].reshape(-1, 2)
+-
+-                    initial_params = np.hstack((rotation_vector.flatten(), translation_vector.flatten()))
+-                    result = least_squares(reprojection_error, initial_params, 
+-                                        args=(pre_pts_inliers, kp1_inliers, intrinsic_np),
+-                                        verbose=0,  # Verbose mode to print loss
+-                                        ftol=1e-8, xtol=1e-8)
+-                    rotation_vector = result.x[:3]
+-                    translation_vector = result.x[3:]
+-                    reprojection_residual = reprojection_error(
+-                        result.x,
+-                        pre_pts_inliers,
+-                        kp1_inliers,
+-                        intrinsic_np,
+-                    )
+-                    reprojection_rmse_value = float(
+-                        np.sqrt(np.mean(reprojection_residual ** 2))
++
++                # Reference lookback: try up to reference_lookback recent accepted cameras
++                reference_lookback = getattr(dataset, 'reference_lookback', 3)
++                reference_indices = accepted_camera_indices[-reference_lookback:]
++                accepted = False
++
++                for retry_index, reference_index in enumerate(reversed(reference_indices)):
++                    ref_viewpoint_cam = scene.getTrainCameras()[reference_index]
++
++                    pre_render_pkg = render(ref_viewpoint_cam, gaussians, pipe, background, retain_grad=False)
++                    pre_rendered_depth = pre_render_pkg["depth"][0]
++
++                    viewpoint_cam.kp0, viewpoint_cam.kp1, _, _, _, _, _, _, viewpoint_cam.pre_depth_map, viewpoint_cam.depth_map = matcher._forward(ref_viewpoint_cam.original_image, viewpoint_cam.original_image, intrinsic_np)
++                    viewpoint_cam.conf = torch.ones(viewpoint_cam.kp0.shape[0], device=viewpoint_cam.kp0.device)
++                    viewpoint_cam.kp0 = viewpoint_cam.kp0.cuda()
++                    viewpoint_cam.kp1 = viewpoint_cam.kp1.cuda()
++                    viewpoint_cam.depth_map = viewpoint_cam.depth_map.cuda()
++                    viewpoint_cam.pre_depth_map = viewpoint_cam.pre_depth_map.cuda()
++
++                    pre_pts = unporject(pre_rendered_depth, ref_viewpoint_cam.view_world_transform, ref_viewpoint_cam.intrinsic, viewpoint_cam.kp0)
++
++                    kp1 = viewpoint_cam.kp1 / 2 + .5
++                    kp1[:, 0] *= viewpoint_cam.original_image.shape[2]
++                    kp1[:, 1] *= viewpoint_cam.original_image.shape[1]
++                    pre_pts_np = pre_pts.detach().cpu().numpy()
++                    kp1_np = kp1.detach().cpu().numpy()
++
++                    match_count = int(pre_pts_np.shape[0])
++                    opencv_success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(pre_pts_np, kp1_np, intrinsic_np, None, iterationsCount=300, reprojectionError=8.0, confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
++                    inlier_count = int(len(inliers)) if inliers is not None else 0
++
++                    rejection_reasons = []
++                    reprojection_rmse_px = None
++                    grid_coverage = None
++                    positive_depth_ratio = None
++                    rotation_step = None
++                    translation_step_ratio = None
++
++                    if not opencv_success:
++                        rejection_reasons.append("opencv_failed")
++                    elif inlier_count < 4:
++                        rejection_reasons.append("too_few_inliers")
++
++                    if not rejection_reasons:
++                        inliers_flat = inliers.flatten()
++                        pre_pts_inliers = pre_pts_np[inliers_flat].reshape(-1, 3)
++                        kp1_inliers = kp1_np[inliers_flat].reshape(-1, 2)
++
++                        initial_params = np.hstack((rotation_vector.flatten(), translation_vector.flatten()))
++                        result = least_squares(reprojection_error, initial_params,
++                                            args=(pre_pts_inliers, kp1_inliers, intrinsic_np),
++                                            verbose=0, ftol=1e-8, xtol=1e-8)
++                        rotation_vector = result.x[:3]
++                        translation_vector = result.x[3:]
++                        reprojection_residual = reprojection_error(
++                            result.x, pre_pts_inliers, kp1_inliers, intrinsic_np)
++                        reprojection_rmse_value = float(np.sqrt(np.mean(reprojection_residual ** 2)))
++                        if np.isfinite(reprojection_rmse_value):
++                            reprojection_rmse_px = reprojection_rmse_value
++
++                        inlier_ratio_candidate = inlier_count / match_count if match_count else 0.0
++
++                        # Quality gate checks
++                        if match_count < getattr(dataset, 'min_match_count', 128):
++                            rejection_reasons.append("match_count")
++                        if inlier_count < getattr(dataset, 'min_inlier_count', 64):
++                            rejection_reasons.append("inlier_count")
++                        if inlier_ratio_candidate < getattr(dataset, 'min_inlier_ratio', 0.80):
++                            rejection_reasons.append("inlier_ratio")
++                        if reprojection_rmse_px is not None and reprojection_rmse_px > getattr(dataset, 'max_reprojection_rmse_px', 2.0):
++                            rejection_reasons.append("reprojection_rmse")
++
++                        # Grid coverage
++                        grid_coverage = keypoint_grid_coverage(
++                            kp1_inliers,
++                            viewpoint_cam.original_image.shape[2],
++                            viewpoint_cam.original_image.shape[1],
++                            grid_size=4,
++                        )
++                        if grid_coverage < getattr(dataset, 'min_grid_coverage', 0.375):
++                            rejection_reasons.append("grid_coverage")
++
++                        # Positive depth ratio (PnP camera coordinates)
++                        rot_mat_rodrigues, _ = cv2.Rodrigues(rotation_vector)
++                        t_vec = translation_vector.reshape(3, 1)
++                        cam_coords = (rot_mat_rodrigues @ pre_pts_inliers.T).T + t_vec.ravel()
++                        positive_depth_ratio = float((cam_coords[:, 2] > 0).mean())
++                        if positive_depth_ratio < getattr(dataset, 'min_positive_depth_ratio', 0.95):
++                            rejection_reasons.append("positive_depth_ratio")
++
++                        # Rotation step
++                        if accepted_rotation_history:
++                            last_accepted_r = accepted_rotation_history[-1]
++                            rot_mat_for_check, _ = cv2.Rodrigues(rotation_vector)
++                            rotation_step = rotation_step_deg(last_accepted_r, rot_mat_for_check)
++                            if rotation_step > getattr(dataset, 'max_rotation_step_deg', 25.0):
++                                rejection_reasons.append("rotation_step")
++
++                        # Translation step ratio (need 3+ inter-camera steps, i.e. 4+ cameras)
++                        if len(accepted_translation_history) >= 4:
++                            recent_trans_steps = []
++                            for i in range(1, min(8, len(accepted_translation_history))):
++                                recent_trans_steps.append(
++                                    np.linalg.norm(accepted_translation_history[-i] - accepted_translation_history[-i-1])
++                                )
++                            if recent_trans_steps:
++                                median_step = float(np.median(recent_trans_steps))
++                                if median_step > 1e-12:
++                                    current_step = np.linalg.norm(t_vec.ravel())
++                                    translation_step_ratio = current_step / median_step
++                                    if translation_step_ratio > getattr(dataset, 'max_translation_step_ratio', 6.0):
++                                        rejection_reasons.append("translation_step_ratio")
++
++                    # Emit telemetry for this attempt
++                    pose_stats = {
++                        "stage": "incremental",
++                        "frame": viewpoint_cam.image_name,
++                        "reference": ref_viewpoint_cam.image_name,
++                        "method": "pnp_ransac_refined",
++                        "opencv_success": bool(opencv_success),
++                        "accepted": len(rejection_reasons) == 0,
++                        "match_count": match_count,
++                        "inlier_count": inlier_count,
++                        "inlier_ratio": inlier_count / match_count if match_count else 0.0,
++                        "grid_coverage": grid_coverage,
++                        "positive_depth_ratio": positive_depth_ratio,
++                        "reprojection_rmse_px": reprojection_rmse_px,
++                        "rotation_step_deg": rotation_step,
++                        "translation_step_ratio": translation_step_ratio,
++                        "retry_index": retry_index,
++                        "rejection_reasons": rejection_reasons,
++                    }
++                    print(
++                        "POSE_TELEMETRY "
++                        + json.dumps(pose_stats, sort_keys=True, allow_nan=False),
++                        flush=True,
+                     )
+-                    if np.isfinite(reprojection_rmse_value):
+-                        reprojection_rmse_px = reprojection_rmse_value
+-                    viewpoint_cam.is_registered = True
+-                else:
+-                    print("Failed to solve PnP")
+-                    viewpoint_cam.is_registered = False
+-                    
+-                    pnp_retry_count[frame_id] = pnp_retry_count.get(frame_id, 0) + 1
+-                    
+-                    if pnp_retry_count[frame_id] >= max_pnp_retries:
+-                        print(f"Frame {frame_id} failed PnP after {max_pnp_retries} retries, skipping...")
++
++                    if not rejection_reasons:
++                        # All gates passed — accept this candidate
++                        accepted = True
++                        rotation_matrix, _ = cv2.Rodrigues(-rotation_vector)
++                        translation_vector = translation_vector.reshape(3)
++                        rotation_matrix = torch.from_numpy(rotation_matrix).float().cuda()
++                        translation_vector = torch.from_numpy(translation_vector).float().cuda()
++
++                        projected_rotation = project_to_so3(rotation_matrix)
++                        viewpoint_cam.update_RT(projected_rotation, translation_vector)
+                         viewpoint_cam.is_registered = True
+-                    else:
+-                        end_view_id -= 1
+-
+-                pose_stats = {
+-                    "frame": viewpoint_cam.image_name,
+-                    "reference": pre_viewpoint_cam1.image_name,
+-                    "stage": "incremental",
+-                    "method": "pnp_ransac",
+-                    "success": pnp_success,
+-                    "match_count": match_count,
+-                    "inlier_count": inlier_count,
+-                    "inlier_ratio": (
+-                        inlier_count / match_count if match_count else 0.0
+-                    ),
+-                    "reprojection_rmse_px": reprojection_rmse_px,
+-                    "retry_count": pnp_retry_count.get(frame_id, 0),
+-                }
+-                print(
+-                    "POSE_TELEMETRY "
+-                    + json.dumps(pose_stats, sort_keys=True, allow_nan=False),
+-                    flush=True,
+-                )
+-
+-                rotation_matrix, _ = cv2.Rodrigues(-rotation_vector)
+-                translation_vector = translation_vector.reshape(3)
+-                rotation_matrix = torch.from_numpy(rotation_matrix).float().cuda()
+-                translation_vector = torch.from_numpy(translation_vector).float().cuda()
+-                
+-                viewpoint_cam.update_RT(rotation_matrix, translation_vector)
++
++                        viewpoint_cam.kp0 = viewpoint_cam.kp0[inliers_flat]
++                        viewpoint_cam.kp1 = viewpoint_cam.kp1[inliers_flat]
++                        viewpoint_cam.conf = viewpoint_cam.conf[inliers_flat]
++
++                        # Update accepted history
++                        accepted_camera_indices.append(end_view_id - 1)
++                        accepted_rotation_history.append(
++                            viewpoint_cam.R.detach().cpu().numpy()
++                        )
++                        accepted_translation_history.append(
++                            viewpoint_cam.T.detach().cpu().numpy()
++                        )
++                        break
++
++                if not accepted:
++                    raise RuntimeError(
++                        f"POSE_GATE_REJECTED frame={viewpoint_cam.image_name} "
++                        f"attempts={reference_lookback}"
++                    )
+ 
+                 scale, offset = compute_scale(pre_rendered_depth, viewpoint_cam.pre_depth_map, viewpoint_cam.kp0)
+                 viewpoint_cam.depth_map = viewpoint_cam.depth_map * scale + offset
+@@ -376,7 +464,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                 image = render_pkg["render"]
+                 rendered_depth = render_pkg["depth"][0]
+                 voxel_visible_mask = render_pkg["visible_mask"]
+-                occ_mask = get_occlusion_mask(viewpoint_cam=pre_viewpoint_cam1, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
++                occ_mask = get_occlusion_mask(viewpoint_cam=ref_viewpoint_cam, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
+ 
+                 if occ_mask.sum() > 0:
+                     Ll1 = l1_loss(image[:,occ_mask], gt_image[:,occ_mask])
+@@ -414,7 +502,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+             progress_bar.close()
+ 
+             with torch.no_grad():
+-                occ_mask = get_occlusion_mask(viewpoint_cam=pre_viewpoint_cam1, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
++                occ_mask = get_occlusion_mask(viewpoint_cam=ref_viewpoint_cam, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
+                 densify_mask = occ_mask.view(-1) == 0
+                 if densify_mask.sum() > 0:
+                     depth_ref =viewpoint_cam.depth_map.cuda()
+diff --git a/utils/pose_utils.py b/utils/pose_utils.py
+index acec092..272284f 100644
+--- a/utils/pose_utils.py
++++ b/utils/pose_utils.py
+@@ -19,6 +19,48 @@ from utils.loss_utils import l1_loss, ssim, depth_loss
+ from utils.graphics_utils import warping, get_occlusion_mask, unporject
+ from gaussian_renderer import render
+ 
++def project_to_so3(rotation):
++    """Project a 3×3 matrix to the closest SO(3) element via SVD.
++
++    Returns a matrix R' such that R' ∈ SO(3), i.e. det(R') = 1 and
++    R' @ R'.T = I.  The input may be a torch.Tensor or numpy array.
++    """
++    if isinstance(rotation, np.ndarray):
++        rotation = torch.from_numpy(rotation).float()
++    u, _, vh = torch.linalg.svd(rotation)
++    correction = torch.eye(3, device=rotation.device, dtype=rotation.dtype)
++    correction[-1, -1] = torch.sign(torch.det(u @ vh))
++    return u @ correction @ vh
++
++
++def keypoint_grid_coverage(points_px, width, height, grid_size=4):
++    """Fraction of grid cells that contain at least one keypoint."""
++    import numpy as np
++
++    if len(points_px) == 0:
++        return 0.0
++    cell_w = width / grid_size
++    cell_h = height / grid_size
++    cols = np.clip((points_px[:, 0] / cell_w).astype(int), 0, grid_size - 1)
++    rows = np.clip((points_px[:, 1] / cell_h).astype(int), 0, grid_size - 1)
++    occupied = set(zip(rows, cols))
++    return len(occupied) / (grid_size * grid_size)
++
++
++def rotation_step_deg(previous_r, candidate_r):
++    """Angular distance in degrees between two 3×3 rotation matrices."""
++    import math
++
++    if isinstance(previous_r, torch.Tensor):
++        previous_r = previous_r.detach().cpu().numpy()
++    if isinstance(candidate_r, torch.Tensor):
++        candidate_r = candidate_r.detach().cpu().numpy()
++    R_rel = candidate_r @ previous_r.T
++    trace_val = np.trace(R_rel)
++    cos_angle = np.clip((trace_val - 1.0) / 2.0, -1.0, 1.0)
++    return math.degrees(math.acos(cos_angle))
++
++
+ def save_transforms(cameras, path):
+     json_cams = []
+     viewpoint_stack = cameras
+@@ -99,6 +141,7 @@ def update_pose(camera, converged_threshold=1e-4):
+ 
+     new_R = new_w2c[0:3, 0:3].t()
+     new_T = new_w2c[0:3, 3]
++    new_R = project_to_so3(new_R)
+ 
+     converged = tau.norm() < converged_threshold
+     camera.update_RT(new_R, new_T)

@@ -1,0 +1,8 @@
+# Existing ./dev.sh bootstrap aggregate for the CPU route and repository tests.
+# This is not the minimal user-facing runtime; use requirements-route.txt for that.
+#
+# The user-facing one-click route itself needs only the packages in
+# requirements-route.txt.  pytest is kept here because ./dev.sh bootstrap is
+# also the environment used by the repository's CPU test workflow.
+-r requirements-route.txt
+pytest

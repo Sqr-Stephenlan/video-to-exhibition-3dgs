@@ -96,6 +96,11 @@ case "$cmd" in
     ensure_venv
     exec "$PY" "$@"
     ;;
+  reconstruct)
+    shift
+    ensure_venv
+    exec "$PY" -m scripts.longsplat.reconstruct_pipeline "$@"
+    ;;
   pip)
     shift
     ensure_venv
@@ -118,7 +123,7 @@ case "$cmd" in
     ;;
   *)
     echo "Unknown command: $cmd" >&2
-    echo "Usage: ./dev.sh {doctor|bootstrap|python|pip|pytest|mypy|ruff} ..." >&2
+    echo "Usage: ./dev.sh {doctor|bootstrap|python|reconstruct|pip|pytest|mypy|ruff} ..." >&2
     exit 2
     ;;
 esac

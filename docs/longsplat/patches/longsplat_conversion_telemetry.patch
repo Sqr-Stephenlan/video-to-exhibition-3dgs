@@ -1,0 +1,404 @@
+diff --git a/scene/__init__.py b/scene/__init__.py
+index 5efe180..60e36b8 100755
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -7,6 +7,7 @@
+ # license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+ 
++import json
+ import os
+ import numpy as np
+ from utils.system_utils import searchForMaxIteration
+@@ -18,7 +19,7 @@ import torch
+ from utils.mast3r_utils import Mast3rMatcher
+ from scene.gaussian_model import BasicPointCloud
+ from torch.nn import functional as F
+-from utils.graphics_utils import align_vda_depth
++from utils.graphics_utils import align_vda_depth_with_stats
+ 
+ class Scene:
+ 
+@@ -168,15 +169,43 @@ class Scene:
+                             mode='bilinear',
+                             align_corners=False
+                         ).squeeze(0).squeeze(0)
+-                        D_vda = align_vda_depth(ext_depth, cam.depth_map,
+-                                                corr_threshold=corr_threshold,
+-                                                outlier_sigma=outlier_sigma)
++                        D_vda, vda_stats = align_vda_depth_with_stats(
++                            ext_depth,
++                            cam.depth_map,
++                            corr_threshold=corr_threshold,
++                            outlier_sigma=outlier_sigma,
++                        )
++                        vda_stats.update({
++                            "stage": "scene_init",
++                            "frame": cam.image_name,
++                        })
++                        print(
++                            "VDA_TELEMETRY "
++                            + json.dumps(
++                                vda_stats, sort_keys=True, allow_nan=False
++                            ),
++                            flush=True,
++                        )
+                         if D_vda is not None:
+                             cam.depth_map = D_vda
+                             print(f"VDA_USAGE result=aligned stage=scene_init frame={cam.image_name}", flush=True)
+                         else:
+                             print(f"VDA_USAGE result=rejected stage=scene_init frame={cam.image_name}", flush=True)
+                     else:
++                        print(
++                            "VDA_TELEMETRY "
++                            + json.dumps(
++                                {
++                                    "result": "missing",
++                                    "reason": "missing_file",
++                                    "stage": "scene_init",
++                                    "frame": cam.image_name,
++                                },
++                                sort_keys=True,
++                                allow_nan=False,
++                            ),
++                            flush=True,
++                        )
+                         print(f"VDA_USAGE result=missing stage=scene_init frame={cam.image_name}", flush=True)
+ 
+             self.cameras_extent = 10.0
+@@ -196,4 +225,4 @@ class Scene:
+         return self.test_cameras[scale]
+     
+     def getAllCameras(self, scale=1.0):
+-        return self.getTrainCameras(scale) + self.getTestCameras(scale)
+\ No newline at end of file
++        return self.getTrainCameras(scale) + self.getTestCameras(scale)
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index 5935fb3..67707d7 100755
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -6,6 +6,7 @@
+ # distribution of this software and related documentation without an express
+ # license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
++import json
+ import torch
+ from functools import reduce
+ import numpy as np
+@@ -499,8 +500,44 @@ class GaussianModel:
+ 
+         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+ 
+-        dist2 = torch.clamp_max(distCUDA2(fused_point_cloud), self.voxel_size)
++        dist2_raw = distCUDA2(fused_point_cloud)
++        dist2 = torch.clamp(dist2_raw, min=1e-7, max=self.voxel_size)
+         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
++
++        raw_finite = dist2_raw.detach()[torch.isfinite(dist2_raw.detach())]
++        adjusted_finite = dist2.detach()[torch.isfinite(dist2.detach())]
++        conversion_stats = {
++            "point_count": int(fused_point_cloud.shape[0]),
++            "nonpositive_distance_count": int(
++                ((dist2_raw <= 0) & torch.isfinite(dist2_raw)).sum().item()
++            ),
++            "finite_scale_count": int(
++                torch.isfinite(scales).all(dim=1).sum().item()
++            ),
++            "distance_min_before": (
++                float(raw_finite.min().item()) if raw_finite.numel() else None
++            ),
++            "distance_max_before": (
++                float(raw_finite.max().item()) if raw_finite.numel() else None
++            ),
++            "distance_min_after": (
++                float(adjusted_finite.min().item())
++                if adjusted_finite.numel()
++                else None
++            ),
++            "distance_max_after": (
++                float(adjusted_finite.max().item())
++                if adjusted_finite.numel()
++                else None
++            ),
++        }
++        print(
++            "CONVERSION_TELEMETRY "
++            + json.dumps(conversion_stats, sort_keys=True, allow_nan=False),
++            flush=True,
++        )
++        if not torch.isfinite(scales).all():
++            raise RuntimeError("3DGS conversion produced non-finite initial scales")
+         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+         rots[:, 0] = 1
+ 
+diff --git a/train.py b/train.py
+index 4afaa66..93f7fa3 100755
+--- a/train.py
++++ b/train.py
+@@ -7,6 +7,7 @@
+ # license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+ 
++import json
+ import os
+ import numpy as np
+ 
+@@ -32,7 +33,7 @@ from utils.image_utils import psnr
+ from argparse import ArgumentParser, Namespace
+ from arguments import ModelParams, PipelineParams, OptimizationParams
+ from utils.pose_utils import save_transforms, update_pose
+-from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute_scale, align_vda_depth
++from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute_scale, align_vda_depth_with_stats
+ from utils.mast3r_utils import Mast3rMatcher
+ import cv2
+ from scipy.optimize import least_squares
+@@ -241,7 +242,13 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+ 
+                 success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(pre_pts_np, kp1_np, intrinsic_np, None, iterationsCount=300,reprojectionError=8.0,confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
+ 
+-                if success and len(inliers) >= 4:
++                match_count = int(pre_pts_np.shape[0])
++                inlier_count = int(len(inliers)) if inliers is not None else 0
++                pnp_success = bool(success and inlier_count >= 4)
++                reprojection_rmse_px = None
++                frame_id = end_view_id - 1
++
++                if pnp_success:
+                     pre_pts_inliers = pre_pts_np[inliers].reshape(-1, 3)
+                     kp1_inliers = kp1_np[inliers].reshape(-1, 2)
+ 
+@@ -252,12 +259,22 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                                         ftol=1e-8, xtol=1e-8)
+                     rotation_vector = result.x[:3]
+                     translation_vector = result.x[3:]
++                    reprojection_residual = reprojection_error(
++                        result.x,
++                        pre_pts_inliers,
++                        kp1_inliers,
++                        intrinsic_np,
++                    )
++                    reprojection_rmse_value = float(
++                        np.sqrt(np.mean(reprojection_residual ** 2))
++                    )
++                    if np.isfinite(reprojection_rmse_value):
++                        reprojection_rmse_px = reprojection_rmse_value
+                     viewpoint_cam.is_registered = True
+                 else:
+                     print("Failed to solve PnP")
+                     viewpoint_cam.is_registered = False
+                     
+-                    frame_id = end_view_id - 1
+                     pnp_retry_count[frame_id] = pnp_retry_count.get(frame_id, 0) + 1
+                     
+                     if pnp_retry_count[frame_id] >= max_pnp_retries:
+@@ -266,6 +283,26 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                     else:
+                         end_view_id -= 1
+ 
++                pose_stats = {
++                    "frame": viewpoint_cam.image_name,
++                    "reference": pre_viewpoint_cam1.image_name,
++                    "stage": "incremental",
++                    "method": "pnp_ransac",
++                    "success": pnp_success,
++                    "match_count": match_count,
++                    "inlier_count": inlier_count,
++                    "inlier_ratio": (
++                        inlier_count / match_count if match_count else 0.0
++                    ),
++                    "reprojection_rmse_px": reprojection_rmse_px,
++                    "retry_count": pnp_retry_count.get(frame_id, 0),
++                }
++                print(
++                    "POSE_TELEMETRY "
++                    + json.dumps(pose_stats, sort_keys=True, allow_nan=False),
++                    flush=True,
++                )
++
+                 rotation_matrix, _ = cv2.Rodrigues(-rotation_vector)
+                 translation_vector = translation_vector.reshape(3)
+                 rotation_matrix = torch.from_numpy(rotation_matrix).float().cuda()
+@@ -291,15 +328,43 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
+                             size=(viewpoint_cam.image_height, viewpoint_cam.image_width),
+                             mode='bilinear', align_corners=False
+                         ).squeeze(0).squeeze(0)
+-                        D_vda = align_vda_depth(vda_v, viewpoint_cam.depth_map,
+-                                                corr_threshold=corr_threshold,
+-                                                outlier_sigma=outlier_sigma)
++                        D_vda, vda_stats = align_vda_depth_with_stats(
++                            vda_v,
++                            viewpoint_cam.depth_map,
++                            corr_threshold=corr_threshold,
++                            outlier_sigma=outlier_sigma,
++                        )
++                        vda_stats.update({
++                            "stage": "incremental",
++                            "frame": viewpoint_cam.image_name,
++                        })
++                        print(
++                            "VDA_TELEMETRY "
++                            + json.dumps(
++                                vda_stats, sort_keys=True, allow_nan=False
++                            ),
++                            flush=True,
++                        )
+                         if D_vda is not None:
+                             viewpoint_cam.depth_map = D_vda
+                             print(f"VDA_USAGE result=aligned stage=incremental frame={viewpoint_cam.image_name}", flush=True)
+                         else:
+                             print(f"VDA_USAGE result=rejected stage=incremental frame={viewpoint_cam.image_name}", flush=True)
+                     else:
++                        print(
++                            "VDA_TELEMETRY "
++                            + json.dumps(
++                                {
++                                    "result": "missing",
++                                    "reason": "missing_file",
++                                    "stage": "incremental",
++                                    "frame": viewpoint_cam.image_name,
++                                },
++                                sort_keys=True,
++                                allow_nan=False,
++                            ),
++                            flush=True,
++                        )
+                         print(f"VDA_USAGE result=missing stage=incremental frame={viewpoint_cam.image_name}", flush=True)
+ 
+             pose_optimizer = torch.optim.Adam([{"params": [viewpoint_cam.cam_trans_delta], "lr": opt.translation_lr_init}, {"params": [viewpoint_cam.cam_rot_delta], "lr": opt.rotation_lr_init}])
+@@ -915,4 +980,4 @@ if __name__ == "__main__":
+     training(lp.extract(args), op.extract(args), pp.extract(args), dataset, args.debug_from, logger)
+     
+     # All done
+-    logger.info("\nTraining complete.")
+\ No newline at end of file
++    logger.info("\nTraining complete.")
+diff --git a/utils/graphics_utils.py b/utils/graphics_utils.py
+index e2657f5..fc706f3 100755
+--- a/utils/graphics_utils.py
++++ b/utils/graphics_utils.py
+@@ -230,7 +230,7 @@ def compute_scale(depth1, depth2, keypoint):
+     return scale, offset
+ 
+ 
+-def align_vda_depth(v, D_ref, corr_threshold=0.3, outlier_sigma=2.5):
++def align_vda_depth_with_stats(v, D_ref, corr_threshold=0.3, outlier_sigma=2.5):
+     """Align VDA relative depth (disparity-like, higher=near) to scene z-depth.
+ 
+     Fits ``a·v + b ≈ 1/D_ref`` in inverse-depth space via least squares,
+@@ -245,8 +245,9 @@ def align_vda_depth(v, D_ref, corr_threshold=0.3, outlier_sigma=2.5):
+         outlier_sigma: Residual threshold (in σ) for re-fit rejection.
+ 
+     Returns:
+-        Aligned z-depth tensor (H, W) with the same dtype/device as D_ref,
+-        or **None** if the alignment fails the correlation safety check.
++        A pair ``(depth, stats)``. ``depth`` is aligned z-depth with the same
++        dtype/device as D_ref, or ``None`` when a safety check rejects it.
++        ``stats`` contains only JSON-serializable diagnostic values.
+     """
+     eps = 1e-6
+     inv_ref = 1.0 / (D_ref + eps)
+@@ -257,8 +258,22 @@ def align_vda_depth(v, D_ref, corr_threshold=0.3, outlier_sigma=2.5):
+     inv_flat = inv_ref[mask].reshape(-1, 1).float()
+     inlier_indices = torch.nonzero(mask.reshape(-1), as_tuple=True)[0]
+ 
++    valid_count = int(v_flat.numel())
++    stats = {
++        "result": "rejected",
++        "reason": None,
++        "valid_count": valid_count,
++        "inlier_count": 0,
++        "inlier_ratio": 0.0,
++        "slope": None,
++        "offset": None,
++        "correlation": None,
++        "residual_rmse": None,
++    }
++
+     if v_flat.numel() < 100:
+-        return None
++        stats["reason"] = "insufficient_valid_points"
++        return None, stats
+ 
+     # --- first fit ---
+     A = torch.cat([v_flat, torch.ones_like(v_flat)], dim=1)  # [N, 2]
+@@ -278,31 +293,68 @@ def align_vda_depth(v, D_ref, corr_threshold=0.3, outlier_sigma=2.5):
+         a, b = float(sol2[0, 0]), float(sol2[1, 0])
+         used_indices = inlier_indices[keep]
+ 
++    a, b = float(a), float(b)
++    stats["slope"] = a if math.isfinite(a) else None
++    stats["offset"] = b if math.isfinite(b) else None
++    stats["inlier_count"] = int(used_indices.numel())
++    stats["inlier_ratio"] = (
++        stats["inlier_count"] / valid_count if valid_count else 0.0
++    )
++
++    if not math.isfinite(a) or not math.isfinite(b):
++        stats["reason"] = "nonfinite_fit"
++        return None, stats
++
+     # --- slope safety valve: negative a means VDA and reference point in
+     #     opposite directions (higher v → lower 1/D), which violates the
+     #     disparity → z-depth model ---
+     if a <= 0:
+         print(f"[align_vda_depth] WARNING: negative slope a={a:.4f}, falling back")
+-        return None
++        stats["reason"] = "nonpositive_slope"
++        return None, stats
+ 
+     # --- correlation safety valve ---
+     if used_indices.numel() < 100:
+-        return None
++        stats["reason"] = "insufficient_inliers"
++        return None, stats
+     inv_vda_flat2 = (a * v.reshape(-1).float()[used_indices] + b)
+     inv_ref_flat2 = inv_ref.reshape(-1).float()[used_indices]
+     stacked = torch.stack([inv_vda_flat2, inv_ref_flat2], dim=0)
+     corr = torch.corrcoef(stacked)[0, 1]
+ 
+-    if torch.isnan(corr) or corr < corr_threshold:
++    corr_value = float(corr)
++    stats["correlation"] = corr_value if math.isfinite(corr_value) else None
++    residual_rmse = float(
++        torch.sqrt(torch.mean((inv_vda_flat2 - inv_ref_flat2) ** 2))
++    )
++    stats["residual_rmse"] = (
++        residual_rmse if math.isfinite(residual_rmse) else None
++    )
++
++    if not math.isfinite(corr_value) or corr_value < corr_threshold:
+         print(f"[align_vda_depth] WARNING: low correlation ρ={float(corr):.4f}, falling back")
+-        return None
++        stats["reason"] = "low_correlation"
++        return None, stats
+ 
+     # --- produce output, filling invalid pixels with reference depth ---
+     D_vda = 1.0 / torch.clamp(a * v + b, min=eps)
+     # Sanitise: non-finite outputs replaced by reference
+     bad = ~torch.isfinite(D_vda)
+     D_vda[bad] = D_ref[bad]
+-    return D_vda.to(device=D_ref.device, dtype=D_ref.dtype)
++    stats["result"] = "aligned"
++    stats["reason"] = None
++    return D_vda.to(device=D_ref.device, dtype=D_ref.dtype), stats
++
++
++def align_vda_depth(v, D_ref, corr_threshold=0.3, outlier_sigma=2.5):
++    """Backward-compatible alignment API returning only the depth tensor."""
++    depth, _ = align_vda_depth_with_stats(
++        v,
++        D_ref,
++        corr_threshold=corr_threshold,
++        outlier_sigma=outlier_sigma,
++    )
++    return depth
+ 
+ 
+ def get_depth_from_3d_points(pts_3d, w2c_pose):
+@@ -330,4 +382,4 @@ def compute_texture_mask(image, threshold=0.05):
+     grad_mag[1:, :] += grad_y
+ 
+     mask = (grad_mag > threshold).float()
+-    return mask.squeeze(0)
+\ No newline at end of file
++    return mask.squeeze(0)

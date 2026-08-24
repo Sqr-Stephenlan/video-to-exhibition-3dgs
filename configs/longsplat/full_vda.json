@@ -1,0 +1,18 @@
+{
+  "source_path": "<run_dir>/input",
+  "model_path": "<run_dir>/longsplat_model",
+  "images": "images",
+  "resolution": -1,
+  "sh_degree": 3,
+  "iterations": 30000,
+  "seed": 0,
+  "mode": "custom",
+  "backend_mode": "research_local",
+  "extra_train_args": {
+    "depth_source": "vda",
+    "vda_corr_threshold": 0.3,
+    "vda_outlier_sigma": 2.5
+  },
+  "convert_iteration": 30000,
+  "convert_prune_ratio": 0.6
+}

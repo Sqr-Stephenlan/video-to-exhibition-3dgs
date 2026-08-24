@@ -1,0 +1,845 @@
+diff --git a/convert_3dgs.py b/convert_3dgs.py
+index 2dbfda55e3ba7509bbb6720c7020456c2542fdfb..3c2c2c821d1204bf7c5d972e1225e0291ff4c499 100755
+--- a/convert_3dgs.py
++++ b/convert_3dgs.py
+@@ -14,3 +13,0 @@ import subprocess
+-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
+-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
+-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+@@ -18 +15,25 @@ os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in res
+-os.system('echo $CUDA_VISIBLE_DEVICES')
++
++def _configure_cuda_visible_devices() -> None:
++    """Select the least-used GPU at the real conversion CLI boundary."""
++
++    result = subprocess.run(
++        ["nvidia-smi", "-q", "-d", "Memory"],
++        shell=False,
++        check=False,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++    if result.returncode != 0:
++        raise RuntimeError(f"nvidia-smi failed with exit {result.returncode}: {result.stderr.strip()[:500]}")
++    used: list[int] = []
++    for line in result.stdout.splitlines():
++        fields = line.split()
++        if len(fields) >= 3 and fields[0] == "Used" and fields[1] == ":":
++            try:
++                used.append(int(fields[2]))
++            except ValueError:
++                continue
++    if not used:
++        raise RuntimeError("nvidia-smi did not report GPU memory usage")
++    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(np.argmin(used)))
+@@ -174,0 +196 @@ if __name__ == "__main__":
++    _configure_cuda_visible_devices()
+diff --git a/gaussian_renderer/network_gui.py b/gaussian_renderer/network_gui.py
+index df2f9dae782b24527ae5b09f91ca4009361de53f..728934b3819fb3cc4c6eddc2232808a54c476742 100755
+--- a/gaussian_renderer/network_gui.py
++++ b/gaussian_renderer/network_gui.py
+@@ -24 +24 @@ addr = None
+-listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++listener = None
+@@ -29,0 +30,2 @@ def init(wish_host, wish_port):
++    if listener is None:
++        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+@@ -86 +88 @@ def receive():
+-        return None, None, None, None, None, None
+\ No newline at end of file
++        return None, None, None, None, None, None
+diff --git a/render.py b/render.py
+index feae119c8239de1b4f64da5258c1263f36deeb1b..bcfcf092f99b37d18ac978ede30b75d929a5f968 100755
+--- a/render.py
++++ b/render.py
+@@ -15,3 +14,0 @@ import subprocess
+-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
+-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
+-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+@@ -19 +16,25 @@ os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in res
+-os.system('echo $CUDA_VISIBLE_DEVICES')
++
++def _configure_cuda_visible_devices() -> None:
++    """Select the least-used GPU at the real render CLI boundary."""
++
++    result = subprocess.run(
++        ["nvidia-smi", "-q", "-d", "Memory"],
++        shell=False,
++        check=False,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++    if result.returncode != 0:
++        raise RuntimeError(f"nvidia-smi failed with exit {result.returncode}: {result.stderr.strip()[:500]}")
++    used: list[int] = []
++    for line in result.stdout.splitlines():
++        fields = line.split()
++        if len(fields) >= 3 and fields[0] == "Used" and fields[1] == ":":
++            try:
++                used.append(int(fields[2]))
++            except ValueError:
++                continue
++    if not used:
++        raise RuntimeError("nvidia-smi did not report GPU memory usage")
++    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(np.argmin(used)))
+@@ -276,0 +298 @@ if __name__ == "__main__":
++    _configure_cuda_visible_devices()
+diff --git a/scene/__init__.py b/scene/__init__.py
+index 7759279d7a181789a0482c8965a0ae09bfa84c4a..512df10cc6fa330e0634d6e98cd3c2696b0a89b3 100755
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -18 +17,0 @@ import torch
+-from utils.mast3r_utils import Mast3rMatcher
+@@ -21 +20,4 @@ from torch.nn import functional as F
+-from utils.external_colmap_pose import external_camera_contract
++from utils.external_colmap_pose import (
++    external_camera_contract,
++    load_external_camera_identity,
++)
+@@ -93,0 +96,2 @@ class Scene:
++            from utils.mast3r_utils import Mast3rMatcher
++
+@@ -166 +170,4 @@ class Scene:
+-            raise ValueError("external_colmap_pose requires --disable_resize for the 1280x720 contract")
++            raise ValueError(
++                "external_colmap_pose requires --disable_resize for the "
++                "per-video centered-PINHOLE contract"
++            )
+@@ -170 +177,6 @@ class Scene:
+-        expected_names = [f"frame_{index:06d}" for index in range(len(cameras))]
++        reference_infos = scene_info.train_cameras + scene_info.test_cameras
++        camera_identity = load_external_camera_identity(
++            source_path=args.source_path,
++            camera_infos=reference_infos,
++        )
++        expected_names = list(camera_identity["expected_internal_names"])
+@@ -174 +186 @@ class Scene:
+-            scene_info.train_cameras + scene_info.test_cameras,
++            reference_infos,
+@@ -200,0 +213 @@ class Scene:
++        contract["camera_identity"] = camera_identity
+@@ -236 +249 @@ class Scene:
+-        return self.getTrainCameras(scale) + self.getTestCameras(scale)
+\ No newline at end of file
++        return self.getTrainCameras(scale) + self.getTestCameras(scale)
+diff --git a/scene/dataset_readers.py b/scene/dataset_readers.py
+index b9be1d9aacb137b74b5b73583ea8ad239f45d0eb..e92583bfa641284ce58a67b2f68997e6be70140f 100755
+--- a/scene/dataset_readers.py
++++ b/scene/dataset_readers.py
+@@ -16,0 +17 @@ from utils.graphics_utils import getWorld2View, focal2fov, fov2focal
++from utils.external_colmap_pose import order_camera_infos_by_contract
+@@ -73,0 +75,10 @@ def readJsonCameras(cameras, cameras_gt, images_folder):
++    gt_by_filename = {}
++    gt_by_stem = {}
++    if cameras_gt is not None:
++        for cam_gt in cameras_gt.values():
++            filename = os.path.basename(cam_gt.name)
++            stem = Path(filename).stem
++            if filename in gt_by_filename or stem in gt_by_stem:
++                raise ValueError(f"COLMAP camera names are ambiguous at {filename}")
++            gt_by_filename[filename] = cam_gt
++            gt_by_stem[stem] = cam_gt
+@@ -81,8 +92,24 @@ def readJsonCameras(cameras, cameras_gt, images_folder):
+-        # Only try to get GT poses if cameras_gt is available
+-        if cameras_gt is not None:
+-            for key in cameras_gt:
+-                cam_gt = cameras_gt[key]
+-                if cam["image_name"] == cam_gt.name.split(".")[0]:
+-                    R_gt = np.transpose(qvec2rotmat(cam_gt.qvec))
+-                    T_gt = np.array(cam_gt.tvec)
+-                    break
++        declared_name = cam.get("image_name")
++        if not isinstance(declared_name, str) or not declared_name or Path(declared_name).name != declared_name:
++            raise ValueError(f"camera JSON image_name is not a safe basename: {declared_name!r}")
++        declared_path = Path(declared_name)
++        if declared_path.suffix:
++            files = [Path(images_folder) / declared_name]
++            internal_name = declared_path.stem
++            cam_gt = gt_by_filename.get(declared_name)
++        else:
++            files = sorted(
++                path for path in Path(images_folder).iterdir()
++                if path.is_file() and not path.is_symlink() and path.stem == declared_name
++            )
++            internal_name = declared_name
++            cam_gt = gt_by_stem.get(declared_name)
++        if len(files) != 1 or not files[0].is_file() or files[0].is_symlink():
++            raise FileNotFoundError(
++                f"camera JSON image_name must resolve to exactly one image: {declared_name}"
++            )
++        if cameras_gt is not None and cam_gt is None:
++            raise ValueError(f"camera JSON image_name has no exact COLMAP pose: {declared_name}")
++        if cam_gt is not None:
++            R_gt = np.transpose(qvec2rotmat(cam_gt.qvec))
++            T_gt = np.array(cam_gt.tvec)
+@@ -95,5 +122 @@ def readJsonCameras(cameras, cameras_gt, images_folder):
+-        pattern = os.path.join(images_folder, cam["image_name"] + ".*")
+-        files = glob.glob(pattern)
+-        if not files:
+-            raise FileNotFoundError(f"Image file not found for {cam['image_name']}")
+-        image_path = files[0]
++        image_path = str(files[0])
+@@ -105 +128 @@ def readJsonCameras(cameras, cameras_gt, images_folder):
+-                               image_path=image_path, image_name=cam["image_name"],
++                               image_path=image_path, image_name=internal_name,
+@@ -148 +171,4 @@ def readUnposedCameras(cam_extrinsics, cam_intrinsics, images_folder):
+-        image_name = os.path.basename(image_path).split(".")[0]
++        # The route-side identity contract records the explicit basename and
++        # maps it to this final-suffix stem.  ``split('.')`` is ambiguous for
++        # legal names such as ``room.v2.png`` and could alias two cameras.
++        image_name = Path(os.path.basename(image_path)).stem
+@@ -165 +191 @@ def readUnposedCameras2(images_folder):
+-        image_name = image_name.split(".")[0]
++        image_name = Path(image_name).stem
+@@ -548 +574,9 @@ def readCustomSceneInfo(path, images, eval, llffhold=8):
+-    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
++    contract_path = Path(path) / "camera_contract-v1.json"
++    if contract_path.is_file() and not contract_path.is_symlink():
++        # COLMAP image IDs are not an ordering contract.  Preserve the
++        # immutable per-video contract order after exact name binding.
++        cam_infos = order_camera_infos_by_contract(
++            source_path=path, camera_infos=cam_infos_unsorted.copy()
++        )
++    else:
++        cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+@@ -598,2 +631,0 @@ from collections import defaultdict, OrderedDict
+-from pytorch3d.renderer import PerspectiveCameras
+-from pytorch3d.utils import opencv_from_cameras_projection
+@@ -602,0 +635,2 @@ def load_camera(data, scale=1.0):
++    from pytorch3d.renderer import PerspectiveCameras
++    from pytorch3d.utils import opencv_from_cameras_projection
+@@ -710 +744 @@ sceneLoadTypeCallbacks = {
+-}
+\ No newline at end of file
++}
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index e9154648b28e33136378530044208531d9bfefaa..1424b654f898d167a1fcc93af63d1d4c71ebf8f4 100755
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -978,0 +979,3 @@ class GaussianModel:
++        before_anchor_count = int(self.get_anchor.shape[0])
++        added_anchor_count = 0
++        deleted_anchor_count = 0
+@@ -985,0 +989,2 @@ class GaussianModel:
++        after_growing_count = int(self.get_anchor.shape[0])
++        added_anchor_count = after_growing_count - before_anchor_count
+@@ -1028,0 +1034 @@ class GaussianModel:
++                deleted_anchor_count = int(prune_mask.sum().item())
+@@ -1031,0 +1038,8 @@ class GaussianModel:
++        after_anchor_count = int(self.get_anchor.shape[0])
++        return {
++            "before_anchor_count": before_anchor_count,
++            "after_anchor_count": after_anchor_count,
++            "added_anchor_count": added_anchor_count,
++            "deleted_anchor_count": deleted_anchor_count,
++            "net_anchor_delta": after_anchor_count - before_anchor_count,
++        }
+diff --git a/tests/test_external_colmap_pose.py b/tests/test_external_colmap_pose.py
+index 0ac607900656888bd7d399a76f0fa2b23073f014..c54b33b04ad8e897fddcdecc04562b51f81e45e2 100644
+--- a/tests/test_external_colmap_pose.py
++++ b/tests/test_external_colmap_pose.py
+@@ -2,0 +3,2 @@ from __future__ import annotations
++import hashlib
++import json
+@@ -13,0 +16,2 @@ from utils.external_colmap_pose import (
++    load_external_camera_identity,
++    order_camera_infos_by_contract,
+@@ -90,0 +95,78 @@ def test_runtime_contract_rejects_invalid_active_pose(failure: str):
++
++
++def _identity_fixture(tmp_path: Path, names: list[str], actual_names: list[str] | None = None) -> tuple[Path, list[SimpleNamespace]]:
++    root = tmp_path / "training-input"
++    (root / "contract").mkdir(parents=True)
++    unsigned = {
++        "schema_version": "camera-contract-v1",
++        "frame_names": names,
++        "frame_count": len(names),
++        "camera": {"model": "PINHOLE", "width": 8, "height": 6},
++    }
++    contract = dict(unsigned)
++    contract["contract_sha256"] = hashlib.sha256(
++        json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
++    ).hexdigest()
++    (root / "camera_contract-v1.json").write_text(json.dumps(contract), encoding="utf-8")
++    (root / "staging_manifest.json").write_text(
++        json.dumps({
++            "image_records": [{"name": name} for name in names],
++            "camera_contract_sha256": contract["contract_sha256"],
++        }),
++        encoding="utf-8",
++    )
++    infos = [SimpleNamespace(image_name=name) for name in (actual_names or [Path(name).stem for name in names])]
++    return root, infos
++
++
++def test_camera_identity_accepts_noncontiguous_filename_contract_and_stem_backend(tmp_path: Path):
++    names = ["camera.alpha.png", "view-17.jpg", "x9.webp"]
++    root, infos = _identity_fixture(tmp_path, names)
++    identity = load_external_camera_identity(
++        source_path=root,
++        camera_infos=infos,
++        registered_colmap_names=names,
++    )
++    assert identity["internal_name_mode"] == "stem"
++    assert identity["registered_colmap_name_mode"] == "filename"
++    assert identity["expected_internal_names"] == ["camera.alpha", "view-17", "x9"]
++    assert identity["basename_to_internal_name"]["camera.alpha.png"] == "camera.alpha"
++
++
++def test_camera_order_adapter_uses_explicit_contract_not_colmap_numeric_order(tmp_path: Path):
++    names = ["camera.alpha.png", "view-17.jpg", "x9.webp"]
++    root, infos = _identity_fixture(tmp_path, names, ["x9", "camera.alpha", "view-17"])
++    ordered = order_camera_infos_by_contract(source_path=root, camera_infos=infos)
++    assert [info.image_name for info in ordered] == ["camera.alpha", "view-17", "x9"]
++
++
++def test_camera_identity_accepts_old_contiguous_stem_contract(tmp_path: Path):
++    names = [f"frame_{index:06d}" for index in range(4)]
++    root, infos = _identity_fixture(tmp_path, names)
++    identity = load_external_camera_identity(
++        source_path=root,
++        camera_infos=infos,
++        registered_colmap_names=names,
++    )
++    assert identity["internal_name_mode"] == "filename"
++    assert identity["expected_internal_names"] == names
++
++
++def test_camera_identity_rejects_duplicate_stem(tmp_path: Path):
++    root, infos = _identity_fixture(tmp_path, ["same.png", "same.jpg"], ["same", "same"])
++    with pytest.raises(ValueError, match="duplicate stems"):
++        load_external_camera_identity(source_path=root, camera_infos=infos, registered_colmap_names=["same.png", "same.jpg"])
++
++
++@pytest.mark.parametrize(
++    "actual,registered,pattern",
++    [
++        (["a"], ["a.png", "b.png"], "count"),
++        (["a", "b"], ["a.png", "c.png"], "set"),
++        (["b", "a"], ["a.png", "b.png"], "order"),
++    ],
++)
++def test_camera_identity_rejects_missing_extra_or_order_drift(tmp_path: Path, actual, registered, pattern: str):
++    root, infos = _identity_fixture(tmp_path, ["a.png", "b.png"], actual)
++    with pytest.raises(ValueError):
++        load_external_camera_identity(source_path=root, camera_infos=infos, registered_colmap_names=registered)
+diff --git a/train.py b/train.py
+index 29974493706eab8a8a2b2b252444663673b392e8..c236181f1512a528f7acfc6f2de795a72a8e5001 100755
+--- a/train.py
++++ b/train.py
+@@ -15,3 +14,0 @@ import subprocess
+-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
+-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
+-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+@@ -19 +16,25 @@ os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in res
+-os.system('echo $CUDA_VISIBLE_DEVICES')
++
++def _configure_cuda_visible_devices() -> None:
++    """Select the least-used GPU at the real training CLI boundary."""
++
++    result = subprocess.run(
++        ["nvidia-smi", "-q", "-d", "Memory"],
++        shell=False,
++        check=False,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++    if result.returncode != 0:
++        raise RuntimeError(f"nvidia-smi failed with exit {result.returncode}: {result.stderr.strip()[:500]}")
++    used: list[int] = []
++    for line in result.stdout.splitlines():
++        fields = line.split()
++        if len(fields) >= 3 and fields[0] == "Used" and fields[1] == ":":
++            try:
++                used.append(int(fields[2]))
++            except ValueError:
++                continue
++    if not used:
++        raise RuntimeError("nvidia-smi did not report GPU memory usage")
++    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(np.argmin(used)))
+@@ -25 +46 @@ from utils.loss_utils import l1_loss, ssim, depth_loss
+-from gaussian_renderer import render, network_gui
++from gaussian_renderer import render
+@@ -36 +57 @@ from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute
+-from utils.mast3r_utils import Mast3rMatcher
++from utils.camera_sampling_telemetry import CameraSamplingTelemetry
+@@ -128,0 +150,8 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
++    sampling_telemetry = CameraSamplingTelemetry(
++        model_path=scene.model_path,
++        contract=contract,
++        cameras=cameras,
++        iterations=iterations,
++    )
++    anchor_adjust_iterations = []
++    anchor_adjust_events = []
+@@ -142,0 +172 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
++        sampling_telemetry.record(iteration, viewpoint_cam)
+@@ -188 +218 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
+-                    gaussians.adjust_anchor(
++                    anchor_stats = gaussians.adjust_anchor(
+@@ -194,0 +225,10 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
++                    anchor_adjust_iterations.append(iteration)
++                    anchor_event = {
++                        "iteration": int(iteration),
++                        **(
++                            dict(anchor_stats)
++                            if isinstance(anchor_stats, dict)
++                            else {}
++                        ),
++                    }
++                    anchor_adjust_events.append(anchor_event)
+@@ -209,0 +250 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
++    sampling_summary = sampling_telemetry.finalize(checkpoint_iteration=checkpoint_iteration)
+@@ -218,0 +260,7 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
++        "camera_sampling_telemetry": sampling_summary,
++        "anchor_schedule": {
++            "semantics": "LongSplat anchor_growing/adjust_anchor runtime events",
++            "observed_iterations": anchor_adjust_iterations,
++            "observed_events": anchor_adjust_events,
++            "observed_from_runtime": True,
++        },
+@@ -249,0 +298,2 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
++    from utils.mast3r_utils import Mast3rMatcher
++
+@@ -1002,0 +1053,6 @@ if __name__ == "__main__":
++    _configure_cuda_visible_devices()
++
++    # Importing network_gui allocates its listener; keep that side effect at
++    # the real training CLI boundary rather than during module import.
++    from gaussian_renderer import network_gui
++
+@@ -1016 +1071,0 @@ if __name__ == "__main__":
+-        os.system("echo $CUDA_VISIBLE_DEVICES")
+@@ -1034 +1089 @@ if __name__ == "__main__":
+-    logger.info("\nTraining complete.")
+\ No newline at end of file
++    logger.info("\nTraining complete.")
+diff --git a/utils/camera_sampling_telemetry.py b/utils/camera_sampling_telemetry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7cf5dd14bd391bebd640a814d1175de6a5d7e57
+--- /dev/null
++++ b/utils/camera_sampling_telemetry.py
+@@ -0,0 +1,171 @@
++"""Append-only camera sampling evidence for the external fixed-pose route.
++
++This module intentionally has no torch, CUDA, or random imports.  The trainer
++owns camera selection; this helper observes the selected camera after the
++existing ``randint``/``pop`` operation and records an immutable identity-bound
++event.  It must never alter RNG state or the selection stack.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++from typing import Any, Mapping, Sequence
++
++
++TELEMETRY_SCHEMA = "camera-sampling-telemetry-v1"
++EVENTS_FILENAME = "camera_sampling_telemetry-v1.jsonl"
++SUMMARY_FILENAME = "camera_sampling_telemetry-v1.json"
++
++
++class CameraSamplingTelemetryError(ValueError):
++    """The immutable camera identity or append-only telemetry contract failed."""
++
++
++def _as_nonempty_string(value: Any, field: str) -> str:
++    if not isinstance(value, str) or not value:
++        raise CameraSamplingTelemetryError(f"{field} must be a non-empty string")
++    return value
++
++
++def _camera_identity(contract: Mapping[str, Any]) -> tuple[list[str], dict[str, str], str | None]:
++    internal_names_value = contract.get("image_names")
++    if not isinstance(internal_names_value, list) or not internal_names_value:
++        raise CameraSamplingTelemetryError("external pose contract image_names are required")
++    internal_names = [_as_nonempty_string(value, "contract image name") for value in internal_names_value]
++    if len(internal_names) != len(set(internal_names)):
++        raise CameraSamplingTelemetryError("external pose contract image_names must be unique")
++
++    identity = contract.get("camera_identity")
++    if not isinstance(identity, Mapping):
++        raise CameraSamplingTelemetryError("external pose contract camera_identity mapping is required")
++    mapping_value = identity.get("basename_to_internal_name")
++    if not isinstance(mapping_value, Mapping) or not mapping_value:
++        raise CameraSamplingTelemetryError("camera_identity.basename_to_internal_name is required")
++    basename_to_internal = {
++        _as_nonempty_string(key, "camera basename"): _as_nonempty_string(value, "internal camera name")
++        for key, value in mapping_value.items()
++    }
++    if len(basename_to_internal) != len(set(basename_to_internal.values())):
++        raise CameraSamplingTelemetryError("camera identity has duplicate internal names")
++    if list(basename_to_internal.values()) != internal_names:
++        raise CameraSamplingTelemetryError(
++            "camera identity order must match external pose contract image_names"
++        )
++    contract_sha = identity.get("contract_file_sha256")
++    if contract_sha is not None:
++        contract_sha = _as_nonempty_string(contract_sha, "camera contract SHA")
++    return internal_names, basename_to_internal, contract_sha
++
++
++class CameraSamplingTelemetry:
++    """Record one event per already-selected external training camera."""
++
++    def __init__(
++        self,
++        *,
++        model_path: str | Path,
++        contract: Mapping[str, Any],
++        cameras: Sequence[object],
++        iterations: int,
++    ) -> None:
++        if int(iterations) <= 0:
++            raise CameraSamplingTelemetryError("telemetry iterations must be positive")
++        self.model_path = Path(model_path)
++        if not self.model_path.is_dir() or self.model_path.is_symlink():
++            raise CameraSamplingTelemetryError(f"telemetry model path is not a real directory: {self.model_path}")
++        self.iterations = int(iterations)
++        self.internal_names, self.basename_to_internal, self.contract_file_sha256 = _camera_identity(contract)
++        self.internal_to_basename = {value: key for key, value in self.basename_to_internal.items()}
++        active_names = [_as_nonempty_string(getattr(camera, "image_name", None), "active camera image_name") for camera in cameras]
++        if active_names != self.internal_names:
++            raise CameraSamplingTelemetryError(
++                "active camera order must match the immutable external pose contract"
++            )
++        self.active_camera_count = len(active_names)
++        self.internal_to_index = {name: index for index, name in enumerate(self.internal_names)}
++        self.counts = {name: 0 for name in self.internal_names}
++        self.event_count = 0
++        self._events_path = self.model_path / EVENTS_FILENAME
++        self._summary_path = self.model_path / SUMMARY_FILENAME
++        if self._events_path.exists() or self._events_path.is_symlink():
++            raise CameraSamplingTelemetryError(f"telemetry events file must be absent: {self._events_path}")
++        if self._summary_path.exists() or self._summary_path.is_symlink():
++            raise CameraSamplingTelemetryError(f"telemetry summary file must be absent: {self._summary_path}")
++        self._events_file = self._events_path.open("x", encoding="utf-8")
++
++    def record(self, iteration: int, camera: object) -> dict[str, Any]:
++        """Observe one selected camera without touching RNG or camera ordering."""
++
++        expected_iteration = self.event_count + 1
++        if int(iteration) != expected_iteration:
++            raise CameraSamplingTelemetryError(
++                f"telemetry iteration must be sequential: expected {expected_iteration}, got {iteration}"
++            )
++        internal_name = _as_nonempty_string(getattr(camera, "image_name", None), "selected camera image_name")
++        if internal_name not in self.internal_to_index:
++            raise CameraSamplingTelemetryError(f"selected camera is absent from external contract: {internal_name}")
++        self.counts[internal_name] += 1
++        self.event_count += 1
++        basename = self.internal_to_basename[internal_name]
++        event = {
++            "schema_version": TELEMETRY_SCHEMA,
++            "iteration": int(iteration),
++            "camera_basename": basename,
++            "camera_internal_name": internal_name,
++            "camera_contract_index": self.internal_to_index[internal_name],
++            "exposure_count": self.counts[internal_name],
++            "cumulative_unique_count": sum(1 for value in self.counts.values() if value > 0),
++        }
++        line = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
++        self._events_file.write(line)
++        self._events_file.flush()
++        return event
++
++    def finalize(self, *, checkpoint_iteration: int) -> dict[str, Any]:
++        if self.event_count != self.iterations:
++            raise CameraSamplingTelemetryError(
++                f"telemetry event count {self.event_count} differs from iterations {self.iterations}"
++            )
++        self._events_file.close()
++        events_sha = hashlib.sha256(self._events_path.read_bytes()).hexdigest()
++        exposure_records = [
++            {
++                "camera_basename": self.internal_to_basename[name],
++                "camera_internal_name": name,
++                "camera_contract_index": index,
++                "exposure_count": self.counts[name],
++            }
++            for index, name in enumerate(self.internal_names)
++        ]
++        exposures = [record["exposure_count"] for record in exposure_records]
++        summary = {
++            "schema_version": TELEMETRY_SCHEMA,
++            "selection_policy": "one_camera_per_iteration_random_pop_without_replacement_per_full_stack",
++            "rng_observation": "telemetry makes no random calls and does not mutate RNG state",
++            "active_camera_count": self.active_camera_count,
++            "active_camera_order": [self.internal_to_basename[name] for name in self.internal_names],
++            "active_camera_internal_order": list(self.internal_names),
++            "camera_contract_file_sha256": self.contract_file_sha256,
++            "iterations": self.iterations,
++            "sampled_iteration_count": self.event_count,
++            "unique_camera_count": sum(1 for value in exposures if value > 0),
++            "coverage_fraction": sum(1 for value in exposures if value > 0) / self.active_camera_count,
++            "complete_rounds": self.iterations // self.active_camera_count,
++            "partial_round_size": self.iterations % self.active_camera_count,
++            "min_exposure_count": min(exposures),
++            "max_exposure_count": max(exposures),
++            "exposure_counts": exposure_records,
++            "events_path": str(self._events_path),
++            "events_sha256": events_sha,
++            "events_size_bytes": self._events_path.stat().st_size,
++            "checkpoint_iteration": int(checkpoint_iteration),
++        }
++        with self._summary_path.open("x", encoding="utf-8") as handle:
++            json.dump(summary, handle, indent=2, sort_keys=True, allow_nan=False)
++            handle.write("\n")
++        summary["summary_path"] = str(self._summary_path)
++        summary["summary_sha256"] = hashlib.sha256(self._summary_path.read_bytes()).hexdigest()
++        summary["summary_size_bytes"] = self._summary_path.stat().st_size
++        return summary
+diff --git a/utils/colmap_utils.py b/utils/colmap_utils.py
+index 367207751fd767a7a6b1510c0ec7fb8905f0c6ca..6d16f3639a37ed12b1dafc369fc69511c97aa8ca 100755
+--- a/utils/colmap_utils.py
++++ b/utils/colmap_utils.py
+@@ -22 +22,16 @@ from utils.graphics_utils import focal2fov, fov2focal
+-from dust3r.utils.device import to_numpy
++
++
++def _require_dust3r_to_numpy():
++    """Load the optional DUSt3R adapter only for legacy point-cloud helpers."""
++
++    try:
++        from dust3r.utils.device import to_numpy
++    except ModuleNotFoundError as exc:
++        if exc.name == "dust3r" or (exc.name and exc.name.startswith("dust3r.")):
++            raise ImportError(
++                "DUSt3R is an optional legacy dependency required by "
++                "utils.colmap_utils.get_pc and its point-cloud helpers; "
++                "external fixed-pose training/render does not use this path."
++            ) from exc
++        raise
++    return to_numpy
+@@ -158,0 +174 @@ def get_pc(imgs, pts3d):
++    to_numpy = _require_dust3r_to_numpy()
+@@ -274 +290 @@ def normalize_scene(
+-    return pts_normalized_list, c2w_normalized_list
+\ No newline at end of file
++    return pts_normalized_list, c2w_normalized_list
+diff --git a/utils/external_colmap_pose.py b/utils/external_colmap_pose.py
+index db46f878bce849ce80b0a1b99c1be6ebac34f603..a5990f95fc4d1666cc893fc8e7b68797eb1a42bb 100644
+--- a/utils/external_colmap_pose.py
++++ b/utils/external_colmap_pose.py
+@@ -9,0 +10,2 @@ import math
++import hashlib
++import json
+@@ -15,0 +18,213 @@ import numpy as np
++_IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
++
++
++def _stable_sha256(value: object) -> str:
++    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
++    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
++
++
++def _safe_basename(value: object, *, label: str, validate_suffix: bool = True) -> str:
++    if not isinstance(value, str) or not value or value in {".", ".."}:
++        raise ValueError(f"{label} must be a non-empty basename")
++    if Path(value).name != value or "/" in value or "\\" in value or "\x00" in value:
++        raise ValueError(f"{label} must be a path-free basename: {value!r}")
++    if any(character.isspace() for character in value):
++        raise ValueError(f"{label} must not contain whitespace: {value!r}")
++    suffix = Path(value).suffix.lower()
++    if validate_suffix and suffix and suffix not in _IMAGE_SUFFIXES:
++        raise ValueError(f"{label} has unsupported image suffix: {value!r}")
++    return value
++
++
++def _filename_stem(value: str) -> str:
++    """Return the explicit final-suffix stem used by the input contract."""
++
++    return Path(value).stem if Path(value).suffix else value
++
++
++def _validate_unique_names(
++    names: Iterable[object], *, label: str, validate_suffix: bool = True
++) -> list[str]:
++    result = [_safe_basename(value, label=label, validate_suffix=validate_suffix) for value in names]
++    if len(result) != len(set(result)):
++        raise ValueError(f"{label} are not unique")
++    return result
++
++
++def _resolve_ordered_identity(
++    actual: list[str], filenames: list[str], stems: list[str], *, label: str
++) -> tuple[str, list[str]]:
++    if actual == filenames:
++        return "filename", list(filenames)
++    if actual == stems:
++        return "stem", list(stems)
++    if set(actual) == set(filenames) or set(actual) == set(stems):
++        raise ValueError(f"{label} order differs from the immutable camera contract")
++    raise ValueError(f"{label} set differs from the immutable camera contract")
++
++
++def _resolve_unordered_identity(
++    actual: list[str], filenames: list[str], stems: list[str], *, label: str
++) -> str:
++    if set(actual) == set(filenames):
++        return "filename"
++    if set(actual) == set(stems):
++        return "stem"
++    raise ValueError(f"{label} set differs from the immutable camera contract")
++
++
++def order_camera_infos_by_contract(
++    *, source_path: str | Path, camera_infos: list[object]
++) -> list[object]:
++    """Apply the recorded camera-contract order to name-bound camera objects.
++
++    COLMAP's numeric image IDs are not an input-order contract.  The adapter
++    therefore reorders already name-bound records by the immutable
++    ``camera_contract-v1.frame_names`` sequence, after requiring an exact
++    filename-or-final-suffix-stem set match.  It never sorts by a generated
++    numeric range or by an independently computed lexical order.
++    """
++
++    root = Path(source_path).resolve()
++    contract_path = root / "camera_contract-v1.json"
++    contract = _load_identity_json(contract_path, "camera contract")
++    if contract.get("schema_version") != "camera-contract-v1":
++        raise ValueError("camera contract schema is not camera-contract-v1")
++    value = contract.get("frame_names")
++    if not isinstance(value, list) or not value:
++        raise ValueError("camera contract frame_names are required")
++    filenames = _validate_unique_names(value, label="camera contract frame names")
++    stems = [_filename_stem(name) for name in filenames]
++    if len(stems) != len(set(stems)):
++        raise ValueError("camera contract has duplicate stems across image extensions")
++    actual = _validate_unique_names(
++        [getattr(camera, "image_name", None) for camera in camera_infos],
++        label="name-bound camera image names",
++        validate_suffix=False,
++    )
++    if set(actual) == set(stems):
++        lookup = dict(zip(actual, camera_infos))
++        return [lookup[stem] for stem in stems]
++    if set(actual) == set(filenames):
++        lookup = dict(zip(actual, camera_infos))
++        return [lookup[filename] for filename in filenames]
++    raise ValueError("name-bound camera set differs from the immutable camera contract")
++
++
++def _load_identity_json(path: Path, label: str) -> dict[str, object]:
++    if path.is_symlink() or not path.is_file():
++        raise ValueError(f"{label} is missing or symlinked: {path}")
++    try:
++        value = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError) as exc:
++        raise ValueError(f"{label} is not valid JSON: {path}") from exc
++    if not isinstance(value, dict):
++        raise ValueError(f"{label} must be a JSON object: {path}")
++    return value
++
++
++def load_external_camera_identity(
++    *,
++    source_path: str | Path,
++    camera_infos: list[object],
++    registered_colmap_names: list[str] | None = None,
++) -> dict[str, object]:
++    """Bind backend camera names to the immutable per-video input order.
++
++    The CPU input contract stores image basenames (usually with an extension),
++    while the nested backend's COLMAP reader exposes ``CameraInfo.image_name``
++    as a final-suffix stem.  This function records that boundary explicitly;
++    it never uses substring matching or a generated numeric range.
++    """
++
++    root = Path(source_path).resolve()
++    contract_path = root / "camera_contract-v1.json"
++    contract = _load_identity_json(contract_path, "camera contract")
++    if contract.get("schema_version") != "camera-contract-v1":
++        raise ValueError("camera contract schema is not camera-contract-v1")
++    contract_names_value = contract.get("frame_names")
++    if not isinstance(contract_names_value, list) or not contract_names_value:
++        raise ValueError("camera contract frame_names are required")
++    contract_names = _validate_unique_names(contract_names_value, label="camera contract frame names")
++    stems = [_filename_stem(name) for name in contract_names]
++    if len(stems) != len(set(stems)):
++        raise ValueError("camera contract has duplicate stems across image extensions")
++
++    manifest_path = root / "staging_manifest.json"
++    manifest = _load_identity_json(manifest_path, "staging manifest")
++    records = manifest.get("image_records")
++    if not isinstance(records, list) or not records:
++        raise ValueError("staging manifest image_records are required")
++    manifest_names = _validate_unique_names(
++        [record.get("name", record.get("staged_name")) for record in records if isinstance(record, dict)],
++        label="staging manifest image names",
++    )
++    if manifest_names != contract_names:
++        raise ValueError("staging manifest image order differs from camera contract")
++    declared_contract_sha = contract.get("contract_sha256")
++    if not isinstance(declared_contract_sha, str) or _stable_sha256({key: value for key, value in contract.items() if key != "contract_sha256"}) != declared_contract_sha:
++        raise ValueError("camera contract stable SHA failed")
++    if manifest.get("camera_contract_sha256") != declared_contract_sha:
++        raise ValueError("staging manifest camera contract binding failed")
++
++    static_path = root / "contract" / "static_contract.json"
++    if static_path.is_file() and not static_path.is_symlink():
++        static = _load_identity_json(static_path, "static contract")
++        if static.get("camera_contract_sha256") != declared_contract_sha:
++            raise ValueError("static contract camera contract binding failed")
++        if static.get("image_count") != len(contract_names) or static.get("image_names_verified") is not True:
++            raise ValueError("static contract camera identity summary failed")
++
++    if registered_colmap_names is None:
++        sparse = root / "sparse" / "0"
++        binary = sparse / "images.bin"
++        text = sparse / "images.txt"
++        if binary.is_file():
++            registered_colmap_names = parse_colmap_image_names_binary(binary)
++        elif text.is_file():
++            registered_colmap_names = parse_colmap_image_names_text(text)
++        else:
++            raise ValueError("COLMAP registered image model is missing")
++    registered = _validate_unique_names(
++        registered_colmap_names,
++        label="COLMAP registered image names",
++        validate_suffix=False,
++    )
++    registered_mode = _resolve_unordered_identity(
++        registered, contract_names, stems, label="COLMAP registered image names"
++    )
++
++    actual = _validate_unique_names(
++        [getattr(camera, "image_name", None) for camera in camera_infos],
++        label="active/reference camera image names",
++        validate_suffix=False,
++    )
++    if len(actual) != len(contract_names):
++        raise ValueError(
++            "active/reference camera count differs from immutable camera contract: "
++            f"{len(actual)} != {len(contract_names)}"
++        )
++    internal_mode, expected_internal = _resolve_ordered_identity(
++        actual, contract_names, stems, label="active/reference camera names"
++    )
++    return {
++        "schema_version": "external-camera-identity-v1",
++        "contract_path": str(contract_path),
++        "contract_file_sha256": hashlib.sha256(contract_path.read_bytes()).hexdigest(),
++        "contract_stable_sha256": declared_contract_sha,
++        "order_source": "camera-contract-v1.frame_names",
++        "contract_frame_names": contract_names,
++        "contract_frame_stems": stems,
++        "registered_colmap_names": registered,
++        "registered_colmap_name_mode": registered_mode,
++        "internal_camera_names": actual,
++        "internal_name_mode": internal_mode,
++        "expected_internal_names": expected_internal,
++        "basename_to_internal_name": dict(zip(contract_names, expected_internal)),
++        "camera_count": len(contract_names),
++        "exact_registered_set": True,
++        "order_verified": True,
++        "duplicate_stem_check": True,
++    }
++
++

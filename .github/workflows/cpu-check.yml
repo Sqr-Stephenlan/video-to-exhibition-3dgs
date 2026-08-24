@@ -58,6 +58,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 1
+          submodules: false
           persist-credentials: false
 
       - name: Set up Python
@@ -93,6 +94,11 @@ jobs:
         if: steps.project.outputs.metadata_found == 'true'
         shell: bash
         run: ./dev.sh bootstrap
+
+      - name: Materialize locked remote LongSplat distribution
+        if: steps.project.outputs.metadata_found == 'true'
+        shell: bash
+        run: ./dev.sh python -m scripts.longsplat.verify_remote_distribution --root "$GITHUB_WORKSPACE" --json
 
       - name: Require dependency metadata for discovered tests
         if: steps.project.outputs.tests_found == 'true' && steps.project.outputs.metadata_found != 'true'

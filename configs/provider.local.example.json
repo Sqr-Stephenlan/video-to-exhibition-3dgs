@@ -1,0 +1,6 @@
+{
+  "backend_env": "/path/to/workspace/backend-envs/longsplat-cu128",
+  "ffmpeg": "/path/to/workspace/backend-envs/media-tools/bin/ffmpeg",
+  "ffprobe": "/path/to/workspace/backend-envs/media-tools/bin/ffprobe",
+  "colmap": "colmap"
+}

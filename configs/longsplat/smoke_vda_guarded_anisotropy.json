@@ -1,0 +1,31 @@
+{
+  "source_path": "<run_dir>/input",
+  "model_path": "<run_dir>/longsplat_model",
+  "images": "images",
+  "resolution": -1,
+  "sh_degree": 3,
+  "iterations": 100,
+  "seed": 0,
+  "mode": "custom",
+  "backend_mode": "research_local",
+  "extra_train_args": {
+    "depth_source": "vda",
+    "vda_corr_threshold": 0.3,
+    "vda_outlier_sigma": 2.5,
+    "init_iteration": 50,
+    "pose_iteration": 100,
+    "local_iter": 100,
+    "global_iter": 100,
+    "post_iter": 50,
+    "anisotropy_reg_weight": 0.001,
+    "anisotropy_soft_limit": 30.0
+  },
+  "convert_iteration": 100,
+  "convert_prune_ratio": 0.6,
+  "expected_native_checkpoint_iteration": 30050,
+  "quality_gates": {
+    "pose": {"mode": "enforce", "max_rotation_step_deg": 40.0, "max_translation_step_ratio": 20.0, "max_orthogonality_error": 0.001, "max_determinant_error": 0.001},
+    "vda": {"mode": "enforce", "min_aligned_fraction": 0.75},
+    "ply": {"mode": "enforce"}
+  }
+}
