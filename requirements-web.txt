@@ -1,0 +1,5 @@
+-r requirements-route.txt
+fastapi
+uvicorn
+python-multipart
+httpx

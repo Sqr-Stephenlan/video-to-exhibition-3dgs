@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from scripts.longsplat.terminal_progress import (
     ProgressSnapshot,
@@ -779,6 +782,59 @@ def test_training_sampling_telemetry_is_real_iteration_not_quality_progress(tmp_
     assert line.startswith("[")
 
 
+def test_training_progress_accepts_model_directory_elsewhere_within_run_root(tmp_path: Path) -> None:
+    run_dir = _make_training_run(tmp_path)
+    attempt = run_dir / "stages" / "convergence-smoke-training" / "attempt-0001"
+    model = run_dir / "raw-formal-input" / "formal-input" / "model"
+    _write_sampling_events(model, 3)
+    (attempt / "executor" / "request.json").write_text(
+        json.dumps(
+            {
+                "stage": "training",
+                "iterations": 1000,
+                "model_path": str(model),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = read_progress_snapshot(run_dir, now=110)
+
+    assert snapshot is not None
+    assert snapshot.training.iteration == 3
+    assert snapshot.training.total == 1000
+
+
+def test_completed_training_progress_remains_visible_after_later_stage_blocks(tmp_path: Path) -> None:
+    run_dir = _make_training_run(tmp_path)
+    summary = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    summary["status"] = "blocked"
+    summary["active_stage"] = "conversion"
+    summary["active_attempt"] = "attempt-0001"
+    summary["last_stage"] = "conversion"
+    summary["blocked"] = {"stage": "conversion", "error": "converter unavailable"}
+    summary["stages"]["convergence-smoke-training"][0]["status"] = "passed"
+    conversion_attempt = run_dir / "stages" / "conversion" / "attempt-0001"
+    (conversion_attempt / "executor").mkdir(parents=True)
+    (conversion_attempt / "request.json").write_text("{}", encoding="utf-8")
+    (conversion_attempt / "result.json").write_text("{}", encoding="utf-8")
+    summary["stages"]["conversion"] = [
+        {
+            "attempt": "attempt-0001",
+            "status": "blocked",
+            "result_path": "stages/conversion/attempt-0001/result.json",
+        }
+    ]
+    (run_dir / "run.json").write_text(json.dumps(summary), encoding="utf-8")
+
+    snapshot = read_progress_snapshot(run_dir, now=110)
+
+    assert snapshot is not None
+    assert snapshot.stage == "conversion"
+    assert snapshot.training.iteration == 3
+    assert snapshot.training.total == 1000
+
+
 def test_training_telemetry_fails_closed_for_malformed_symlink_outside_and_old_attempt(
     tmp_path: Path,
 ) -> None:
@@ -793,7 +849,12 @@ def test_training_telemetry_fails_closed_for_malformed_symlink_outside_and_old_a
     outside_events = tmp_path / "symlinked-events.jsonl"
     outside_events.write_text("{}\n", encoding="utf-8")
     symlinked_events.unlink()
-    symlinked_events.symlink_to(outside_events)
+    try:
+        symlinked_events.symlink_to(outside_events)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
     assert read_progress_snapshot(symlinked).training.iteration is None
 
     outside = _make_training_run(tmp_path / "outside")

@@ -37,6 +37,7 @@ class ConversionProgress:
 class TrainingProgress:
     iteration: int | None
     total: int | None
+    marker_timestamp: float | None = None
 
 
 @dataclass(frozen=True)
@@ -598,11 +599,15 @@ def _stage_timing(
 
 def _read_training_events(path: Path, total: int) -> TrainingProgress:
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - _SIDECAR_TAIL_BYTES)
+            handle.seek(start)
+            raw = handle.read(size - start)
         if not raw or not raw.endswith(b"\n"):
             return TrainingProgress(None, None)
-        start = max(0, len(raw) - _SIDECAR_TAIL_BYTES)
-        payload = raw[start:]
+        payload = raw
         if start:
             separator = payload.find(b"\n")
             if separator < 0:
@@ -636,7 +641,38 @@ def _read_training_events(path: Path, total: int) -> TrainingProgress:
         latest = iteration
     if latest is None:
         return TrainingProgress(None, None)
-    return TrainingProgress(latest, total)
+    try:
+        marker_timestamp = path.stat().st_mtime
+    except OSError:
+        marker_timestamp = None
+    return TrainingProgress(latest, total, marker_timestamp)
+
+
+def _latest_training_stage(
+    summary: Mapping[str, Any],
+    *,
+    stage_order: tuple[str, ...],
+) -> str | None:
+    stages = summary.get("stages")
+    if not isinstance(stages, Mapping):
+        return None
+    for candidate in reversed(stage_order):
+        if candidate not in _TRAINING_STAGES:
+            continue
+        entries = stages.get(candidate)
+        if not isinstance(entries, list) or not entries:
+            continue
+        latest = entries[-1]
+        status = latest.get("status") if isinstance(latest, Mapping) else None
+        if str(status or "").strip().lower() in {
+            "running",
+            "passed",
+            "complete",
+            "completed",
+            "accepted",
+        }:
+            return candidate
+    return None
 
 
 def _training_progress(
@@ -647,9 +683,9 @@ def _training_progress(
     active_stage = summary.get("active_stage")
     if not isinstance(active_stage, str):
         active_stage = summary.get("current_intended_stage")
-    if root is None or stage not in _TRAINING_STAGES or active_stage != stage:
+    if root is None or stage not in _TRAINING_STAGES:
         return TrainingProgress(None, None)
-    attempt = summary.get("active_attempt")
+    attempt = summary.get("active_attempt") if active_stage == stage else _latest_attempt_name(summary, stage=stage)
     if not isinstance(attempt, str):
         return TrainingProgress(None, None)
     attempt_dir = _contained_directory(root / "stages" / stage / attempt, root)
@@ -668,12 +704,11 @@ def _training_progress(
         or not isinstance(model_value, str)
     ):
         return TrainingProgress(None, None)
-    model = _contained_directory(Path(model_value), root)
+    model_path = Path(model_value)
+    if not model_path.is_absolute():
+        model_path = root / model_path
+    model = _contained_directory(model_path, root)
     if model is None:
-        return TrainingProgress(None, None)
-    try:
-        model.relative_to(attempt_dir)
-    except ValueError:
         return TrainingProgress(None, None)
     events = _contained_file(model / _SAMPLING_EVENTS_NAME, root)
     if events is None:
@@ -743,7 +778,11 @@ def read_progress_snapshot(run_dir: str | Path, *, now: float | None = None) -> 
     conversion = _read_sidecar(sidecar) if sidecar is not None else ConversionProgress(None, None, None)
     position = stage_order.index(selected.stage) + 1
     timing = _stage_timing(selected.root, selected.summary, selected.stage)
-    training = _training_progress(selected.root, selected.summary, selected.stage)
+    training_stage = selected.stage if selected.stage in _TRAINING_STAGES else _latest_training_stage(
+        selected.summary,
+        stage_order=stage_order,
+    )
+    training = _training_progress(selected.root, selected.summary, training_stage)
     status = selected.summary.get("status")
     if selected.active and selected.stage is not None and _active_attempt(
         selected.summary,
